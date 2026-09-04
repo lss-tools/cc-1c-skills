@@ -71,7 +71,6 @@ def main():
     format_version = "2.17"
 
     # --- Resolve ConfigPath ---
-    base_lang_uuid = "00000000-0000-0000-0000-000000000000"
     if args.ConfigPath:
         config_path = args.ConfigPath
         if not os.path.isabs(config_path):
@@ -86,24 +85,6 @@ def main():
         if not os.path.exists(config_path):
             print(f"Config file not found: {config_path}", file=sys.stderr)
             sys.exit(1)
-        cfg_dir = os.path.dirname(os.path.abspath(config_path))
-
-        # Read Language UUID from base config
-        base_lang_file = os.path.join(cfg_dir, "Languages", "Русский.xml")
-        if os.path.exists(base_lang_file):
-            try:
-                base_tree = ET.parse(base_lang_file)
-                base_root = base_tree.getroot()
-                for child in base_root:
-                    if child.tag.endswith('}Language') or child.tag == 'Language':
-                        base_lang_uuid = child.get('uuid', base_lang_uuid)
-                        print(f"[INFO] Base config Language UUID: {base_lang_uuid}")
-                        break
-            except Exception:
-                print(f"[WARN] Could not parse {base_lang_file}")
-        else:
-            print(f"[WARN] Base config language not found: {base_lang_file}")
-
         # Read CompatibilityMode and InterfaceCompatibilityMode from base config
         try:
             base_cfg_tree = ET.parse(os.path.abspath(config_path))
@@ -131,7 +112,13 @@ def main():
             ifc_mode = "TaxiEnableVersion8_2"
     else:
         ifc_mode = "TaxiEnableVersion8_2"
-        print("[WARN] Language ExtendedConfigurationObject set to zeros. Use -ConfigPath to auto-resolve from base config, or fix manually before loading.")
+        # Контролируемые свойства (версия формата, CompatibilityMode, InterfaceCompatibilityMode)
+        # берутся с потолка. /UpdateDBCfg -Extension сверяет их с расширяемой конфигурацией и
+        # падает: «Значение контролируемого свойства … не совпадает» (проверено 04.09.2026).
+        print("[WARN] Без -ConfigPath контролируемые свойства (формат "
+              f"{format_version}, CompatibilityMode {compat}, InterfaceCompatibilityMode {ifc_mode}) "
+              "заданы по умолчанию и, скорее всего, не совпадут с расширяемой конфигурацией — "
+              "/UpdateDBCfg -Extension откажет. Указывайте -ConfigPath.")
 
     # --- Generate UUIDs ---
     uuid_cfg = new_uuid()
@@ -252,6 +239,14 @@ def main():
 </MetaDataObject>'''
 
     # --- Languages/Русский.xml (adopted format) ---
+    # БЕЗ <ExtendedConfigurationObject>: это контролируемое свойство, платформа сверяет его
+    # с расширяемой конфигурацией при /UpdateDBCfg -Extension. Любой записанный сюда uuid —
+    # догадка (нули без -ConfigPath, uuid чужой выгрузки — с ним), и при несовпадении
+    # обновление падает: «Значение контролируемого свойства ОбъектРасширяемойКонфигурации
+    # у объекта Язык.Русский не совпадает со значением в расширяемой конфигурации».
+    # Без элемента платформа связывает язык по имени и проставляет uuid сама.
+    # Эталон — расширение YAxUnit: ObjectBelonging=Adopted, собственный uuid, элемента нет.
+    # Проверено 04.09.2026 (wiki-1c/19-skill-defects), платформа 8.3.27.1936.
     lang_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <MetaDataObject {xmlns_decl} version="{format_version}">
 \t<Language uuid="{uuid_lang}">
@@ -260,7 +255,6 @@ def main():
 \t\t\t<ObjectBelonging>Adopted</ObjectBelonging>
 \t\t\t<Name>Русский</Name>
 \t\t\t<Comment/>
-\t\t\t<ExtendedConfigurationObject>{base_lang_uuid}</ExtendedConfigurationObject>
 \t\t\t<LanguageCode>ru</LanguageCode>
 \t\t</Properties>
 \t</Language>

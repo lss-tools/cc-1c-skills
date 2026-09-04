@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-# meta-compile v1.88 — Compile 1C metadata object from JSON
+# meta-compile v1.88+lss.1 — Compile 1C metadata object from JSON
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 import argparse
+import difflib
 import json
 import os
 import re
@@ -339,6 +340,166 @@ if isinstance(defn, list):
 # Normalize field synonyms: accept "objectType" as alias for "type"
 if not defn.get('type') and defn.get('objectType'):
     defn['type'] = defn['objectType']
+
+# --- Валидация ключей DSL ------------------------------------------------
+# Неизвестный ключ раньше отбрасывался молча: meta-compile печатал [OK], а объект
+# собирался урезанным. Пилот wiki-1c/16-yaxunit (грабля Г5): справочник из примера
+# SKILL.md (kind / properties / children) собрался БЕЗ единого реквизита и с
+# DescriptionLength=25 вместо 150; cfe-validate дал 13/13 OK, расширение загрузилось
+# в базу, дефект всплыл только на падении тестов. Поэтому неизвестный ключ — ошибка.
+# Белые списки сняты с самого компилятора (что он читает, то и разрешено) скриптом
+# build_validator.py из docs/plans/wiki-1c/19-skill-defects/scripts/ репозитория wiki-1c;
+# после расширения DSL списки пересобираются им же.
+
+# Ключи верхнего уровня (все типы объектов; лишние для типа безвредны)
+KNOWN_OBJECT_KEYS = {
+    'accountingFlags', 'actionPeriod', 'actionPeriodUse', 'addressing', 'addressingAttributes',
+    'attributes', 'authenticationSeparation', 'autoOrderByCode', 'autoUse', 'autonumbering',
+    'auxiliaryChoiceForm', 'auxiliaryFolderChoiceForm', 'auxiliaryFolderForm', 'auxiliaryForm',
+    'auxiliaryListForm', 'auxiliaryLoadForm', 'auxiliaryObjectForm', 'auxiliaryRecordForm',
+    'auxiliarySaveForm', 'auxiliarySettingsForm', 'auxiliaryVariantForm',
+    'availabilityForAppearance', 'availabilityForChoice', 'baseCalculationTypes', 'basePeriod',
+    'basedOn', 'category', 'characteristicExtValues', 'characteristics', 'chartOfAccounts',
+    'chartOfCalculationTypes', 'checkUnique', 'choiceFoldersAndItems', 'choiceForm',
+    'choiceHistoryOnInput', 'choiceMode', 'choiceParameterLinks', 'choiceParameters',
+    'clientManagedApplication', 'clientOrdinaryApplication', 'codeAllowedLength', 'codeLength',
+    'codeMask', 'codeSeries', 'codeType', 'columns', 'commandParameterType', 'commands',
+    'comment', 'conditionalSeparation', 'configurationExtensionsSeparation', 'content',
+    'context', 'correspondence', 'createOnInput', 'createTaskInPrivilegedMode',
+    'currentPerformer', 'dataHistory', 'dataLockControlMode', 'dataLockFields',
+    'dataSeparation', 'dataSeparationUse', 'dataSeparationValue', 'defaultChoiceForm',
+    'defaultFolderChoiceForm', 'defaultFolderForm', 'defaultForm', 'defaultListForm',
+    'defaultLoadForm', 'defaultObjectForm', 'defaultPresentation', 'defaultRecordForm',
+    'defaultSaveForm', 'defaultSettingsForm', 'defaultVariantForm',
+    'dependenceOnCalculationTypes', 'description', 'descriptionLength', 'descriptorFileName',
+    'dimensions', 'distributedInfoBase', 'documents', 'editFormat', 'editType',
+    'enableTotalsSliceFirst', 'enableTotalsSliceLast', 'enableTotalsSplitting', 'event',
+    'executeAfterWriteDataHistoryVersionProcessing', 'explanation',
+    'extDimensionAccountingFlags', 'extDimensionTypes', 'extendedEdit',
+    'extendedListPresentation', 'extendedObjectPresentation', 'extendedPresentation',
+    'extendedRecordPresentation', 'externalConnection', 'fillChecking', 'fillFromFillingValue',
+    'fillValue', 'foldersOnTop', 'formType', 'format', 'fullTextSearch',
+    'fullTextSearchOnInputByString', 'global', 'group', 'handler', 'hierarchical',
+    'hierarchyType', 'includeConfigurationExtensions', 'includeHelpInContents', 'indexing',
+    'inputByString', 'key', 'length', 'levelCount', 'limitLevelCount', 'linkByType',
+    'listPresentation', 'loadTransparent', 'location', 'locationURL', 'locationUrl',
+    'mainAddressingAttribute', 'mainDataCompositionSchema', 'mainFilterOnPeriod',
+    'markNegatives', 'mask', 'maxExtDimensionCount', 'maxValue', 'methodName', 'minValue',
+    'modifiesData', 'moveBoundaryOnPosting', 'multiLine', 'name', 'namespace', 'nonneg',
+    'nonnegative', 'numberAllowedLength', 'numberLength', 'numberPeriodicity', 'numberType',
+    'numerator', 'objectPresentation', 'objectType', 'onMainServerUnavalableBehavior',
+    'operations', 'orderLength', 'owners', 'parameterUseMode', 'passwordMode',
+    'periodAdjustmentLength', 'periodicity', 'picture', 'postInPrivilegedMode', 'posting',
+    'precision', 'predefined', 'predefinedDataUpdate', 'privileged', 'privilegedGetMode',
+    'quickChoice', 'realTimePosting', 'recordPresentation', 'registerRecords',
+    'registerRecordsDeletion', 'registerRecordsWritingOnPost', 'registerType',
+    'registeredDocuments', 'representation', 'resources', 'restartCountOnFailure',
+    'restartIntervalOnFailure', 'returnValuesReuse', 'reuseSessions', 'rootURL', 'schedule',
+    'scheduleDate', 'scheduleValue', 'searchStringModeOnInputByString', 'separatedDataUse',
+    'sequenceFilling', 'server', 'serverCall', 'sessionMaxAge', 'settingsStorage', 'shortcut',
+    'source', 'standardAttributes', 'subordinationUse', 'synonym', 'tabularSections', 'task',
+    'taskNumberAutoPrefix', 'templateType', 'tooltip', 'type', 'unpostInPrivilegedMode',
+    'updateDataHistoryImmediatelyAfterWrite', 'urlTemplates', 'use',
+    'useInInterfaceCompatibilityMode', 'usePurposes', 'useStandardCommands', 'usersSeparation',
+    'value', 'valueType', 'valueTypes', 'values', 'variantsStorage', 'writeMode',
+    'xdtoPackages', 'Состав'
+}
+
+# Объектная форма реквизита / измерения / ресурса / колонки ТЧ / признака учёта
+KNOWN_ATTRIBUTE_KEYS = {
+    'accountingFlag', 'addressingDimension', 'balance', 'baseDimension',
+    'choiceFoldersAndItems', 'choiceForm', 'choiceHistoryOnInput', 'choiceParameterLinks',
+    'choiceParameters', 'comment', 'createOnInput', 'dataHistory', 'denyIncompleteValues',
+    'documentMap', 'editFormat', 'extDimensionAccountingFlag', 'extendedEdit', 'fillCheck',
+    'fillChecking', 'fillFromFillingValue', 'fillValue', 'flags', 'format', 'fullTextSearch',
+    'indexing', 'length', 'linkByType', 'mainFilter', 'markNegatives', 'mask', 'master',
+    'maxValue', 'minValue', 'multiLine', 'name', 'nonneg', 'nonnegative', 'passwordMode',
+    'precision', 'quickChoice', 'registerRecordsMap', 'scheduleLink', 'synonym', 'tooltip',
+    'type', 'typeReductionMode', 'use', 'useInTotals', 'valueType'
+}
+
+# Объектная форма табличной части
+KNOWN_TABULAR_SECTION_KEYS = {
+    'attributes', 'columns', 'comment', 'fillChecking', 'lineNumber', 'lineNumberLength',
+    'name', 'synonym', 'tooltip', 'use'
+}
+
+# Значение перечисления в объектной форме
+KNOWN_ENUM_VALUE_KEYS = {
+    'comment', 'name', 'synonym'
+}
+
+# Ключи «чужого» DSL, на которые агент сбивается чаще всего, — с прямой подсказкой.
+LEGACY_KEY_HINTS = {
+    'kind': "тип объекта задаётся ключом 'type' (или 'objectType')",
+    'properties': "свойства объекта — плоские ключи верхнего уровня, обёртки 'properties' нет",
+    'children': "'attributes' / 'tabularSections' / 'dimensions' / 'resources' — "
+                "плоские ключи верхнего уровня, обёртки 'children' нет",
+    'fields': "реквизиты задаются ключом 'attributes'",
+    'props': "свойства объекта — плоские ключи верхнего уровня",
+}
+
+
+def _dsl_key_errors(node, known, where):
+    """Ошибки по неизвестным ключам одного узла DSL."""
+    errs = []
+    for k in node:
+        if k in known:
+            continue
+        hint = LEGACY_KEY_HINTS.get(k)
+        if not hint:
+            near = difflib.get_close_matches(str(k), sorted(known), n=1, cutoff=0.75)
+            hint = f"похоже на '{near[0]}'" if near else 'ключ не входит в DSL meta-compile'
+        errs.append(f"{where}: неизвестный ключ '{k}' — {hint}")
+    return errs
+
+
+def _validate_dsl_keys(d):
+    errs = _dsl_key_errors(d, KNOWN_OBJECT_KEYS, 'корень')
+
+    def check_attrs(items, where):
+        if isinstance(items, dict):
+            items = [items]
+        for i, it in enumerate(items or [], 1):
+            if isinstance(it, dict):
+                errs.extend(_dsl_key_errors(it, KNOWN_ATTRIBUTE_KEYS, f'{where}[{i}]'))
+
+    for key in ('attributes', 'dimensions', 'resources', 'accountingFlags',
+                'extDimensionAccountingFlags', 'addressingAttributes'):
+        if key in d:
+            check_attrs(d.get(key), key)
+
+    ts_data = d.get('tabularSections')
+    if isinstance(ts_data, dict):
+        ts_items = list(ts_data.items())
+    elif isinstance(ts_data, list):
+        ts_items = [(str((t or {}).get('name', i)), t) for i, t in enumerate(ts_data, 1)
+                    if isinstance(t, dict)]
+    else:
+        ts_items = []
+    for ts_name, ts in ts_items:
+        where = f"tabularSections['{ts_name}']"
+        if isinstance(ts, dict):
+            errs.extend(_dsl_key_errors(ts, KNOWN_TABULAR_SECTION_KEYS, where))
+            check_attrs(ts.get('attributes') or ts.get('columns'), where + '.attributes')
+        elif isinstance(ts, list):
+            check_attrs(ts, where)
+
+    for i, v in enumerate(d.get('values') or [], 1):
+        if isinstance(v, dict):
+            errs.extend(_dsl_key_errors(v, KNOWN_ENUM_VALUE_KEYS, f'values[{i}]'))
+
+    if errs:
+        sys.stderr.write('Неизвестные ключи DSL (компиляция остановлена, объект НЕ создан):\n')
+        for e in errs:
+            sys.stderr.write('  - ' + e + '\n')
+        sys.stderr.write('Формат DSL — references/meta-dsl-spec.md, '
+                         'references/meta-compile-<тип>.md\n')
+        sys.exit(1)
+
+
+_validate_dsl_keys(defn)
+
 
 # Object type synonyms (Russian -> English)
 object_type_synonyms = {

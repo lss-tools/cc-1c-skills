@@ -1,4 +1,4 @@
-﻿# meta-compile v1.88 — Compile 1C metadata object from JSON
+﻿# meta-compile v1.88+lss.1 — Compile 1C metadata object from JSON
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 param(
 	[Parameter(Mandatory)]
@@ -183,6 +183,210 @@ if ($def -is [array] -or ($null -ne $def -and $def.GetType().BaseType.Name -eq '
 if (-not $def.type -and $def.objectType) {
 	$def | Add-Member -NotePropertyName "type" -NotePropertyValue $def.objectType
 }
+
+# --- Валидация ключей DSL ------------------------------------------------
+# Зеркало проверки из Python-порта (см. комментарий там). Неизвестный ключ раньше
+# отбрасывался молча: скрипт печатал [OK], а объект собирался урезанным — грабля Г5
+# пилота wiki-1c/16-yaxunit. Скилл вызывает именно PowerShell-порт, поэтому проверка
+# обязана быть и здесь. Списки собраны из Python-порта: оба порта принимают один DSL.
+
+# Ключи верхнего уровня (все типы объектов; лишние для типа безвредны)
+$script:KnownObjectKeys = [System.Collections.Generic.HashSet[string]]::new(
+	[string[]]@(
+		'accountingFlags', 'actionPeriod', 'actionPeriodUse', 'addressing', 'addressingAttributes',
+		'attributes', 'authenticationSeparation', 'autoOrderByCode', 'autoUse', 'autonumbering',
+		'auxiliaryChoiceForm', 'auxiliaryFolderChoiceForm', 'auxiliaryFolderForm', 'auxiliaryForm',
+		'auxiliaryListForm', 'auxiliaryLoadForm', 'auxiliaryObjectForm', 'auxiliaryRecordForm',
+		'auxiliarySaveForm', 'auxiliarySettingsForm', 'auxiliaryVariantForm', 'availabilityForAppearance',
+		'availabilityForChoice', 'baseCalculationTypes', 'basePeriod', 'basedOn', 'category',
+		'characteristicExtValues', 'characteristics', 'chartOfAccounts', 'chartOfCalculationTypes',
+		'checkUnique', 'choiceFoldersAndItems', 'choiceForm', 'choiceHistoryOnInput', 'choiceMode',
+		'choiceParameterLinks', 'choiceParameters', 'clientManagedApplication',
+		'clientOrdinaryApplication', 'codeAllowedLength', 'codeLength', 'codeMask', 'codeSeries',
+		'codeType', 'columns', 'commandParameterType', 'commands', 'comment', 'conditionalSeparation',
+		'configurationExtensionsSeparation', 'content', 'context', 'correspondence', 'createOnInput',
+		'createTaskInPrivilegedMode', 'currentPerformer', 'dataHistory', 'dataLockControlMode',
+		'dataLockFields', 'dataSeparation', 'dataSeparationUse', 'dataSeparationValue',
+		'defaultChoiceForm', 'defaultFolderChoiceForm', 'defaultFolderForm', 'defaultForm',
+		'defaultListForm', 'defaultLoadForm', 'defaultObjectForm', 'defaultPresentation',
+		'defaultRecordForm', 'defaultSaveForm', 'defaultSettingsForm', 'defaultVariantForm',
+		'dependenceOnCalculationTypes', 'description', 'descriptionLength', 'descriptorFileName',
+		'dimensions', 'distributedInfoBase', 'documents', 'editFormat', 'editType',
+		'enableTotalsSliceFirst', 'enableTotalsSliceLast', 'enableTotalsSplitting', 'event',
+		'executeAfterWriteDataHistoryVersionProcessing', 'explanation', 'extDimensionAccountingFlags',
+		'extDimensionTypes', 'extendedEdit', 'extendedListPresentation', 'extendedObjectPresentation',
+		'extendedPresentation', 'extendedRecordPresentation', 'externalConnection', 'fillChecking',
+		'fillFromFillingValue', 'fillValue', 'foldersOnTop', 'formType', 'format', 'fullTextSearch',
+		'fullTextSearchOnInputByString', 'global', 'group', 'handler', 'hierarchical', 'hierarchyType',
+		'includeConfigurationExtensions', 'includeHelpInContents', 'indexing', 'inputByString', 'key',
+		'length', 'levelCount', 'limitLevelCount', 'linkByType', 'listPresentation', 'loadTransparent',
+		'location', 'locationURL', 'locationUrl', 'mainAddressingAttribute', 'mainDataCompositionSchema',
+		'mainFilterOnPeriod', 'markNegatives', 'mask', 'maxExtDimensionCount', 'maxValue', 'methodName',
+		'minValue', 'modifiesData', 'moveBoundaryOnPosting', 'multiLine', 'name', 'namespace', 'nonneg',
+		'nonnegative', 'numberAllowedLength', 'numberLength', 'numberPeriodicity', 'numberType',
+		'numerator', 'objectPresentation', 'objectType', 'onMainServerUnavalableBehavior', 'operations',
+		'orderLength', 'owners', 'parameterUseMode', 'passwordMode', 'periodAdjustmentLength',
+		'periodicity', 'picture', 'postInPrivilegedMode', 'posting', 'precision', 'predefined',
+		'predefinedDataUpdate', 'privileged', 'privilegedGetMode', 'quickChoice', 'realTimePosting',
+		'recordPresentation', 'registerRecords', 'registerRecordsDeletion',
+		'registerRecordsWritingOnPost', 'registerType', 'registeredDocuments', 'representation',
+		'resources', 'restartCountOnFailure', 'restartIntervalOnFailure', 'returnValuesReuse',
+		'reuseSessions', 'rootURL', 'schedule', 'scheduleDate', 'scheduleValue',
+		'searchStringModeOnInputByString', 'separatedDataUse', 'sequenceFilling', 'server', 'serverCall',
+		'sessionMaxAge', 'settingsStorage', 'shortcut', 'source', 'standardAttributes',
+		'subordinationUse', 'synonym', 'tabularSections', 'task', 'taskNumberAutoPrefix', 'templateType',
+		'tooltip', 'type', 'unpostInPrivilegedMode', 'updateDataHistoryImmediatelyAfterWrite',
+		'urlTemplates', 'use', 'useInInterfaceCompatibilityMode', 'usePurposes', 'useStandardCommands',
+		'usersSeparation', 'value', 'valueType', 'valueTypes', 'values', 'variantsStorage', 'writeMode',
+		'xdtoPackages', 'Состав'
+	))
+
+# Объектная форма реквизита / измерения / ресурса / колонки ТЧ / признака учёта
+$script:KnownAttributeKeys = [System.Collections.Generic.HashSet[string]]::new(
+	[string[]]@(
+		'accountingFlag', 'addressingDimension', 'balance', 'baseDimension', 'choiceFoldersAndItems',
+		'choiceForm', 'choiceHistoryOnInput', 'choiceParameterLinks', 'choiceParameters', 'comment',
+		'createOnInput', 'dataHistory', 'denyIncompleteValues', 'documentMap', 'editFormat',
+		'extDimensionAccountingFlag', 'extendedEdit', 'fillCheck', 'fillChecking', 'fillFromFillingValue',
+		'fillValue', 'flags', 'format', 'fullTextSearch', 'indexing', 'length', 'linkByType',
+		'mainFilter', 'markNegatives', 'mask', 'master', 'maxValue', 'minValue', 'multiLine', 'name',
+		'nonneg', 'nonnegative', 'passwordMode', 'precision', 'quickChoice', 'registerRecordsMap',
+		'scheduleLink', 'synonym', 'tooltip', 'type', 'typeReductionMode', 'use', 'useInTotals',
+		'valueType'
+	))
+
+# Объектная форма табличной части
+$script:KnownTabularSectionKeys = [System.Collections.Generic.HashSet[string]]::new(
+	[string[]]@(
+		'attributes', 'columns', 'comment', 'fillChecking', 'lineNumber', 'lineNumberLength', 'name',
+		'synonym', 'tooltip', 'use'
+	))
+
+# Значение перечисления в объектной форме
+$script:KnownEnumValueKeys = [System.Collections.Generic.HashSet[string]]::new(
+	[string[]]@(
+		'comment', 'name', 'synonym'
+	))
+
+# Ключи «чужого» DSL, на которые агент сбивается чаще всего, — с прямой подсказкой.
+$script:LegacyKeyHints = @{
+	'kind'       = "тип объекта задаётся ключом 'type' (или 'objectType')"
+	'properties' = "свойства объекта — плоские ключи верхнего уровня, обёртки 'properties' нет"
+	'children'   = "'attributes' / 'tabularSections' / 'dimensions' / 'resources' — плоские ключи верхнего уровня, обёртки 'children' нет"
+	'fields'     = "реквизиты задаются ключом 'attributes'"
+	'props'      = "свойства объекта — плоские ключи верхнего уровня"
+}
+
+function Get-NodeKeys($node) {
+	if ($null -eq $node) { return @() }
+	if ($node -is [System.Collections.IDictionary]) { return @($node.Keys) }
+	if ($node.PSObject -and $node.PSObject.Properties) { return @($node.PSObject.Properties.Name) }
+	return @()
+}
+
+function Get-EditDistance([string]$a, [string]$b) {
+	$n = $a.Length; $m = $b.Length
+	if ($n -eq 0) { return $m }
+	if ($m -eq 0) { return $n }
+	$prev = 0..$m
+	for ($i = 1; $i -le $n; $i++) {
+		$cur = @($i) + (1..$m | ForEach-Object { 0 })
+		for ($j = 1; $j -le $m; $j++) {
+			$cost = if ($a[$i - 1] -eq $b[$j - 1]) { 0 } else { 1 }
+			$cur[$j] = [Math]::Min([Math]::Min($prev[$j] + 1, $cur[$j - 1] + 1), $prev[$j - 1] + $cost)
+		}
+		$prev = $cur
+	}
+	return $prev[$m]
+}
+
+function Get-DslKeyErrors($node, $known, [string]$where) {
+	$errs = @()
+	foreach ($k in (Get-NodeKeys $node)) {
+		if ($known.Contains($k)) { continue }
+		$hint = $script:LegacyKeyHints[$k]
+		if (-not $hint) {
+			$best = $null; $bestD = 99
+			foreach ($kk in $known) {
+				$d = Get-EditDistance $k $kk
+				if ($d -lt $bestD) { $bestD = $d; $best = $kk }
+			}
+			$limit = [Math]::Max(1, [int]([Math]::Floor($k.Length / 4)) + 1)
+			$hint = if ($bestD -le $limit) { "похоже на '$best'" } else { 'ключ не входит в DSL meta-compile' }
+		}
+		$errs += "${where}: неизвестный ключ '$k' — $hint"
+	}
+	return $errs
+}
+
+function Test-DslKeys($d) {
+	$errs = @()
+	$errs += Get-DslKeyErrors $d $script:KnownObjectKeys 'корень'
+
+	function Test-AttrList($items, [string]$where) {
+		$list = @()
+		if ($null -eq $items) { return @() }
+		if ($items -is [System.Collections.IEnumerable] -and $items -isnot [string]) { $list = @($items) }
+		else { $list = @($items) }
+		$out = @()
+		for ($i = 0; $i -lt $list.Count; $i++) {
+			$it = $list[$i]
+			if ($it -is [string]) { continue }
+			$out += Get-DslKeyErrors $it $script:KnownAttributeKeys "$where[$($i + 1)]"
+		}
+		return $out
+	}
+
+	foreach ($key in @('attributes', 'dimensions', 'resources', 'accountingFlags',
+			'extDimensionAccountingFlags', 'addressingAttributes')) {
+		if ($d.PSObject.Properties.Name -contains $key) {
+			$errs += Test-AttrList $d.$key $key
+		}
+	}
+
+	$ts = $d.tabularSections
+	if ($null -ne $ts) {
+		if ($ts -is [System.Array]) {
+			for ($i = 0; $i -lt $ts.Count; $i++) {
+				$name = if ($ts[$i].name) { $ts[$i].name } else { $i + 1 }
+				$where = "tabularSections['$name']"
+				$errs += Get-DslKeyErrors $ts[$i] $script:KnownTabularSectionKeys $where
+				$cols = if ($ts[$i].attributes) { $ts[$i].attributes } else { $ts[$i].columns }
+				$errs += Test-AttrList $cols "$where.attributes"
+			}
+		} else {
+			foreach ($p in (Get-NodeKeys $ts)) {
+				$where = "tabularSections['$p']"
+				$val = $ts.$p
+				if ($val -is [System.Array]) {
+					$errs += Test-AttrList $val $where
+				} else {
+					$errs += Get-DslKeyErrors $val $script:KnownTabularSectionKeys $where
+					$cols = if ($val.attributes) { $val.attributes } else { $val.columns }
+					$errs += Test-AttrList $cols "$where.attributes"
+				}
+			}
+		}
+	}
+
+	if ($null -ne $d.values) {
+		$vals = @($d.values)
+		for ($i = 0; $i -lt $vals.Count; $i++) {
+			if ($vals[$i] -is [string]) { continue }
+			$errs += Get-DslKeyErrors $vals[$i] $script:KnownEnumValueKeys "values[$($i + 1)]"
+		}
+	}
+
+	if ($errs.Count -gt 0) {
+		[Console]::Error.WriteLine('Неизвестные ключи DSL (компиляция остановлена, объект НЕ создан):')
+		foreach ($e in $errs) { [Console]::Error.WriteLine("  - $e") }
+		[Console]::Error.WriteLine('Формат DSL — references/meta-dsl-spec.md, references/meta-compile-<тип>.md')
+		exit 1
+	}
+}
+
+Test-DslKeys $def
+
 
 # Object type synonyms (Russian → English)
 $script:objectTypeSynonyms = @{

@@ -40,7 +40,6 @@ if (Test-Path $cfgFile) {
 $formatVersion = "2.17"
 
 # --- Resolve ConfigPath ---
-$baseLangUuid = "00000000-0000-0000-0000-000000000000"
 if ($ConfigPath) {
 	if (-not [System.IO.Path]::IsPathRooted($ConfigPath)) {
 		$ConfigPath = Join-Path (Get-Location).Path $ConfigPath
@@ -51,28 +50,6 @@ if ($ConfigPath) {
 		else { Write-Error "No Configuration.xml in config directory: $ConfigPath"; exit 1 }
 	}
 	if (-not (Test-Path $ConfigPath)) { Write-Error "Config file not found: $ConfigPath"; exit 1 }
-	$cfgDir = Split-Path (Resolve-Path $ConfigPath).Path -Parent
-
-	# 3a. Read Language UUID from base config
-	$baseLangFile = Join-Path (Join-Path $cfgDir "Languages") "Русский.xml"
-	if (Test-Path $baseLangFile) {
-		$baseLangDoc = New-Object System.Xml.XmlDocument
-		$baseLangDoc.PreserveWhitespace = $false
-		$baseLangDoc.Load($baseLangFile)
-		$langEl = $null
-		foreach ($c in $baseLangDoc.DocumentElement.ChildNodes) {
-			if ($c.NodeType -eq 'Element' -and $c.LocalName -eq 'Language') { $langEl = $c; break }
-		}
-		if ($langEl) {
-			$baseLangUuid = $langEl.GetAttribute("uuid")
-			Write-Host "[INFO] Base config Language UUID: $baseLangUuid"
-		} else {
-			Write-Host "[WARN] No <Language> element in $baseLangFile"
-		}
-	} else {
-		Write-Host "[WARN] Base config language not found: $baseLangFile"
-	}
-
 	# 3b. Read CompatibilityMode and InterfaceCompatibilityMode from base config
 	$baseCfgDoc = New-Object System.Xml.XmlDocument
 	$baseCfgDoc.PreserveWhitespace = $false
@@ -101,7 +78,10 @@ if ($ConfigPath) {
 	}
 } else {
 	$InterfaceCompatibilityMode = "TaxiEnableVersion8_2"
-	Write-Host "[WARN] Language ExtendedConfigurationObject set to zeros. Use -ConfigPath to auto-resolve from base config, or fix manually before loading."
+	# Контролируемые свойства (версия формата, CompatibilityMode, InterfaceCompatibilityMode)
+	# берутся с потолка. /UpdateDBCfg -Extension сверяет их с расширяемой конфигурацией и
+	# падает: «Значение контролируемого свойства … не совпадает» (проверено 04.09.2026).
+	Write-Host "[WARN] Без -ConfigPath контролируемые свойства (формат $formatVersion, CompatibilityMode $CompatibilityMode, InterfaceCompatibilityMode $InterfaceCompatibilityMode) заданы по умолчанию и, скорее всего, не совпадут с расширяемой конфигурацией — /UpdateDBCfg -Extension откажет. Указывайте -ConfigPath."
 }
 
 # --- Generate UUIDs ---
@@ -235,6 +215,14 @@ $cfgXml = @"
 "@
 
 # --- Languages/Русский.xml (adopted format) ---
+# БЕЗ <ExtendedConfigurationObject>: это контролируемое свойство, платформа сверяет его
+# с расширяемой конфигурацией при /UpdateDBCfg -Extension. Любой записанный сюда uuid —
+# догадка (нули без -ConfigPath, uuid чужой выгрузки — с ним), и при несовпадении
+# обновление падает: «Значение контролируемого свойства ОбъектРасширяемойКонфигурации
+# у объекта Язык.Русский не совпадает со значением в расширяемой конфигурации».
+# Без элемента платформа связывает язык по имени и проставляет uuid сама.
+# Эталон — расширение YAxUnit: ObjectBelonging=Adopted, собственный uuid, элемента нет.
+# Проверено 04.09.2026 (wiki-1c/19-skill-defects), платформа 8.3.27.1936.
 $langXml = @"
 <?xml version="1.0" encoding="UTF-8"?>
 <MetaDataObject $xmlnsDecl version="$formatVersion">
@@ -244,7 +232,6 @@ $langXml = @"
 			<ObjectBelonging>Adopted</ObjectBelonging>
 			<Name>Русский</Name>
 			<Comment/>
-			<ExtendedConfigurationObject>$baseLangUuid</ExtendedConfigurationObject>
 			<LanguageCode>ru</LanguageCode>
 		</Properties>
 	</Language>
