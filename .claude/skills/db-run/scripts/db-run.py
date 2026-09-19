@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# db-run v1.7 — Launch 1C:Enterprise
+# db-run v1.10 — Launch 1C:Enterprise
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 import argparse
@@ -10,6 +10,28 @@ import re
 import subprocess
 import sys
 import time
+
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
 
 
 def _find_project_v8path():
@@ -42,6 +64,17 @@ V8_OWNED_KEYS = [
     "/DumpConfigToFiles", "/LoadConfigFromFiles", "/UpdateDBCfg",
     "/DumpExternalDataProcessorOrReportToFiles", "/LoadExternalDataProcessorOrReportFromFiles",
 ]
+# Пакетные команды платформы. В одной командной строке DESIGNER выполняет ТОЛЬКО ПОСЛЕДНЮЮ,
+# остальные молча отбрасывает (проверено на 8.3.24: /LoadConfigFromFiles вместе с
+# /CheckCanApplyConfigurationExtensions завершились кодом 0 с пустым логом, и загрузка НЕ
+# состоялась). Такая команда в дополнительных аргументах подменяет собой операцию навыка, а навык
+# отчитывается успехом. Дополнительные аргументы — это опции, а не режимы.
+V8_BATCH_KEYS = [
+    "/CheckConfig", "/CheckModules", "/CheckCanApplyConfigurationExtensions",
+    "/DumpDBCfgList", "/DeleteCfg", "/UpdateCfg", "/CompareCfg", "/MergeCfg",
+    "/ManageCfgSupport", "/RollbackCfg", "/ConvertFiles",
+]
+
 IBCMD_OWNED_KEYS = [
     "--db-path", "--data", "--out", "--file", "--load", "--restore",
     "--import", "--export", "--apply", "--force", "--create-database",
@@ -95,15 +128,21 @@ def assert_extra_args(extra, engine, hints):
             print(
                 f"Error: '{tok}' is a positional token — pass values as --key=value "
                 f"({param} cannot extend the ibcmd command)",
-                file=sys.stderr,
             )
             sys.exit(1)
+        if engine != "ibcmd":
+            for b in V8_BATCH_KEYS:
+                if arg_key_match(tok, b):
+                    print(
+                        f"Error: {b} is a batch command; passed via {param} it would replace "
+                        f"the skill's own operation (a command line runs only its last batch command)",
+                    )
+                    sys.exit(1)
         for k in owned:
             if arg_key_match(tok, k):
                 hint = f" (use {hints[k]})" if hints and k in hints else ""
                 print(
                     f"Error: {k} is controlled by the skill and cannot be passed via {param}{hint}",
-                    file=sys.stderr,
                 )
                 sys.exit(1)
 
@@ -171,14 +210,12 @@ def resolve_extra_args(engine, v8_extra, ibcmd_extra, hints):
         print(
             "Error: -AdditionalV8Arguments applies to 1cv8 only; the selected engine is ibcmd "
             "(use -AdditionalIbcmdArguments)",
-            file=sys.stderr,
         )
         sys.exit(1)
     if engine != "ibcmd" and ibcmd_extra:
         print(
             "Error: -AdditionalIbcmdArguments applies to ibcmd only; the selected engine is 1cv8 "
             "(use -AdditionalV8Arguments)",
-            file=sys.stderr,
         )
         sys.exit(1)
     if engine == "ibcmd":
@@ -203,7 +240,7 @@ def clean_path(value, param=""):
     if len(v) > 3 and v[-1] in "\\/":
         v = v[:-1]
     if '"' in v:
-        print(f"Error: {param or 'path'} contains a quote character: {value}", file=sys.stderr)
+        print(f"Error: {param or 'path'} contains a quote character: {value}")
         sys.exit(1)
     return v
 
@@ -238,14 +275,14 @@ def resolve_v8path(v8path):
             v8path = max(candidates, key=_version_key)
             print(f"Auto-selected platform {_version_dir(v8path)}: {v8path}")
         else:
-            print("Error: 1C executable not found. Specify -V8Path", file=sys.stderr)
+            print("Error: 1C executable not found. Specify -V8Path")
             sys.exit(1)
     if os.path.isdir(v8path):
         # PY-only: на *nix исполняемый называется "1cv8" (без .exe); ibcmd — только явным путём.
         exe = "1cv8.exe" if os.name == "nt" else "1cv8"
         v8path = os.path.join(v8path, exe)
     if not os.path.isfile(v8path):
-        print(f"Error: 1C executable not found at {v8path}", file=sys.stderr)
+        print(f"Error: 1C executable not found at {v8path}")
         sys.exit(1)
     return v8path
 
@@ -281,7 +318,7 @@ def main():
                         help="Extra ibcmd arguments in --key=value form")
     known_opts = {s.lower() for a in parser._actions for s in a.option_strings}
     argv, v8_extra, ibcmd_extra = extract_extra_args(sys.argv[1:], known_opts)
-    args = parser.parse_args(argv)
+    args = ci_parse_args(parser, argv)
 
     args.V8Path = clean_path(args.V8Path, "-V8Path")
     args.InfoBasePath = clean_path(args.InfoBasePath, "-InfoBasePath")
@@ -305,7 +342,7 @@ def main():
 
     # --- Validate connection ---
     if not args.InfoBasePath and (not args.InfoBaseServer or not args.InfoBaseRef):
-        print("Error: specify -InfoBasePath or -InfoBaseServer + -InfoBaseRef", file=sys.stderr)
+        print("Error: specify -InfoBasePath or -InfoBaseServer + -InfoBaseRef")
         sys.exit(1)
 
     # --- Build arguments ---
@@ -355,7 +392,7 @@ def main():
         time.sleep(0.2)
     rc = proc.poll()
     if rc is not None:
-        print(f"Error: 1C:Enterprise exited immediately (code: {rc})", file=sys.stderr)
+        print(f"Error: 1C:Enterprise exited immediately (code: {rc})")
         sys.exit(rc if rc and rc > 0 else 1)
     print(f"PID: {proc.pid}")
     print("1C:Enterprise launched")

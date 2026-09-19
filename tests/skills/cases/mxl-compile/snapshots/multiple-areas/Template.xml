@@ -15,11 +15,10 @@
 	<rowsItem>
 		<index>0</index>
 		<row>
-			<formatIndex>2</formatIndex>
+			<formatIndex>1</formatIndex>
 			<c>
-				<i>0</i>
 				<c>
-					<f>3</f>
+					<f>2</f>
 					<parameter>ТекстЗаголовка</parameter>
 				</c>
 			</c>
@@ -28,10 +27,10 @@
 	<rowsItem>
 		<index>1</index>
 		<row>
+			<formatIndex>3</formatIndex>
 			<c>
-				<i>0</i>
 				<c>
-					<f>5</f>
+					<f>3</f>
 					<tl>
 						<v8:item>
 							<v8:lang>ru</v8:lang>
@@ -41,9 +40,8 @@
 				</c>
 			</c>
 			<c>
-				<i>1</i>
 				<c>
-					<f>5</f>
+					<f>3</f>
 					<tl>
 						<v8:item>
 							<v8:lang>ru</v8:lang>
@@ -53,9 +51,8 @@
 				</c>
 			</c>
 			<c>
-				<i>2</i>
 				<c>
-					<f>5</f>
+					<f>3</f>
 					<tl>
 						<v8:item>
 							<v8:lang>ru</v8:lang>
@@ -65,9 +62,8 @@
 				</c>
 			</c>
 			<c>
-				<i>3</i>
 				<c>
-					<f>5</f>
+					<f>3</f>
 					<tl>
 						<v8:item>
 							<v8:lang>ru</v8:lang>
@@ -81,32 +77,29 @@
 	<rowsItem>
 		<index>2</index>
 		<row>
+			<formatIndex>3</formatIndex>
 			<c>
-				<i>0</i>
 				<c>
-					<f>6</f>
+					<f>4</f>
 					<parameter>НомерСтроки</parameter>
 				</c>
 			</c>
 			<c>
-				<i>1</i>
 				<c>
-					<f>6</f>
+					<f>4</f>
 					<parameter>Товар</parameter>
 					<detailParameter>Номенклатура</detailParameter>
 				</c>
 			</c>
 			<c>
-				<i>2</i>
 				<c>
-					<f>7</f>
+					<f>5</f>
 					<parameter>Количество</parameter>
 				</c>
 			</c>
 			<c>
-				<i>3</i>
 				<c>
-					<f>7</f>
+					<f>5</f>
 					<parameter>Сумма</parameter>
 				</c>
 			</c>
@@ -118,7 +111,7 @@
 			<c>
 				<i>2</i>
 				<c>
-					<f>8</f>
+					<f>6</f>
 					<tl>
 						<v8:item>
 							<v8:lang>ru</v8:lang>
@@ -128,16 +121,15 @@
 				</c>
 			</c>
 			<c>
-				<i>3</i>
 				<c>
-					<f>9</f>
+					<f>7</f>
 					<parameter>Всего</parameter>
 				</c>
 			</c>
 		</row>
 	</rowsItem>
 	<templateMode>true</templateMode>
-	<defaultFormatIndex>1</defaultFormatIndex>
+	<defaultFormatIndex>8</defaultFormatIndex>
 	<height>4</height>
 	<vgRows>4</vgRows>
 	<merge>
@@ -156,11 +148,11 @@
 		</area>
 	</namedItem>
 	<namedItem xsi:type="NamedItemCells">
-		<name>ШапкаТаблицы</name>
+		<name>Итого</name>
 		<area>
 			<type>Rows</type>
-			<beginRow>1</beginRow>
-			<endRow>1</endRow>
+			<beginRow>3</beginRow>
+			<endRow>3</endRow>
 			<beginColumn>-1</beginColumn>
 			<endColumn>-1</endColumn>
 		</area>
@@ -176,11 +168,11 @@
 		</area>
 	</namedItem>
 	<namedItem xsi:type="NamedItemCells">
-		<name>Итого</name>
+		<name>ШапкаТаблицы</name>
 		<area>
 			<type>Rows</type>
-			<beginRow>3</beginRow>
-			<endRow>3</endRow>
+			<beginRow>1</beginRow>
+			<endRow>1</endRow>
 			<beginColumn>-1</beginColumn>
 			<endColumn>-1</endColumn>
 		</area>
@@ -188,62 +180,40 @@
 	<line width="1" gap="false">
 		<v8ui:style xsi:type="v8ui:SpreadsheetDocumentCellLineType">Solid</v8ui:style>
 	</line>
-	<font faceName="Arial" height="10" bold="false" italic="false" underline="false" strikeout="false" kind="Absolute" scale="100"/>
 	<font faceName="Arial" height="10" bold="true" italic="false" underline="false" strikeout="false" kind="Absolute" scale="100"/>
 	<font faceName="Arial" height="14" bold="true" italic="false" underline="false" strikeout="false" kind="Absolute" scale="100"/>
-	<format>
-		<width>30</width>
-	</format>
 	<format>
 		<height>20</height>
 	</format>
 	<format>
-		<font>2</font>
+		<font>1</font>
 		<horizontalAlignment>Center</horizontalAlignment>
 		<fillType>Parameter</fillType>
 	</format>
 	<format>
-		<font>0</font>
-		<leftBorder>0</leftBorder>
-		<topBorder>0</topBorder>
-		<rightBorder>0</rightBorder>
-		<bottomBorder>0</bottomBorder>
+		<border>0</border>
 	</format>
 	<format>
-		<font>0</font>
-		<leftBorder>0</leftBorder>
-		<topBorder>0</topBorder>
-		<rightBorder>0</rightBorder>
-		<bottomBorder>0</bottomBorder>
-		<fillType>Text</fillType>
-	</format>
-	<format>
-		<font>0</font>
-		<leftBorder>0</leftBorder>
-		<topBorder>0</topBorder>
-		<rightBorder>0</rightBorder>
-		<bottomBorder>0</bottomBorder>
+		<border>0</border>
 		<fillType>Parameter</fillType>
 	</format>
 	<format>
-		<font>0</font>
-		<leftBorder>0</leftBorder>
-		<topBorder>0</topBorder>
-		<rightBorder>0</rightBorder>
-		<bottomBorder>0</bottomBorder>
+		<border>0</border>
 		<horizontalAlignment>Right</horizontalAlignment>
 		<fillType>Parameter</fillType>
 	</format>
 	<format>
-		<font>1</font>
+		<font>0</font>
 		<topBorder>0</topBorder>
 		<horizontalAlignment>Right</horizontalAlignment>
-		<fillType>Text</fillType>
 	</format>
 	<format>
-		<font>1</font>
+		<font>0</font>
 		<topBorder>0</topBorder>
 		<horizontalAlignment>Right</horizontalAlignment>
 		<fillType>Parameter</fillType>
+	</format>
+	<format>
+		<width>30</width>
 	</format>
 </document>

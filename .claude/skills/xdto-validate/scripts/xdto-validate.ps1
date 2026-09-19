@@ -1,7 +1,8 @@
-﻿# xdto-validate v1.1 — Validate a 1C XDTO package
+﻿# xdto-validate v1.4 — Validate a 1C XDTO package
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
+[CmdletBinding(PositionalBinding=$false)]
 param(
-	[Parameter(Mandatory)]
+	[Parameter(Mandatory, Position=0)]
 	[Alias('Path')]
 	[string]$PackagePath,
 
@@ -43,16 +44,21 @@ $script:stopped = $false
 $script:output = New-Object System.Text.StringBuilder
 
 function Out-Line([string]$s) { [void]$script:output.AppendLine($s) }
-function Report-OK([string]$msg) {
+function Report-OK {
+	param([string]$msg)
 	$script:okCount++
 	if ($Detailed) { Out-Line "[OK]    $msg" }
 }
-function Report-Error([string]$msg) {
+function Report-Error {
+	param([string]$msg)
 	$script:errors++
 	Out-Line "[ERROR] $msg"
-	if ($script:errors -ge $MaxErrors) { $script:stopped = $true }
+	if ($script:errors -ge $MaxErrors) {
+		$script:stopped = $true
+	}
 }
-function Report-Warn([string]$msg) {
+function Report-Warn {
+	param([string]$msg)
 	$script:warnings++
 	Out-Line "[WARN]  $msg"
 }

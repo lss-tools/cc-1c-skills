@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // verify-snapshots v0.2 — Platform verification of skill test snapshots
 // Reruns skill scripts from test-case DSL, then loads into 1C platform.
-// Usage: node tests/skills/verify-snapshots.mjs [--skill meta-compile] [--case catalog-basic] [--runtime powershell|python] [--keep] [--verbose]
+// Usage: node tests/skills/verify-snapshots.mjs [--skill meta-compile] [--case catalog-basic] [--runtime powershell|python] [--keep] [--verbose] [--strict]
 // Supports: meta-compile, form-compile, form-add, form-edit, skd-compile, skd-edit,
 //           role-compile, subsystem-compile, subsystem-edit, mxl-compile, template-add,
 //           help-add, cf-init, cf-edit, epf-init, meta-edit, interface-edit,
@@ -12,10 +12,13 @@
 // типовой конфигурации (~3 мин на кейс, ноль информации). Такие гонять через --case.
 
 import { execFileSync } from 'child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync,
-         readdirSync, statSync, cpSync, copyFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, unlinkSync, readFileSync, writeFileSync,
+         readdirSync, statSync, copyFileSync, chmodSync } from 'fs';
 import { join, resolve, dirname, basename } from 'path';
 import { tmpdir } from 'os';
+// fs.rmSync/fs.cpSync напрямую не зовём: на Windows они молча ничего не делают, когда в пути
+// есть не-ASCII символы. Подробности и таблица сборок — в самом модуле.
+import { removePathSync, copyTreeSync } from '../common/fsutil.mjs';
 
 // ─── Paths ──────────────────────────────────────────────────────────────────
 
@@ -43,6 +46,7 @@ Options:
                            Precedence: --v8path > .v8-project.json > auto-detect.
   --keep                   Keep generated work directories on disk after run
   -v, --verbose            Verbose output
+  --strict                 Пропуск считать падением: непроверенных кейсов не остаётся
   -h, --help, /?           Show this help and exit
 `);
 }
@@ -59,6 +63,7 @@ function parseArgs(argv) {
     if (a === '--v8path' && rest[i + 1]) { args.v8path = rest[++i]; continue; }
     if (a === '--keep') { args.keep = true; continue; }
     if (a === '--verbose' || a === '-v') { args.verbose = true; continue; }
+    if (a === '--strict') { args.strict = true; continue; }
   }
   return args;
 }
@@ -563,10 +568,16 @@ function buildSkillArgs(skillConfig, caseData, workDir, inputFile, runtime) {
     args.push(mapping.flag);
     switch (mapping.from) {
       case 'inputFile':
-        args.push(inputFile || '');
+        // inputFrom: вход берётся из файла в workDir, а не из case.input. Нужно, когда вход
+        // производит preRun (например, декомпилятор) — case.input пишется ПОСЛЕ preRun и
+        // затёр бы его. Как в runner.mjs.
+        args.push(caseData.inputFrom ? join(workDir, caseData.inputFrom) : (inputFile || ''));
         break;
       case 'workDir':
         args.push(workDir);
+        break;
+      case 'outputPath':
+        args.push(join(workDir, caseData.outputPath || ''));
         break;
       case 'workPath': {
         const field = mapping.field || 'objectPath';
@@ -592,10 +603,19 @@ function buildSkillArgs(skillConfig, caseData, workDir, inputFile, runtime) {
           args.push(String(caseData.params?.[field] ?? caseData[field] ?? ''));
         } else if (mapping.from === 'literal') {
           args.push(mapping.value || '');
+        } else {
+          // Незнакомый from раньше молча не давал значения — флаг уходил без аргумента, и
+          // это выглядело как дефект навыка. DSL читают два раннера, поэтому расхождение
+          // должно быть громким.
+          throw new Error(`_skill.json: неизвестный "from": "${mapping.from}" у флага ${mapping.flag}`
+            + ' — verify-snapshots.mjs не знает этого маппинга (см. buildSkillArgs)');
         }
     }
   }
-  if (caseData.args_extra) args.push(...caseData.args_extra);
+  // Плейсхолдер {workDir} раскрывается и в args_extra — как в runner.mjs.
+  if (caseData.args_extra) {
+    args.push(...caseData.args_extra.map(a => typeof a === 'string' ? a.replace('{workDir}', workDir) : a));
+  }
   return { scriptPath, args };
 }
 
@@ -612,8 +632,21 @@ function runPreSteps(preRun, workDir, runtime, log) {
         : JSON.stringify(step.writeFile.content, null, 2);
       mkdirSync(dirname(wfPath), { recursive: true });
       writeFileSync(wfPath, wfContent, 'utf8');
+      // Бит исполнения: на *nix навык запускает платформу через exec, и фейк без +x
+      // не стартует вовсе. На Windows chmod — no-op.
+      if (step.writeFile.executable) chmodSync(wfPath, 0o755);
       log(`preRun: writeFile ${step.writeFile.path}`, true);
       continue;
+    }
+    // deletePath step — как в runner.mjs: состояние «файла нет» выражается удалением.
+    // Без этой ветки шаг проваливался в запуск скрипта и падал на step.script.split.
+    if (step.deletePath) {
+      removePathSync(join(workDir, step.deletePath));
+      log(`preRun: deletePath ${step.deletePath}`, true);
+      continue;
+    }
+    if (!step.script) {
+      throw new Error(`preRun: шаг без script/writeFile/deletePath — ${JSON.stringify(step).slice(0, 120)}`);
     }
     const preArgs = [];
     for (const [flag, value] of Object.entries(step.args || {})) {
@@ -631,13 +664,16 @@ function runPreSteps(preRun, workDir, runtime, log) {
     }
     const stepName = step.script.split('/').pop();
     try {
-      execSkill(runtime, step.script, preArgs);
+      // cwd: "{workDir}" — шаг запускается из рабочего каталога, чтобы относительные
+      // пути в его args (напр. -OutputPath Template.xml) легли в фикстуру, а не в репозиторий.
+      const preCwd = step.cwd === '{workDir}' ? workDir : REPO_ROOT;
+      execSkill(runtime, step.script, preArgs, 60_000, preCwd);
       log(`preRun: ${stepName}`, true);
     } catch (e) {
       log(`preRun: ${stepName}`, false, e.stderr || e.message);
       throw new Error(`preRun "${step.script}" failed: ${(e.stderr || e.message).substring(0, 500)}`);
     }
-    if (preInputFile && existsSync(preInputFile)) rmSync(preInputFile);
+    if (preInputFile && existsSync(preInputFile)) unlinkSync(preInputFile);
   }
 }
 
@@ -647,7 +683,7 @@ function runPreSteps(preRun, workDir, runtime, log) {
 
 // Standalone file skills — produce files (not configs), platform load = just run script
 const STANDALONE_SKILLS = new Set([
-  'skd-compile', 'skd-edit', 'skd-info', 'skd-validate',
+  'skd-compile', 'skd-edit', 'skd-info', 'skd-validate', 'skd-decompile',
   'mxl-decompile', 'mxl-info', 'mxl-validate',
 ]);
 
@@ -671,6 +707,124 @@ const EPF_SKILLS = new Map([
 // route is auto-detected after the main script runs.
 const EPF_OR_CONFIG_SKILLS = new Set(['template-add', 'help-add']);
 
+// Диагностика падения навыка. Оба потока вместе: ps1 печатает строку ошибки в stdout, py — в
+// stderr, а лог платформы оба кладут в stdout. Читать только `stderr || stdout` значило на
+// python-порте потерять лог целиком — падение выглядело как «Error loading configuration (code: 1)»
+// без причины, и по нему нельзя было отличить неподдерживаемый формат от реального дефекта.
+function errDetail(e) {
+  return [e.stdout, e.stderr, e.message].filter(Boolean).join('\n').trim();
+}
+
+// Режим совместимости конфигурации против версии платформы: "Version8_3_27" на 8.3.24 не
+// загрузится. Возвращает причину пропуска либо null, если платформа подходит.
+function compatibilityGap(configDir, v8path) {
+  const cfgFile = join(configDir, 'Configuration.xml');
+  if (!existsSync(cfgFile)) return null;
+  const m = /<CompatibilityMode>Version(\d+)_(\d+)_(\d+)<\/CompatibilityMode>/.exec(readFileSync(cfgFile, 'utf8'));
+  if (!m) return null;
+  const need = [+m[1], +m[2], +m[3]];
+  const p = /(\d+)\.(\d+)\.(\d+)/.exec(v8path || '');
+  if (!p) return null;
+  const have = [+p[1], +p[2], +p[3]];
+  for (let i = 0; i < 3; i++) {
+    if (have[i] > need[i]) return null;
+    if (have[i] < need[i]) {
+      return `режим совместимости ${need.join('.')} выше платформы ${have.join('.')} — запустите с --v8path`;
+    }
+  }
+  return null;
+}
+
+// ── Вход кейса: те же ключи, что понимает runner.mjs ────────────────────────
+// DSL один, реализации две, и ключ, известный лишь одному раннеру, даёт тихую дыру: кейс зелёный
+// в функциональном прогоне и не доезжает до платформы в верификации. Так и вышло с inputRaw —
+// verify писал вход только из caseData.input и только UTF-8, поэтому навык оставался без входного
+// файла. Копия encodeInput из runner.mjs (общего модуля у раннеров нет) — держать одинаковыми.
+// Байты входного файла в заданной кодировке. Нужно для кейсов про кодировку: writeFileSync
+// пишет только UTF-8, а навык обязан одинаково вести себя на UTF-16 с BOM (принять) и на
+// cp1251 (отвергнуть, а не молча подменить кириллицу на U+FFFD). cp1251 в Node нет — кодируем
+// формулой по диапазонам, которые встречаются в кейсах (ASCII + кириллица); прочее — ошибка кейса.
+function encodeInput(text, encoding) {
+  if (!encoding || encoding === 'utf-8' || encoding === 'utf8') return Buffer.from(text, 'utf8');
+  if (encoding === 'utf-16le') return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, 'utf16le')]);
+  if (encoding === 'utf-16be') {
+    const le = Buffer.from(text, 'utf16le');
+    const be = Buffer.alloc(le.length);
+    for (let i = 0; i < le.length; i += 2) { be[i] = le[i + 1]; be[i + 1] = le[i]; }
+    return Buffer.concat([Buffer.from([0xfe, 0xff]), be]);
+  }
+  if (encoding === 'cp1251') {
+    const out = Buffer.alloc(text.length);
+    for (let i = 0; i < text.length; i++) {
+      const c = text.codePointAt(i);
+      if (c < 0x80) out[i] = c;
+      else if (c >= 0x410 && c <= 0x44f) out[i] = c - 0x350;
+      else if (c === 0x401) out[i] = 0xa8;
+      else if (c === 0x451) out[i] = 0xb8;
+      else throw new Error(`inputEncoding cp1251: символ U+${c.toString(16)} вне поддержанного набора (ASCII + кириллица)`);
+    }
+    return out;
+  }
+  throw new Error(`inputEncoding: неизвестная кодировка "${encoding}"`);
+}
+
+// Версия формата выгрузки против платформы: формат 2.21 не загрузится на 8.3.27, даже если
+// режим совместимости платформе подходит. Без этой проверки кейс на 2.21 скипался только на
+// 8.3.24 (по совместимости), а на 8.3.27 доходил до загрузки и падал — постоянный ложный
+// красный на стендах с промежуточной платформой.
+//
+// Эталон — таблица «Лестница версий» из docs/1c-configuration-spec.md (§7.1); разбор — копия
+// такого же в check-format-versions.mjs, держать одинаковыми.
+function formatGap(configDir, v8path) {
+  return formatGapForXml(join(configDir, 'Configuration.xml'), v8path);
+}
+
+// Ядро гейта: версия формата берётся из шапки любого MetaDataObject — Configuration.xml для
+// конфигурации, исходник обработки/отчёта для EPF/ERF. Раньше проверка вызывалась только при
+// наличии каталога конфигурации, поэтому кейсы epf-init/erf-init на формате 2.21 доходили до
+// сборки и падали на стенде без 8.5 — красным, хотя это свойство стенда.
+function formatGapForXml(xmlFile, v8path) {
+  if (!existsSync(xmlFile)) return null;
+  const fm = /<MetaDataObject[^>]*\sversion="(\d+\.\d+)"/.exec(readFileSync(xmlFile, 'utf8'));
+  const pm = /(\d+\.\d+\.\d+)/.exec(v8path || '');
+  if (!fm || !pm) return null;
+
+  const specFile = join(REPO_ROOT, 'docs', '1c-configuration-spec.md');
+  if (!existsSync(specFile)) return null;
+  const section = readFileSync(specFile, 'utf8').split(/^### 7\.1\./m)[1];
+  if (!section) return null;
+  const ladder = new Map();               // версия формата → минимальная платформа
+  for (const line of section.split(/^###? /m)[0].split('\n')) {
+    const m = /^\|\s*([\d.]+)\s*\|\s*`?(\d+\.\d+)`?\s*\|/.exec(line);
+    if (m) ladder.set(m[2], m[1]);
+  }
+  const needPlatform = ladder.get(fm[1]);
+  if (!needPlatform) return null;
+
+  const cmp = (a, b) => {
+    const x = a.split('.').map(Number), y = b.split('.').map(Number);
+    for (let i = 0; i < Math.max(x.length, y.length); i++) {
+      if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0);
+    }
+    return 0;
+  };
+  if (cmp(pm[1], needPlatform) < 0) {
+    return `формат выгрузки ${fm[1]} требует платформу ${needPlatform}, доступна ${pm[1]} — запустите с --v8path`;
+  }
+  return null;
+}
+
+// Аргументы cf-init для вариантов пустой конфигурации. Копия таблицы EMPTY_CONFIGS из
+// runner.mjs — держать одинаковыми: разойдутся, и верификация пойдёт не на том формате,
+// на котором прогонялся кейс.
+const EMPTY_CONFIG_ARGS = {
+  'empty-config': [],
+  'empty-config-218': ['-FormatVersion', '2.18', '-CompatibilityMode', 'Version8_3_24'],
+  'empty-config-220': ['-FormatVersion', '2.20', '-CompatibilityMode', 'Version8_3_27'],
+  'empty-config-220-compat24': ['-FormatVersion', '2.20', '-CompatibilityMode', 'Version8_3_24'],
+  'empty-config-221': ['-FormatVersion', '2.21', '-CompatibilityMode', 'Version8_3_27'],
+};
+
 // CFE skills — two-stage load: base config → extension
 const CFE_SKILLS = new Set([
   'cfe-init', 'cfe-borrow', 'cfe-patch-method',
@@ -693,10 +847,25 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
   // Кейс может осознанно исключаться из платформенной проверки — когда его
   // результат невалиден by design (например, операция намеренно оставляет
   // висящий импорт). Причина обязательна, молча пропускать нельзя.
+  // Строка — пропуск всегда. Объект `{reason, platforms:[…]}` — пропуск ТОЛЬКО на перечисленных
+  // сборках платформы: бывает, что кейс валиден и проверяется на всех стендах, кроме одного,
+  // где сама платформа отвергает даже собственный артефакт. Глухой пропуск в таком случае снял
+  // бы проверку и там, где она работает.
   if (caseData.skipPlatformVerify) {
-    result.skipped = true;
-    result.skipReason = String(caseData.skipPlatformVerify);
-    return result;
+    const spec = caseData.skipPlatformVerify;
+    const isObj = typeof spec === 'object' && spec !== null;
+    const reason = isObj ? spec.reason : String(spec);
+    if (!reason) {
+      result.errors.push('skipPlatformVerify: причина обязательна');
+      return result;
+    }
+    const builds = isObj && Array.isArray(spec.platforms) ? spec.platforms : null;
+    const v8exe = (opts.v8ctx && opts.v8ctx.v8exe) || '';
+    if (!builds || builds.some(b => v8exe.includes(b))) {
+      result.skipped = true;
+      result.skipReason = reason;
+      return result;
+    }
   }
 
   // caseFiles — файловый вход кейса (напр. XSD для xdto-compile), как в runner.mjs
@@ -716,8 +885,12 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
     }
   };
 
-  // Determine config dir
-  const setupType = skillConfig.setup || 'empty-config';
+  // Determine config dir.
+  // setup кейса перекрывает setup навыка — как в runner.mjs. Без этого кейсы с гейтом по версии
+  // формата (empty-config-218/220/221) проверялись на конфигурации 2.17, то есть платформа не
+  // видела ровно того поведения, ради которого кейс написан.
+  const caseSetup = typeof caseData.setup === 'string' ? caseData.setup : null;
+  const setupType = (caseSetup && caseSetup.startsWith('empty-config')) ? caseSetup : (skillConfig.setup || 'empty-config');
   const isStandalone = STANDALONE_SKILLS.has(skillName);
   let epfExt = EPF_SKILLS.get(skillName);
   let isEpf = !!epfExt;
@@ -725,7 +898,7 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
   // For 'empty-config': workDir is the config (setup creates it)
   // For cf-init: workDir becomes the config after the script runs
   // For 'none' + non-special: no config (standalone/EPF)
-  let configDir = (setupType === 'empty-config' || isCfInit) ? workDir : null;
+  let configDir = (setupType.startsWith('empty-config') || isCfInit) ? workDir : null;
 
   try {
     // ── Step 0: Case-level fixture/external setup (runner.mjs compatibility) ──
@@ -739,15 +912,24 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
         result.errors.push(`Fixture not found: ${fixturePath}`);
         return result;
       }
-      cpSync(fixturePath, workDir, { recursive: true });
+      copyTreeSync(fixturePath, workDir);
       log(`fixture: ${fixtureName}`, true);
+      // Фикстура-конфигурация — такой же вход для платформы, как external-выгрузка. Раньше
+      // configDir приходил только из скилл-уровневого setup (empty-config), поэтому у навыков
+      // с setup: none фикстура до платформы не доезжала, а кейс всё равно получал PASS.
+      if (existsSync(join(workDir, 'Configuration.xml'))) configDir = workDir;
     } else if (typeof caseData.setup === 'string' && caseData.setup.startsWith('external:')) {
       const extPath = resolve(REPO_ROOT, caseData.setup.slice('external:'.length));
+      // Недоступная внешняя выгрузка — СКИП, как в runner.mjs (`ensureSetup`, ветка
+      // external). Путь к дампу ERP/БП машинозависим: на маке его нет, и падение
+      // здесь красило набор при полностью исправном навыке — расхождение двух
+      // раннеров по одному и тому же ключу DSL.
       if (!existsSync(extPath)) {
-        result.errors.push(`External setup path not found: ${extPath}`);
+        result.skipped = true;
+        result.skipReason = `внешняя выгрузка недоступна на этой машине: ${extPath}`;
         return result;
       }
-      cpSync(extPath, workDir, { recursive: true });
+      copyTreeSync(extPath, workDir);
       log(`external: ${extPath}`, true);
       configDir = workDir;
     }
@@ -757,10 +939,11 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
     const caseProvidedConfig = typeof caseData.setup === 'string' &&
       (caseData.setup.startsWith('external:') || caseData.setup.startsWith('fixture:'));
     // Skip setup for cf-init skill — the test itself creates the config
-    if (configDir && setupType === 'empty-config' && !CONFIG_INIT_SKILLS.has(skillName) && !caseProvidedConfig) {
+    if (configDir && setupType.startsWith('empty-config') && !CONFIG_INIT_SKILLS.has(skillName) && !caseProvidedConfig) {
       try {
-        execSkill(opts.runtime, 'cf-init/scripts/cf-init', ['-Name', 'VerifyTest', '-OutputDir', workDir]);
-        log('cf-init', true);
+        const initArgs = ['-Name', 'VerifyTest', '-OutputDir', workDir, ...(EMPTY_CONFIG_ARGS[setupType] || [])];
+        execSkill(opts.runtime, 'cf-init/scripts/cf-init', initArgs);
+        log('cf-init', true, (EMPTY_CONFIG_ARGS[setupType] || []).join(' '));
       } catch (e) {
         log('cf-init', false, e.stderr || e.message);
         result.errors.push(`cf-init failed: ${(e.stderr || e.message).substring(0, 500)}`);
@@ -868,14 +1051,19 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
 
     // ── Step 4: Main skill script ──
     let inputFile = null;
-    if (caseData.input !== undefined) {
+    if (caseData.inputRaw !== undefined) {
+      // inputRaw пишется дословно: негативный кейс про битый JSON через input невыразим —
+      // JSON.stringify всегда даёт валидный документ.
       inputFile = join(workDir, '__input.json');
-      writeFileSync(inputFile, JSON.stringify(caseData.input, null, 2), 'utf8');
+      writeFileSync(inputFile, encodeInput(caseData.inputRaw, caseData.inputEncoding));
+    } else if (caseData.input !== undefined) {
+      inputFile = join(workDir, '__input.json');
+      writeFileSync(inputFile, encodeInput(JSON.stringify(caseData.input, null, 2), caseData.inputEncoding));
     }
 
     try {
       const { args } = buildSkillArgs(skillConfig, caseData, workDir, inputFile, opts.runtime);
-      const mainCwd = skillConfig.cwd === 'workDir' ? workDir : REPO_ROOT;
+      const mainCwd = (caseData.cwd || skillConfig.cwd) === 'workDir' ? workDir : REPO_ROOT;
       const output = execSkill(opts.runtime, skillConfig.script, args, 60_000, mainCwd);
       const lastLine = output.trim().split('\n').pop();
       if (caseData.expectError) {
@@ -885,7 +1073,7 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
       }
       log(skillName, true, lastLine);
     } catch (e) {
-      const detail = (e.stderr || e.stdout || e.message).trim();
+      const detail = errDetail(e);
       if (caseData.expectError) {
         if (typeof caseData.expectError === 'string' && !detail.includes(caseData.expectError)) {
           log(skillName, false, `expected "${caseData.expectError}" in stderr, got: ${detail.substring(0, 200)}`);
@@ -893,6 +1081,7 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
           return result;
         }
         log(skillName, true, `(expected error) ${detail.substring(0, 100)}`);
+        result.noPlatformReason = 'навык ожидаемо отказал — своего выхода нет, грузить нечего';
         result.passed = true;
         return result;
       }
@@ -900,13 +1089,28 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
       result.errors.push(`${skillName} failed: ${detail.substring(0, 500)}`);
       return result;
     }
-    if (inputFile && existsSync(inputFile)) rmSync(inputFile);
+    if (inputFile && existsSync(inputFile)) unlinkSync(inputFile);
+
+    // Режим совместимости конфигурации выше платформы — она такую не загрузит. Это свойство
+    // стенда, а не дефект кейса, поэтому пропускаем с причиной: иначе на машине без нужной
+    // платформы кейсы с гейтом по версии формата давали бы ложное падение.
+    if (opts.v8ctx && configDir) {
+      const compatSkip = compatibilityGap(configDir, opts.v8ctx.v8path)
+        || formatGap(configDir, opts.v8ctx.v8path);
+      if (compatSkip) {
+        result.skipped = true;
+        result.skipReason = compatSkip;
+        log('platform-load', true, `skipped (${compatSkip})`);
+        return result;
+      }
+    }
 
     // ── Step 5: Determine verification strategy ──
     if (SKD_PLATFORM_VERIFY.has(skillName)) {
       // Wrap produced Template.xml in an external report (ERF) and try to build —
       // platform either accepts the schema or rejects it with an error.
       if (!opts.v8ctx) {
+        result.noPlatformReason = 'платформа недоступна в этом окружении';
         result.passed = true;
         log('platform-load', true, 'skipped (no v8 context)');
         return result;
@@ -926,13 +1130,13 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
         execSkill(opts.runtime, 'erf-init/scripts/init', ['-Name', 'TestReport', '-SrcDir', erfDir, '-WithSKD']);
         log('erf-init', true);
       } catch (e) {
-        const detail = (e.stderr || e.stdout || e.message).trim();
+        const detail = errDetail(e);
         log('erf-init', false, detail);
         result.errors.push(`erf-init failed: ${detail.substring(0, 500)}`);
         return result;
       }
       const dcsTpl = join(erfDir, 'TestReport', 'Templates', 'ОсновнаяСхемаКомпоновкиДанных', 'Ext', 'Template.xml');
-      cpSync(tplPath, dcsTpl, { force: true });
+      copyFileSync(tplPath, dcsTpl);
       try {
         execSkill(opts.runtime, 'epf-build/scripts/epf-build', [
           '-V8Path', opts.v8ctx.v8path,
@@ -940,9 +1144,10 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
           '-OutputFile', join(erfOutDir, 'TestReport.erf'),
         ], 120_000);
         log('erf-build', true, 'platform accepted schema');
+        result.platformChecked = true;
         result.passed = true;
       } catch (e) {
-        const detail = (e.stderr || e.stdout || e.message).trim();
+        const detail = errDetail(e);
         log('erf-build', false, detail);
         result.errors.push(`erf-build rejected schema: ${detail.substring(0, 1000)}`);
       }
@@ -964,7 +1169,7 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
         execSkill(opts.runtime, 'epf-init/scripts/init', ['-Name', 'TestProc', '-SrcDir', epfDir]);
         log('epf-init', true);
       } catch (e) {
-        const detail = (e.stderr || e.stdout || e.message).trim();
+        const detail = errDetail(e);
         log('epf-init', false, detail);
         result.errors.push(`epf-init failed: ${detail.substring(0, 500)}`);
         return result;
@@ -978,13 +1183,13 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
         ]);
         log('template-add', true);
       } catch (e) {
-        const detail = (e.stderr || e.stdout || e.message).trim();
+        const detail = errDetail(e);
         log('template-add', false, detail);
         result.errors.push(`template-add failed: ${detail.substring(0, 500)}`);
         return result;
       }
       const tplDest = join(epfDir, 'TestProc', 'Templates', 'Макет', 'Ext', 'Template.xml');
-      cpSync(tplPath, tplDest, { force: true });
+      copyFileSync(tplPath, tplDest);
       try {
         execSkill(opts.runtime, 'epf-build/scripts/epf-build', [
           '-V8Path', opts.v8ctx.v8path,
@@ -992,9 +1197,10 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
           '-OutputFile', join(epfOutDir, 'TestProc.epf'),
         ], 180_000);
         log('epf-build', true, 'platform accepted MXL');
+        result.platformChecked = true;
         result.passed = true;
       } catch (e) {
-        const detail = (e.stderr || e.stdout || e.message).trim();
+        const detail = errDetail(e);
         log('epf-build', false, detail);
         result.errors.push(`epf-build rejected MXL: ${detail.substring(0, 1000)}`);
       }
@@ -1002,6 +1208,7 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
     }
 
     if (isStandalone) {
+      result.noPlatformReason = 'standalone-навык: выход не конфигурация';
       result.passed = true;
       log('platform-load', true, 'skipped (standalone file, not a config)');
       return result;
@@ -1039,6 +1246,13 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
         result.errors.push(`EPF/ERF source not found: ${sourceFile}`);
         return result;
       }
+      const versionSkip = formatGapForXml(sourceFile, opts.v8ctx.v8path);
+      if (versionSkip) {
+        result.skipped = true;
+        result.skipReason = versionSkip;
+        log('epf-build', true, `skipped (${versionSkip})`);
+        return result;
+      }
       const outDir = join(workDir, '__build');
       mkdirSync(outDir, { recursive: true });
       const outFile = join(outDir, `${name}${epfExt}`);
@@ -1049,9 +1263,10 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
           '-OutputFile', outFile,
         ], 180_000);
         log('epf-build', true, `platform built ${epfExt}`);
+        result.platformChecked = true;
         result.passed = true;
       } catch (e) {
-        const detail = (e.stderr || e.stdout || e.message).trim();
+        const detail = errDetail(e);
         log('epf-build', false, detail);
         result.errors.push(`epf-build failed: ${detail.substring(0, 1000)}`);
       }
@@ -1059,8 +1274,16 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
     }
 
     if (CFE_SKILLS.has(skillName)) {
-      // CFE: two-stage load — base config first, then extension
-      const extDir = join(workDir, 'ext');
+      // CFE: two-stage load — base config first, then extension.
+      // Каталог расширения берём из кейса, а не хардкодим: при жёстком 'ext' кейс, назвавший
+      // каталог иначе, молча терял вторую половину проверки — блок ниже обходился по existsSync,
+      // и в отчёте это выглядело как успех.
+      const extRel = caseData.params?.extensionPath || caseData.params?.outputDir;
+      if (!extRel || extRel === '.') {
+        result.errors.push('CFE verify требует params.extensionPath (или params.outputDir) с каталогом расширения');
+        return result;
+      }
+      const extDir = join(workDir, extRel);
       const baseConfigDir = workDir; // preRun puts base config directly in workDir
       const dbDir = join(workDir, 'testdb');
 
@@ -1097,7 +1320,17 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
           ['-V8Path', opts.v8ctx.v8path, '-InfoBasePath', dbDir, '-ConfigDir', baseConfigDir, '-StrictLog'], 180_000);
         log('db-load-xml (config)', true);
       } catch (e) {
-        const detail = (e.stderr || e.stdout || e.message).trim();
+        const detail = errDetail(e);
+        // Формат выгрузки новее платформы — свойство стенда, а не дефект кейса. Платформа
+        // говорит об этом прямо, поэтому лестницу «платформа → версия формата» здесь
+        // дублировать не нужно: читаем её ответ.
+        const fmt = /Неизвестная версия формата ([\d.]+)/.exec(detail);
+        if (fmt) {
+          result.skipped = true;
+          result.skipReason = `формат выгрузки ${fmt[1]} новее платформы — запустите с --v8path`;
+          log('db-load-xml (config)', true, `skipped (${result.skipReason})`);
+          return result;
+        }
         log('db-load-xml (config)', false, detail);
         result.errors.push(`LoadConfig failed: ${detail.substring(0, 1000)}`);
         return result;
@@ -1108,7 +1341,7 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
           ['-V8Path', opts.v8ctx.v8path, '-InfoBasePath', dbDir], 180_000);
         log('db-update (config)', true);
       } catch (e) {
-        const detail = (e.stderr || e.stdout || e.message).trim();
+        const detail = errDetail(e);
         log('db-update (config)', false, detail);
         result.errors.push(`UpdateDBCfg config failed: ${detail.substring(0, 1000)}`);
         return result;
@@ -1128,7 +1361,7 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
             ['-V8Path', opts.v8ctx.v8path, '-InfoBasePath', dbDir, '-ConfigDir', extDir, '-Extension', extName, '-StrictLog'], 180_000);
           log('db-load-xml (ext)', true);
         } catch (e) {
-          const detail = (e.stderr || e.stdout || e.message).trim();
+          const detail = errDetail(e);
           log('db-load-xml (ext)', false, detail);
           result.errors.push(`LoadExtension failed: ${detail.substring(0, 1000)}`);
           return result;
@@ -1139,13 +1372,14 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
             ['-V8Path', opts.v8ctx.v8path, '-InfoBasePath', dbDir, '-Extension', extName], 180_000);
           log('db-update (ext)', true);
         } catch (e) {
-          const detail = (e.stderr || e.stdout || e.message).trim();
+          const detail = errDetail(e);
           log('db-update (ext)', false, detail);
           result.errors.push(`UpdateDBCfg ext failed: ${detail.substring(0, 1000)}`);
           return result;
         }
       }
 
+      result.platformChecked = true;
       result.passed = true;
       return result;
     }
@@ -1158,8 +1392,13 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
     }
 
     if (!configDir) {
-      // No config to load — setup was 'none' and not EPF/standalone
-      result.passed = true;
+      // Грузить нечего, и спец-маршрута (MXL/SKD/EPF/CFE/standalone) для навыка нет. Раньше здесь
+      // стоял PASS — кейс выглядел проверенным, ни разу не обратившись к платформе. Пропуск
+      // допустим, но только объявленный: причина должна быть в кейсе и видна в отчёте.
+      result.errors.push(
+        'Платформенной проверки не было: конфигурации для загрузки нет, спец-маршрут не подошёл. '
+        + 'Если для этого кейса проверка невозможна или вырождается — объявите в кейсе '
+        + '"skipPlatformVerify": "<причина>"');
       return result;
     }
 
@@ -1250,6 +1489,7 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
     // to exercise the skill script against real-world XML, not to validate
     // that an entire vendor config loads into a fresh DB.
     if (caseProvidedConfig && caseData.setup.startsWith('external:')) {
+      result.noPlatformReason = 'external: грузилась бы собственная выгрузка типовой (~3 мин, ноль информации о навыке)';
       result.passed = true;
       log('platform-load', true, 'skipped (external setup)');
       return result;
@@ -1271,7 +1511,7 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
         ['-V8Path', opts.v8ctx.v8path, '-InfoBasePath', dbDir, '-ConfigDir', configDir, '-StrictLog'], 180_000);
       log('db-load-xml', true);
     } catch (e) {
-      const detail = (e.stderr || e.stdout || e.message).trim();
+      const detail = errDetail(e);
       log('db-load-xml', false, detail);
       result.errors.push(`LoadConfigFromFiles failed: ${detail.substring(0, 1000)}`);
       return result;
@@ -1282,19 +1522,20 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
         ['-V8Path', opts.v8ctx.v8path, '-InfoBasePath', dbDir], 180_000);
       log('db-update', true);
     } catch (e) {
-      const detail = (e.stderr || e.stdout || e.message).trim();
+      const detail = errDetail(e);
       log('db-update', false, detail);
       result.errors.push(`UpdateDBCfg failed: ${detail.substring(0, 1000)}`);
       return result;
     }
 
+    result.platformChecked = true;
     result.passed = true;
   } catch (e) {
     result.errors.push(`Unexpected error: ${e.message}`);
   } finally {
     if (!opts.keep) {
-      try { rmSync(workDir, { recursive: true, force: true }); } catch {}
-      result.workDir = '(cleaned)';
+      // При неудаче оставляем в result реальный путь: остаток каталога виден в отчёте.
+      try { removePathSync(workDir); result.workDir = '(cleaned)'; } catch {}
     }
   }
 
@@ -1306,7 +1547,7 @@ async function verifyCase(skillName, caseName, skillConfig, caseData, opts) {
 // Default skills to verify when no --skill given
 const DEFAULT_SKILLS = [
   'meta-compile', 'form-compile', 'form-compile-from-object', 'form-add', 'form-edit',
-  'role-compile', 'subsystem-compile', 'subsystem-edit',
+  'role-compile', 'role-edit', 'subsystem-compile', 'subsystem-edit',
   'cf-init', 'cf-edit', 'meta-edit', 'interface-edit',
   'epf-init', 'erf-init', 'template-add', 'help-add',
   'cfe-init', 'cfe-borrow', 'cfe-patch-method',
@@ -1340,8 +1581,15 @@ function discoverCases(skillFilter, caseFilter) {
       // Skip error cases
       if (caseName.startsWith('error-')) continue;
 
-      // Skip cases without input AND without preRun AND without params (truly read-only)
-      if (caseData.input === undefined && !caseData.preRun && !caseData.params) continue;
+      // Skip cases without input AND without preRun AND without params (truly read-only).
+      // Кейс на `setup: fixture:` тоже не read-only: навык правит скопированную фикстуру, и
+      // без этой ветки такие кейсы молча выпадали из платформенной проверки — то есть ровно
+      // из той, ради которой этот файл и существует.
+      const hasFixtureSetup = typeof caseData.setup === 'string' && caseData.setup.startsWith('fixture:');
+      // inputRaw — такой же вход, как input: кейс, подающий навыку сырую строку, отбрасывался
+      // здесь как «ничего не подаёт» и в верификацию не попадал вовсе.
+      const hasInput = caseData.input !== undefined || caseData.inputRaw !== undefined;
+      if (!hasInput && !caseData.preRun && !caseData.params && !hasFixtureSetup) continue;
 
       results.push({ skill: skillDir, caseName, caseData, skillConfig });
     }
@@ -1358,19 +1606,27 @@ function writeReport(results) {
     `# Snapshot Verification Report`,
     ``,
     `Date: ${new Date().toISOString().split('T')[0]}`,
-    `Total: ${results.length} | Passed: ${results.filter(r => r.passed).length} | Failed: ${results.filter(r => !r.passed).length}`,
+    `Total: ${results.length} | Passed: ${results.filter(r => r.passed && !r.skipped).length}`
+      + ` | Failed: ${results.filter(r => !r.passed && !r.skipped).length}`
+      + ` | Skipped: ${results.filter(r => r.skipped).length}`,
+    `Проверено платформой: ${results.filter(r => r.platformChecked).length}`
+      + ` | Прошло без обращения к платформе: ${results.filter(r => r.passed && !r.skipped && !r.platformChecked).length}`,
     ``,
   ];
 
-  lines.push('| Skill | Case | Status | Error |');
-  lines.push('|-------|------|--------|-------|');
+  lines.push('| Skill | Case | Status | Платформа | Error |');
+  lines.push('|-------|------|--------|-----------|-------|');
   for (const r of results) {
-    const status = r.passed ? 'OK' : 'FAIL';
+    // Пропуск — не падение: в консольной сводке они уже различались, а в файле отчёта пропуск
+    // выглядел как FAIL и попадал в счётчик падений. Отчёт читают глазами и по нему решают,
+    // есть ли проблема, — расхождение с консолью здесь дороже всего.
+    const status = r.skipped ? 'SKIP' : (r.passed ? 'OK' : 'FAIL');
     const error = r.errors.length > 0 ? r.errors[0].substring(0, 100).replace(/\|/g, '\\|').replace(/\n/g, ' ') : '';
-    lines.push(`| ${r.skill} | ${r.case} | ${status} | ${error} |`);
+    const plat = r.platformChecked ? 'да' : (r.skipped ? '—' : (r.noPlatformReason || 'нет'));
+    lines.push(`| ${r.skill} | ${r.case} | ${status} | ${plat.substring(0, 60)} | ${error} |`);
   }
 
-  const failures = results.filter(r => !r.passed);
+  const failures = results.filter(r => !r.passed && !r.skipped);
   if (failures.length > 0) {
     lines.push('', '## Findings', '');
     for (const r of failures) {
@@ -1440,10 +1696,13 @@ async function main() {
     const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
 
     if (!opts.verbose) {
-      const icon = result.passed ? '\u2713' : '\u2717';
+      // Скип — своя иконка, а не ✗: скипнутый кейс `passed` не выставляет, и построчный
+      // вывод рисовал его падением. Итоговая строка при этом считала его skipped, из-за
+      // чего десяток «✗» под «0 failed» читался как сломанный набор.
+      const icon = result.skipped ? '\u25cb' : (result.passed ? '\u2713' : '\u2717');
       console.log(` ${icon} (${elapsed}s)${result.errors.length ? ' — ' + result.errors[0].substring(0, 80) : ''}`);
     } else {
-      console.log(`    → ${result.passed ? 'PASS' : 'FAIL'} (${elapsed}s)\n`);
+      console.log(`    → ${result.skipped ? 'SKIP' : (result.passed ? 'PASS' : 'FAIL')} (${elapsed}s)\n`);
     }
 
     results.push(result);
@@ -1452,15 +1711,40 @@ async function main() {
   const passed = results.filter(r => r.passed).length;
   const skipped = results.filter(r => r.skipped).length;
   const failed = results.filter(r => !r.passed && !r.skipped).length;
-  console.log(`\n${'='.repeat(60)}`);
-  console.log(`Results: ${passed} passed, ${failed} failed`
-    + (skipped ? `, ${skipped} skipped` : '') + ` out of ${results.length}`);
   for (const r of results.filter(x => x.skipped)) {
     console.log(`  \u25cb ${r.skill}/${r.case} \u2014 ${r.skipReason}`);
   }
+  // Пропуск гасит проверку: кривую фикстуру он тоже спрячет, если её формат объявлен выше
+  // платформы стенда. На стенде, где нужные платформы есть, гоняем со --strict — тогда
+  // непроверенных кейсов не остаётся вовсе.
+  if (skipped && !opts.strict) {
+    console.log(`  (пропуски не проверены — на стенде с нужными платформами прогоните со --strict)`);
+  }
 
   writeReport(results);
-  process.exit(failed > 0 ? 1 : 0);
+
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`Results: ${passed} passed, ${failed} failed`
+    + (skipped ? `, ${skipped} skipped` : '') + ` out of ${results.length}`);
+  // «Прошло» и «проверено платформой» — разные вещи: часть кейсов законно идёт мимо неё
+  // (навык отказал, выход не конфигурация, external). Пока эта доля не названа, отчёт читается
+  // как «всё проверено», хотя платформу спрашивали не у всех.
+  const onPlatform = results.filter(r => r.platformChecked).length;
+  // Только успешные: у падения обращение к платформе было — оно и не удалось, мешать его
+  // с «мимо платформы» значит завышать долю непроверенного.
+  const offPlatform = results.filter(r => r.passed && !r.skipped && !r.platformChecked);
+  const byReason = {};
+  for (const r of offPlatform) {
+    const key = r.noPlatformReason || 'причина не указана';
+    (byReason[key] = byReason[key] || []).push(`${r.skill}/${r.case}`);
+  }
+  console.log(`  из них проверено платформой: ${onPlatform}; прошло без обращения к платформе: ${offPlatform.length}`);
+  for (const [reason, list] of Object.entries(byReason)) {
+    console.log(`    • ${list.length} — ${reason}`);
+  }
+  const unverified = opts.strict ? skipped : 0;
+  if (unverified) console.error(`\n--strict: ${unverified} кейс(ов) пропущено — считаем падением`);
+  process.exit(failed + unverified > 0 ? 1 : 0);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });

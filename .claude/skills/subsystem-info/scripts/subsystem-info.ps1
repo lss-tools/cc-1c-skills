@@ -1,7 +1,8 @@
-﻿# subsystem-info v1.2 — Compact summary of 1C subsystem structure
+﻿# subsystem-info v1.6 — Compact summary of 1C subsystem structure
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
+[CmdletBinding(PositionalBinding=$false)]
 param(
-	[Parameter(Mandatory=$true)][Alias('Path')][string]$SubsystemPath,
+	[Parameter(Mandatory=$true, Position=0)][Alias('Path')][string]$SubsystemPath,
 	[ValidateSet("overview","content","ci","tree","full")]
 	[string]$Mode = "overview",
 	[string]$Name,

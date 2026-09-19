@@ -1,0 +1,28 @@
+{
+  "name": "Тот же лог под -StrictLog: код возврата поднимается до 1 (fake platform)",
+  "fakePlatform": {
+    "log": "﻿Загрузка конфигурации из файлов.\r\nНеверное свойство объекта метаданных. Свойство LineNumberLength не входит в состав объекта метаданных TabularSection. - LineNumberLength\r\nЗагрузка завершена.\r\n"
+  },
+  "preRun": [
+    {
+      "writeFile": {
+        "path": "src/Configuration.xml",
+        "content": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<MetaDataObject/>"
+      }
+    }
+  ],
+  "args_extra": [
+    "-V8Path",
+    "{fakePlatform}",
+    "-InfoBasePath",
+    "{workDir}/ib",
+    "-ConfigDir",
+    "{workDir}/src",
+    "-StrictLog"
+  ],
+  "expect": {
+    "stdoutContains": "[warning] platform reported success, but the log contains 1 problem(s):"
+  },
+  "noSnapshot": "навык ничего не пишет в рабочий каталог — проверяется разбор лога платформы",
+  "expectError": true
+}

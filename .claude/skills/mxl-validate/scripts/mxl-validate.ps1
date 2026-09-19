@@ -1,6 +1,8 @@
-﻿# mxl-validate v1.1 — Validate 1C spreadsheet
+﻿# mxl-validate v1.8 — Validate 1C spreadsheet
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
+[CmdletBinding(PositionalBinding=$false)]
 param(
+	[Parameter(Position=0)]
 	[Alias('Path')]
 	[string]$TemplatePath,
 	[string]$ProcessorName,
@@ -91,7 +93,9 @@ function Report-Warn {
 
 $templateName = [System.IO.Path]::GetFileName([System.IO.Path]::GetDirectoryName([System.IO.Path]::GetDirectoryName($TemplatePath)))
 if ($Detailed) {
-	Write-Host "=== Validation: $templateName ==="
+	# Форма имени та же, что в итоговой строке и у py-порта: раньше шапка -Detailed
+	# печаталась без префикса «Template.», и вывод портов расходился одной строкой.
+	Write-Host "=== Validation: Template.$templateName ==="
 	Write-Host ""
 }
 
@@ -284,6 +288,14 @@ foreach ($ri in $rowNodes) {
 					Report-Error "Row ${rowIndex}: cell format index $val > format palette size ($formatCount)"
 				}
 			}
+			# Примечание — четвёртый владелец формата, и его ссылка тоже бывает битой.
+			$noteNode = $cell.SelectSingleNode("d:note", $nsMgr)
+			if ($noteNode) {
+				$nf = $noteNode.SelectSingleNode("d:formatIndex", $nsMgr)
+				if ($nf -and [int]$nf.InnerText -gt $formatCount) {
+					Report-Error "Row ${rowIndex}: note format index $($nf.InnerText) > format palette size ($formatCount)"
+				}
+			}
 		}
 	}
 
@@ -398,6 +410,145 @@ foreach ($drawing in $root.SelectNodes("d:drawing", $nsMgr)) {
 			Report-Error "Drawing id=${drawId}: pictureIndex=$picIdx > picture count ($pictureCount)"
 		}
 	}
+	# Оформление рисунка — такая же запись палитры форматов, как у ячейки, и висячая
+	# ссылка на неё так же валит загрузку макета.
+	$fmtIdxNode = $drawing.SelectSingleNode("d:formatIndex", $nsMgr)
+	if ($fmtIdxNode) {
+		$fmtIdx = [int]$fmtIdxNode.InnerText
+		if ($fmtIdx -gt $formatCount) {
+			$drawId = $drawing.SelectSingleNode("d:id", $nsMgr).InnerText
+			Report-Error "Drawing id=${drawId}: formatIndex=$fmtIdx > format palette size ($formatCount)"
+		}
+	}
+}
+
+# --- Check 13: value cells (input fields) ---
+# Свойства containsValue/valueType/controlType принадлежат ЯЧЕЙКЕ: на корпусе ERP
+# (370 197 ссылок) на такие записи палитры ссылаются только <f>, ни строка, ни колонка,
+# ни defaultFormatIndex. Ячейка со значением текста не несёт — ни одна из 370 197.
+
+$valueFormatIdx = @{}
+$controlGuids = @('381ed624-9217-4e63-85db-c4c3cb87daae', '35af3d93-d7c7-4a2e-a8eb-bac87a1a3f26')
+for ($i = 0; $i -lt $formatNodes.Count; $i++) {
+	$fmt = $formatNodes[$i]
+	$contains = $fmt.SelectSingleNode("d:containsValue", $nsMgr)
+	$vt = $fmt.SelectSingleNode("d:valueType", $nsMgr)
+	if (-not $contains -and -not $vt) { continue }
+	$num = $i + 1
+	$valueFormatIdx[$num] = $true
+	if (-not $contains -or $contains.InnerText.Trim() -cne 'true') {
+		Report-Error "Format ${num}: <valueType> without <containsValue>true</containsValue>"
+	} elseif (-not $vt) {
+		Report-Error "Format ${num}: <containsValue> without <valueType>"
+	}
+	if ($vt) {
+		foreach ($child in $vt.ChildNodes) {
+			if ($child.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+			$tag = $child.get_LocalName()
+			if ($tag -cne 'Type' -and $tag -cne 'TypeSet' -and $tag -notlike '*Qualifiers') {
+				Report-Error "Format ${num}: unexpected <$tag> inside <valueType>"
+			}
+		}
+	}
+	$ctl = $fmt.SelectSingleNode("d:controlType", $nsMgr)
+	if ($ctl -and ($controlGuids -notcontains $ctl.InnerText.Trim().ToLowerInvariant())) {
+		Report-Warn "Format ${num}: unknown controlType $($ctl.InnerText.Trim())"
+	}
+	# Флажок Конфигуратор предлагает только для булева и числа. Движок принимает его на любом
+	# типе (проверено сборкой EPF и обратной выгрузкой), поэтому это предупреждение, а не ошибка:
+	# собрать такую ячейку в Конфигураторе нельзя, и почти наверняка это описка.
+	if ($ctl -and $ctl.InnerText.Trim().ToLowerInvariant() -ceq $controlGuids[1] -and $vt) {
+		$kinds = @()
+		foreach ($child in $vt.ChildNodes) {
+			if ($child.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+			if ($child.get_LocalName() -ceq 'Type') { $kinds += $child.InnerText.Trim() }
+		}
+		if (-not (($kinds.Count -eq 1) -and ($kinds[0] -ceq 'xs:boolean' -or $kinds[0] -ceq 'xs:decimal'))) {
+			Report-Warn "Format ${num}: checkbox control on a type other than Boolean or Number"
+		}
+	}
+}
+
+foreach ($ri in $root.SelectNodes("d:rowsItem", $nsMgr)) {
+	if ($stopped) { break }
+	$row = $ri.SelectSingleNode("d:row", $nsMgr)
+	if (-not $row) { continue }
+	$idxNode = $ri.SelectSingleNode("d:index", $nsMgr)
+	$rn = if ($idxNode) { $idxNode.InnerText } else { '?' }
+	$rowFmt = $row.SelectSingleNode("d:formatIndex", $nsMgr)
+	if ($rowFmt -and $valueFormatIdx.ContainsKey([int]$rowFmt.InnerText)) {
+		Report-Warn "Row ${rn}: formatIndex points to a value format (cell-only property)"
+	}
+	foreach ($cGroup in $row.SelectNodes("d:c", $nsMgr)) {
+		$cell = $cGroup.SelectSingleNode("d:c", $nsMgr)
+		if (-not $cell) { continue }
+		$fNode = $cell.SelectSingleNode("d:f", $nsMgr)
+		if (-not $fNode -or -not $valueFormatIdx.ContainsKey([int]$fNode.InnerText)) {
+			# Значение и настройки элемента управления бывают только у ячейки-поля ввода:
+			# на корпусе ни одного <v> и ни одного <control> в обычной ячейке.
+			if ($cell.SelectSingleNode("d:v", $nsMgr)) {
+				Report-Error "Row ${rn}: cell carries value but its format has no containsValue"
+			}
+			if ($cell.SelectSingleNode("d:control", $nsMgr)) {
+				Report-Error "Row ${rn}: cell carries control settings but its format has no containsValue"
+			}
+			continue
+		}
+		if ($cell.SelectSingleNode("d:tl", $nsMgr)) {
+			Report-Error "Row ${rn}: cell contains a value and text at the same time"
+		}
+	}
+}
+foreach ($cols in $root.SelectNodes("d:columns", $nsMgr)) {
+	foreach ($ci in $cols.SelectNodes("d:columnsItem", $nsMgr)) {
+		$col = $ci.SelectSingleNode("d:column", $nsMgr)
+		if (-not $col) { continue }
+		$fmtNode = $col.SelectSingleNode("d:formatIndex", $nsMgr)
+		if ($fmtNode -and $valueFormatIdx.ContainsKey([int]$fmtNode.InnerText)) {
+			$colIdxNode = $ci.SelectSingleNode("d:index", $nsMgr)
+			$colIdxText = if ($colIdxNode) { $colIdxNode.InnerText } else { '?' }
+			Report-Warn "Column ${colIdxText}: formatIndex points to a value format (cell-only property)"
+		}
+	}
+}
+$dfi = $root.SelectSingleNode("d:defaultFormatIndex", $nsMgr)
+if ($dfi -and $valueFormatIdx.ContainsKey([int]$dfi.InnerText)) {
+	Report-Warn "defaultFormatIndex points to a value format (cell-only property)"
+}
+if ($valueFormatIdx.Count -gt 0) {
+	Report-OK "Value cells: $($valueFormatIdx.Count) value formats"
+}
+
+# --- Check 14: группировки строк и колонок ---
+# Диапазоны группировок либо вложены, либо не пересекаются: на корпусе 40 620 886 пар
+# непересекающихся и 599 958 вложенных, частичных пересечений нет ни одного.
+
+foreach ($tag in @('vg', 'hg')) {
+	$ranges = @()
+	foreach ($g in $root.SelectNodes("d:$tag", $nsMgr)) {
+		$bNode = $g.SelectSingleNode("d:b", $nsMgr)
+		if (-not $bNode) {
+			Report-Error "Group <$tag>: <b> is missing"
+			continue
+		}
+		$b = [int]$bNode.InnerText
+		$eNode = $g.SelectSingleNode("d:e", $nsMgr)
+		$e = if ($eNode) { [int]$eNode.InnerText } else { $b }
+		if ($e -lt $b) { Report-Error "Group <$tag> $b..${e}: range is reversed" }
+		if ($tag -ceq 'vg' -and $docHeight -gt 0 -and $b -ge $docHeight) {
+			Report-Warn "Group <vg> starts at row $b, beyond document height ($docHeight)"
+		}
+		$ranges += ,@($b, $e)
+	}
+	for ($i = 0; $i -lt $ranges.Count; $i++) {
+		for ($j = $i + 1; $j -lt $ranges.Count; $j++) {
+			$a = $ranges[$i]; $c = $ranges[$j]
+			if ($a[1] -lt $c[0] -or $c[1] -lt $a[0]) { continue }
+			if (($a[0] -le $c[0] -and $c[1] -le $a[1]) -or ($c[0] -le $a[0] -and $a[1] -le $c[1])) { continue }
+			Report-Error "Groups <$tag> $($a[0])..$($a[1]) and $($c[0])..$($c[1]) overlap partially"
+		}
+	}
+	if ($ranges.Count -gt 0) { Report-OK "Groups <$tag>: $($ranges.Count)" }
 }
 
 # --- Summary ---

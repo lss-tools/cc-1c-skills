@@ -1,9 +1,31 @@
 #!/usr/bin/env python3
-# role-validate v1.1 — Validate 1C role Rights.xml structure
+# role-validate v1.6 — Validate 1C role Rights.xml structure
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 """Validates role Rights.xml: root element, global flags, objects, rights, RLS, templates."""
 import sys, os, argparse, re
 from lxml import etree
+
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
 
 GUID_PATTERN = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
@@ -56,7 +78,9 @@ KNOWN_RIGHTS = {
     ],
     'AccumulationRegister': ['Read', 'Update', 'View', 'Edit', 'TotalsControl'],
     'AccountingRegister': ['Read', 'Update', 'View', 'Edit', 'TotalsControl'],
-    'CalculationRegister': ['Read', 'View'],
+    'CalculationRegister': [
+        'Read', 'Update', 'View', 'Edit',
+    ],
     'Constant': [
         'Read', 'Update', 'View', 'Edit',
         'ReadDataHistory', 'ViewDataHistory', 'UpdateDataHistory',
@@ -64,14 +88,13 @@ KNOWN_RIGHTS = {
         'EditDataHistoryVersionComment', 'SwitchToDataHistoryVersion',
     ],
     'ChartOfAccounts': [
-        'Read', 'Insert', 'Update', 'Delete', 'View', 'Edit', 'InputByString',
-        'InteractiveInsert', 'InteractiveSetDeletionMark', 'InteractiveClearDeletionMark',
-        'InteractiveDelete',
-        'InteractiveDeletePredefinedData', 'InteractiveSetDeletionMarkPredefinedData',
-        'InteractiveClearDeletionMarkPredefinedData', 'InteractiveDeleteMarkedPredefinedData',
-        'ReadDataHistory', 'ReadDataHistoryOfMissingData',
-        'UpdateDataHistory', 'UpdateDataHistoryOfMissingData',
-        'UpdateDataHistorySettings', 'UpdateDataHistoryVersionComment',
+        'Read', 'Insert', 'Update', 'Delete',
+        'View', 'Edit', 'InputByString', 'InteractiveInsert',
+        'InteractiveSetDeletionMark', 'InteractiveClearDeletionMark', 'InteractiveDelete', 'InteractiveDeleteMarked',
+        'InteractiveDeletePredefinedData', 'InteractiveSetDeletionMarkPredefinedData', 'InteractiveClearDeletionMarkPredefinedData', 'InteractiveDeleteMarkedPredefinedData',
+        'ReadDataHistory', 'ReadDataHistoryOfMissingData', 'UpdateDataHistory', 'UpdateDataHistoryOfMissingData',
+        'UpdateDataHistorySettings', 'UpdateDataHistoryVersionComment', 'ViewDataHistory', 'EditDataHistoryVersionComment',
+        'SwitchToDataHistoryVersion',
     ],
     'ChartOfCharacteristicTypes': [
         'Read', 'Insert', 'Update', 'Delete', 'View', 'Edit', 'InputByString',
@@ -85,11 +108,13 @@ KNOWN_RIGHTS = {
         'EditDataHistoryVersionComment', 'SwitchToDataHistoryVersion',
     ],
     'ChartOfCalculationTypes': [
-        'Read', 'Insert', 'Update', 'Delete', 'View', 'Edit', 'InputByString',
-        'InteractiveInsert', 'InteractiveSetDeletionMark', 'InteractiveClearDeletionMark',
-        'InteractiveDelete',
-        'InteractiveDeletePredefinedData', 'InteractiveSetDeletionMarkPredefinedData',
-        'InteractiveClearDeletionMarkPredefinedData', 'InteractiveDeleteMarkedPredefinedData',
+        'Read', 'Insert', 'Update', 'Delete',
+        'View', 'Edit', 'InputByString', 'InteractiveInsert',
+        'InteractiveSetDeletionMark', 'InteractiveClearDeletionMark', 'InteractiveDelete', 'InteractiveDeleteMarked',
+        'InteractiveDeletePredefinedData', 'InteractiveSetDeletionMarkPredefinedData', 'InteractiveClearDeletionMarkPredefinedData', 'InteractiveDeleteMarkedPredefinedData',
+        'ReadDataHistory', 'ReadDataHistoryOfMissingData', 'UpdateDataHistory', 'UpdateDataHistoryOfMissingData',
+        'UpdateDataHistorySettings', 'UpdateDataHistoryVersionComment', 'ViewDataHistory', 'EditDataHistoryVersionComment',
+        'SwitchToDataHistoryVersion',
     ],
     'ExchangePlan': [
         'Read', 'Insert', 'Update', 'Delete', 'View', 'Edit', 'InputByString',
@@ -101,14 +126,20 @@ KNOWN_RIGHTS = {
         'EditDataHistoryVersionComment', 'SwitchToDataHistoryVersion',
     ],
     'BusinessProcess': [
-        'Read', 'Insert', 'Update', 'Delete', 'View', 'Edit', 'InputByString',
-        'Start', 'InteractiveInsert', 'InteractiveSetDeletionMark', 'InteractiveClearDeletionMark',
-        'InteractiveDelete', 'InteractiveActivate', 'InteractiveStart',
+        'Read', 'Insert', 'Update', 'Delete',
+        'View', 'Edit', 'InputByString', 'Start',
+        'InteractiveInsert', 'InteractiveSetDeletionMark', 'InteractiveClearDeletionMark', 'InteractiveDelete',
+        'InteractiveDeleteMarked', 'InteractiveActivate', 'InteractiveStart', 'ReadDataHistory',
+        'ReadDataHistoryOfMissingData', 'UpdateDataHistory', 'UpdateDataHistoryOfMissingData', 'UpdateDataHistorySettings',
+        'UpdateDataHistoryVersionComment', 'ViewDataHistory', 'EditDataHistoryVersionComment', 'SwitchToDataHistoryVersion',
     ],
     'Task': [
-        'Read', 'Insert', 'Update', 'Delete', 'View', 'Edit', 'InputByString',
-        'Execute', 'InteractiveInsert', 'InteractiveSetDeletionMark', 'InteractiveClearDeletionMark',
-        'InteractiveDelete', 'InteractiveActivate', 'InteractiveExecute',
+        'Read', 'Insert', 'Update', 'Delete',
+        'View', 'Edit', 'InputByString', 'Execute',
+        'InteractiveInsert', 'InteractiveSetDeletionMark', 'InteractiveClearDeletionMark', 'InteractiveDelete',
+        'InteractiveDeleteMarked', 'InteractiveActivate', 'InteractiveExecute', 'ReadDataHistory',
+        'ReadDataHistoryOfMissingData', 'UpdateDataHistory', 'UpdateDataHistoryOfMissingData', 'UpdateDataHistorySettings',
+        'UpdateDataHistoryVersionComment', 'ViewDataHistory', 'EditDataHistoryVersionComment', 'SwitchToDataHistoryVersion',
     ],
     'DataProcessor': ['Use', 'View'],
     'Report': ['Use', 'View'],
@@ -123,11 +154,79 @@ KNOWN_RIGHTS = {
     'IntegrationService': ['Use'],
     'SessionParameter': ['Get', 'Set'],
     'CommonAttribute': ['View', 'Edit'],
+    'ExternalDataSource': [
+        'Use', 'Administration', 'StandardAuthenticationChange',
+        'SessionStandardAuthenticationChange', 'SessionOSAuthenticationChange',
+    ],
 }
 
-NESTED_RIGHTS = ['View', 'Edit']
-CHANNEL_RIGHTS = ['Use']
-COMMAND_RIGHTS = ['View']
+# Виды вложенности (предпоследний сегмент пути) → допустимые права. Списки сняты с корпуса
+# типовых конфигураций и с выгрузки роли, где права проставлены по всему дереву редактора:
+# догадкам тут не место — закрытый список превращает промах в ложный отказ.
+NESTED_KIND_RIGHTS = {
+    'Attribute': ['View', 'Edit'],
+    'StandardAttribute': ['View', 'Edit'],
+    'TabularSection': ['View', 'Edit'],
+    'StandardTabularSection': ['View', 'Edit'],
+    'Dimension': ['View', 'Edit'],
+    'Resource': ['View', 'Edit'],
+    'AccountingFlag': ['View', 'Edit'],
+    'ExtDimensionAccountingFlag': ['View', 'Edit'],
+    'AddressingAttribute': ['View', 'Edit'],
+    'Field': ['View', 'Edit'],
+    'Command': ['View'],
+    'Subsystem': ['View'],
+    'Operation': ['Use'],
+    'Method': ['Use'],
+    'IntegrationServiceChannel': ['Use'],
+    'Recalculation': ['Read', 'Update'],
+    'Cube': ['Read', 'View'],
+    'DimensionTable': ['Read', 'View'],
+    'Function': ['Use', 'View'],
+    'Table': [
+        'Read', 'Insert', 'Update', 'Delete', 'View', 'Edit', 'InputByString',
+        'InteractiveInsert', 'InteractiveDelete',
+    ],
+}
+
+# Виды, существующие только у одного типа-родителя: без этой привязки
+# `Catalog.Товары.Field.Цена` прошёл бы как валидный вложенный объект.
+KIND_OWNERS = {
+    'Table': 'ExternalDataSource',
+    'Cube': 'ExternalDataSource',
+    'Function': 'ExternalDataSource',
+    'Field': 'ExternalDataSource',
+    'DimensionTable': 'ExternalDataSource',
+    'Recalculation': 'CalculationRegister',
+    'Operation': 'WebService',
+    'Method': 'HTTPService',
+    'IntegrationServiceChannel': 'IntegrationService',
+}
+
+# Подсказка формата для каждого вида сервиса: {0} подставляется как `Тип.Имя` из роли.
+SERVICE_LEAF_HINTS = {
+    'WebService': '{0}.Operation.<Операция>',
+    'HTTPService': '{0}.URLTemplate.<Шаблон>.Method.<Метод>',
+    'IntegrationService': '{0}.IntegrationServiceChannel.<Канал>',
+}
+
+# Один и тот же вид под разными родителями имеет разный набор: измерение регистра —
+# View + Edit, измерение куба внешнего источника — только View. Объединять нельзя,
+# объединение молча разрешило бы Edit там, где платформа его не даёт.
+NESTED_KIND_RIGHTS_BY_TYPE = {
+    'ExternalDataSource': {
+        'Dimension': ['View'],
+        'Resource': ['View'],
+    },
+}
+
+# Типы без прав в ролях (в дереве редактора ролей их нет). Таблица НЕ управляет поведением —
+# отказ даёт отсутствие типа в KNOWN_RIGHTS; здесь только причина для сообщения.
+NO_RIGHTS_TYPES = [
+    'Enum', 'CommonModule', 'DefinedType', 'CommonPicture', 'CommonTemplate', 'Language',
+    'FunctionalOption', 'FunctionalOptionsParameter', 'EventSubscription', 'ScheduledJob',
+    'StyleItem', 'Style', 'SettingsStorage', 'XDTOPackage', 'WSReference', 'DocumentNumerator',
+]
 
 
 def get_object_type(name):
@@ -141,6 +240,22 @@ def is_nested_object(name):
     return name.count('.') >= 2
 
 
+def get_nested_kind(name):
+    """Вид вложенности — предпоследний сегмент: путь бывает и восьмисегментным
+    (ExternalDataSource.И.Cube.К.DimensionTable.Т.Field.П), считать от конца."""
+    parts = name.split('.')
+    if len(parts) < 3:
+        return None
+    return parts[-2]
+
+
+def get_nested_rights(object_type, kind):
+    by_type = NESTED_KIND_RIGHTS_BY_TYPE.get(object_type)
+    if by_type and kind in by_type:
+        return by_type[kind]
+    return NESTED_KIND_RIGHTS.get(kind)
+
+
 def find_similar(needle, haystack):
     result = []
     needle_lower = needle.lower()
@@ -151,6 +266,16 @@ def find_similar(needle, haystack):
         if len(result) >= 3:
             break
     return result
+
+
+def format_type_error(obj_name, object_type):
+    """Запрещённый тип и незнакомый тип — разные диагнозы: первый документирован,
+    второй скорее опечатка или пробел в таблице."""
+    if object_type in NO_RIGHTS_TYPES:
+        return f"{obj_name}: тип '{object_type}' не имеет прав в роли — блок нужно удалить"
+    similar = find_similar(object_type, list(KNOWN_RIGHTS.keys()))
+    sug = f" Возможно: {', '.join(similar)}?" if similar else ''
+    return f"{obj_name}: неизвестный тип объекта '{object_type}'.{sug}"
 
 
 def get_child_text(parent, local_name, ns):
@@ -183,7 +308,7 @@ def main():
     parser.add_argument('-OutFile', dest='OutFile', default='')
     parser.add_argument('-Detailed', dest='Detailed', action='store_true')
     parser.add_argument('-MaxErrors', dest='MaxErrors', type=int, default=30)
-    args = parser.parse_args()
+    args = ci_parse_args(parser)
 
     rights_path = args.RightsPath
     out_file = args.OutFile
@@ -317,9 +442,24 @@ def main():
         object_type = get_object_type(obj_name)
         is_nested = is_nested_object(obj_name)
 
-        # Check object type is known
-        if not is_nested and object_type not in KNOWN_RIGHTS:
-            report_warn(f"{obj_name}: unknown object type '{object_type}'")
+        # Тип проверяется ВСЕГДА, включая вложенные пути: раньше `Enum.Х.Attribute.Y`
+        # не проверялся вообще — ветка «unknown» стояла под `not is_nested`.
+        nested_kind = get_nested_kind(obj_name) if is_nested else None
+        type_known = object_type in KNOWN_RIGHTS
+        if not type_known:
+            report_error(format_type_error(obj_name, object_type))
+        elif is_nested and nested_kind in KIND_OWNERS and object_type != KIND_OWNERS[nested_kind]:
+            report_error(f"{obj_name}: вид '{nested_kind}' бывает только у {KIND_OWNERS[nested_kind]}")
+        elif is_nested and get_nested_rights(object_type, nested_kind) is None:
+            report_error(f"{obj_name}: неизвестный вид вложенности '{nested_kind}'")
+        elif not is_nested and object_type in SERVICE_LEAF_HINTS:
+            # Право на сервис целиком платформа игнорирует: проверяется лист (метод шаблона
+            # URL, операция, канал). Роль формально валидна и молча не работает — 403 на всех
+            # маршрутах, причина по симптому не читается. В Конфигураторе галки на корне
+            # сервиса нет вовсе, так что это недостижимое состояние, а не стилистика.
+            hint = SERVICE_LEAF_HINTS[object_type].format(obj_name)
+            report_error(f"{obj_name}: право на сервис целиком не действует — "
+                         f"назначайте права на вложенные объекты: {hint}")
 
         # Check rights
         for child in obj:
@@ -362,23 +502,19 @@ def main():
 
             right_count += 1
 
-            # Validate right name
-            if is_nested:
-                if '.Command.' in obj_name:
-                    if r_name not in COMMAND_RIGHTS:
-                        report_warn(f"{obj_name}: '{r_name}' not valid for commands (only: View)")
-                elif '.IntegrationServiceChannel.' in obj_name:
-                    if r_name not in CHANNEL_RIGHTS:
-                        report_warn(f"{obj_name}: '{r_name}' not valid for channels (only: Use)")
-                else:
-                    if r_name not in NESTED_RIGHTS:
-                        report_warn(f"{obj_name}: '{r_name}' not valid for nested objects (only: View, Edit)")
-            elif object_type in KNOWN_RIGHTS:
+            # Validate right name. Тип уже отвергнут выше — второй раз про него не пишем.
+            if not type_known:
+                pass
+            elif is_nested:
+                valid_nested = get_nested_rights(object_type, nested_kind)
+                if valid_nested is not None and r_name not in valid_nested:
+                    report_error(f"{obj_name}: право '{r_name}' недопустимо для вида '{nested_kind}' (допустимо: {', '.join(valid_nested)})")
+            else:
                 valid_rights = KNOWN_RIGHTS[object_type]
                 if r_name not in valid_rights:
                     similar = find_similar(r_name, valid_rights)
-                    sug_str = f' Did you mean: {", ".join(similar)}?' if similar else ''
-                    report_warn(f"{obj_name}: unknown right '{r_name}'.{sug_str}")
+                    sug_str = f" Возможно: {', '.join(similar)}?" if similar else ''
+                    report_error(f"{obj_name}: право '{r_name}' не существует у типа '{object_type}'.{sug_str}")
 
     report_ok(f'{obj_count} objects, {right_count} rights')
     if rls_count > 0:

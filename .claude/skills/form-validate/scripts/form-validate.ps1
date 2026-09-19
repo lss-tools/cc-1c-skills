@@ -1,7 +1,8 @@
-﻿# form-validate v1.9 — Validate 1C managed form
+﻿# form-validate v1.19 — Validate 1C managed form
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
+[CmdletBinding(PositionalBinding=$false)]
 param(
-	[Parameter(Mandatory)]
+	[Parameter(Mandatory, Position=0)]
 	[Alias('Path')]
 	[string]$FormPath,
 
@@ -56,8 +57,22 @@ try {
 $nsMgr = New-Object System.Xml.XmlNamespaceManager($xmlDoc.NameTable)
 $nsMgr.AddNamespace("f", "http://v8.1c.ru/8.3/xcf/logform")
 $nsMgr.AddNamespace("v8", "http://v8.1c.ru/8.1/data/core")
+$nsMgr.AddNamespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
 
 $root = $xmlDoc.DocumentElement
+
+# Корень автономной внешней обработки/отчёта. Копия общего эталона (семья
+# support-guard: is_external_root, авторитет — cf-edit).
+function Test-ExternalObjectRoot([string]$xmlPath) {
+	if (-not (Test-Path $xmlPath)) { return $false }
+	try {
+		[xml]$mx = Get-Content -Path $xmlPath -Encoding UTF8
+		$el = $mx.DocumentElement.FirstChild
+		while ($el -and $el.NodeType -ne 'Element') { $el = $el.NextSibling }
+		if ($el) { return @('ExternalDataProcessor','ExternalReport') -contains $el.LocalName }
+	} catch {}
+	return $false
+}
 
 # --- Detect context: config vs EPF/ERF ---
 # Walk up from FormPath looking for Configuration.xml → config context
@@ -66,11 +81,54 @@ $script:isConfigContext = $false
 $walkDir = Split-Path (Resolve-Path $FormPath) -Parent
 for ($i = 0; $i -lt 15; $i++) {
 	if (-not $walkDir -or $walkDir -eq (Split-Path $walkDir)) { break }
+	# Порядок проверок тот же, что у Detect-FormatVersion: сначала корень автономной обработки,
+	# потом Configuration.xml — иначе форма внутри EPF, лежащей в дереве конфигурации, взяла бы
+	# версию конфигурации.
+	$extRoot = "$walkDir.xml"
+	if (-not $script:versionAnchor) {
+		if (Test-ExternalObjectRoot $extRoot) {
+			# Ближайший якорь побеждает: автономная обработка остаётся автономной, даже если её
+			# исходники лежат внутри дерева с Configuration.xml (типовая раскладка проекта:
+			# src/cf рядом с src/epf). Иначе её собственные External*-типы считались бы ошибкой.
+			$script:versionAnchor = $extRoot
+			break
+		}
+	}
 	if (Test-Path (Join-Path $walkDir "Configuration.xml")) {
 		$script:isConfigContext = $true
+		$script:configXmlPath = Join-Path $walkDir "Configuration.xml"
+		if (-not $script:versionAnchor) { $script:versionAnchor = $script:configXmlPath }
 		break
 	}
 	$walkDir = Split-Path $walkDir
+}
+
+# Версия формата выгрузки. Копия общего эталона (семья detect_format_version, авторитет —
+# form-compile): та же ветка для автономной EPF/ERF, где версию несёт корень обработки.
+function Detect-FormatVersion([string]$dir) {
+	$d = $dir
+	while ($d) {
+		# Автономная внешняя обработка/отчёт: своего Configuration.xml у неё нет, версию несёт
+		# корень самой обработки. Без этого форма и макет внутри обработки 2.21 писались бы 2.17.
+		$extPath = "$d.xml"
+		if (Test-Path $extPath) {
+			$extText = [System.IO.File]::ReadAllText($extPath, [System.Text.Encoding]::UTF8)
+			$extHead = $extText.Substring(0, [Math]::Min(2000, $extText.Length))
+			if ($extHead -match '<(ExternalDataProcessor|ExternalReport)[ >]' -and $extHead -match '<MetaDataObject[^>]+version="(\d+\.\d+)"') { return $Matches[1] }
+		}
+		$cfgPath = Join-Path $d "Configuration.xml"
+		if (Test-Path $cfgPath) {
+			$cfgText = [System.IO.File]::ReadAllText($cfgPath, [System.Text.Encoding]::UTF8)
+			# Длину среза берём по СТРОКЕ, а не по размеру файла: размер в БАЙТАХ, Substring считает
+			# СИМВОЛЫ, и на кириллице байт больше — короткий Configuration.xml ронял навык исключением.
+			$head = $cfgText.Substring(0, [Math]::Min(2000, $cfgText.Length))
+			if ($head -match '<MetaDataObject[^>]+version="(\d+\.\d+)"') { return $Matches[1] }
+		}
+		$parent = Split-Path $d -Parent
+		if ($parent -eq $d) { break }
+		$d = $parent
+	}
+	return "2.17"
 }
 
 # --- Counters ---
@@ -101,6 +159,19 @@ function Report-Warn {
 	Write-Host "[WARN]  $msg"
 }
 
+# --- Format version ---
+# Проверенный диапазон версий формата выгрузки: 2.17 (8.3.24) … 2.21 (8.5). Полная лестница —
+# docs/1c-configuration-spec.md, «Лестница версий». Версию задаёт платформа ВЫГРУЗКИ, а не режим
+# совместимости конфигурации. Версии ниже 2.17 (платформы 8.3.23 и старше) существуют, но навыки
+# на них не проверялись — это предупреждение о непокрытии, а не о некорректности файла.
+$formatVerifiedMin = "2.17"
+$formatVerifiedMax = "2.21"
+# Версия формата как число: "2.20" → 220. Строковое сравнение неверно ("2.9" > "2.17").
+function Get-FormatRank([string]$ver) {
+	if ($ver -match '^(\d+)\.(\d+)$') { return [int]$Matches[1] * 100 + [int]$Matches[2] }
+	return 0
+}
+
 # --- Form name from path ---
 
 $formName = [System.IO.Path]::GetFileNameWithoutExtension($FormPath)
@@ -127,13 +198,17 @@ if ($root.LocalName -ne "Form") {
 	Report-Error "Root element is '$($root.LocalName)', expected 'Form'"
 } else {
 	$version = $root.GetAttribute("version")
-	# Лестница версий формата: 2.17 (8.3.20-8.3.24), 2.18 (8.3.25), 2.19 (8.3.26), 2.20 (8.3.27).
-	if ($version -in @("2.17", "2.18", "2.19", "2.20")) {
-		Report-OK "Root element: Form version=$version"
-	} elseif ($version) {
-		Report-Warn "Form version='$version' (expected 2.17-2.20)"
-	} else {
+	$versionRank = Get-FormatRank $version
+	if (-not $version) {
 		Report-Warn "Form version attribute missing"
+	} elseif ($versionRank -eq 0) {
+		Report-Error "Malformed version '$version' (expected N.N)"
+	} elseif ($versionRank -lt (Get-FormatRank $formatVerifiedMin)) {
+		Report-Warn "Format version '$version' is below the tested range $formatVerifiedMin-$formatVerifiedMax — skills were not verified on it"
+	} elseif ($versionRank -gt (Get-FormatRank $formatVerifiedMax)) {
+		Report-Warn "Format version '$version' is above the tested range $formatVerifiedMin-$formatVerifiedMax — skills were not verified on it"
+	} else {
+		Report-OK "Root element: Form version=$version"
 	}
 }
 
@@ -144,10 +219,15 @@ if (-not $stopped) {
 	if ($acb) {
 		$acbName = $acb.GetAttribute("name")
 		$acbId = $acb.GetAttribute("id")
+		# id=-1 — соглашение, а не требование: в корпусе УТ/БП/ERP так у 21 094 форм из 21 097,
+		# но три формы платформа выгружает с обычным id и грузит их без нареканий. Поэтому
+		# предупреждение; ошибка — только если id вовсе не число.
 		if ($acbId -eq "-1") {
 			Report-OK "AutoCommandBar: name='$acbName', id=$acbId"
+		} elseif ($acbId -match '^-?\d+$') {
+			Report-Warn "AutoCommandBar id='$acbId', usually '-1'"
 		} else {
-			Report-Error "AutoCommandBar id='$acbId', expected '-1'"
+			Report-Error "AutoCommandBar id='$acbId' is not a number"
 		}
 	} else {
 		Report-Error "AutoCommandBar element missing"
@@ -427,11 +507,19 @@ if (-not $stopped) {
 			$segments = $cleanPath -split '\.'
 			$rootAttr = $segments[0]
 
-			# Resolve Items.<TableName>.CurrentData.<Field>... — table element, not attribute
-			if ($rootAttr -eq 'Items') {
+			# Resolve Items.<TableName>.CurrentData.<Field>... — table element, not attribute.
+			# Разрешаем ЦЕПОЧКОЙ: таблица во вложенной таблице сама привязана через Items.*, и один
+			# шаг оставлял корнем литерал «Items» — форма платформы объявлялась битой (типовые
+			# НастройкаПравилОбработкиЗаявокСотрудников в БП и ERP).
+			$itemsHops = 0
+			$itemsBroken = $false
+			while ($rootAttr -eq 'Items') {
+				$itemsHops++
+				if ($itemsHops -gt 10) { $itemsBroken = $true; break }   # страховка от кольца ссылок
 				if ($segments.Count -lt 3 -or $segments[2] -ne 'CurrentData') {
 					Report-Warn "[$tag] '$elName': $bTag='$dataPath' — unknown Items.* shape, expected Items.<Table>.CurrentData.*"
-					continue
+					$itemsBroken = $true
+					break
 				}
 				$tableName = $segments[1]
 				$tableEl = $null
@@ -444,17 +532,21 @@ if (-not $stopped) {
 				if (-not $tableEl) {
 					Report-Error "[$tag] '$elName': $bTag='$dataPath' — table element '$tableName' not found"
 					$pathErrors++
-					continue
+					$itemsBroken = $true
+					break
 				}
 				$tableDpNode = $tableEl.Node.SelectSingleNode("f:DataPath", $nsMgr)
 				if (-not $tableDpNode -or -not $tableDpNode.InnerText.Trim()) {
 					# Table without DataPath — can't resolve further, accept silently
-					continue
+					$itemsBroken = $true
+					break
 				}
 				$tableDp = $tableDpNode.InnerText.Trim() -replace '\[\d+\]', ''
 				if ($tableDp.StartsWith('~')) { $tableDp = $tableDp.Substring(1) }
-				$rootAttr = ($tableDp -split '\.')[0]
+				$segments = $tableDp -split '\.'
+				$rootAttr = $segments[0]
 			}
+			if ($itemsBroken) { continue }
 
 			if (-not $attrMap.ContainsKey($rootAttr)) {
 				Report-Error "[$tag] '$elName': $bTag='$dataPath' — attribute '$rootAttr' not found"
@@ -569,13 +661,18 @@ if (-not $stopped) {
 	$actionErrors = 0
 	$actionChecked = 0
 
+	# Предупреждение, а не ошибка: <Action> может назначаться в рантайме
+	# (`Команда.Действие = "Подключаемый_…"` в ПриСозданииНаСервере) — приём типовых конфигураций
+	# там, где обработчик существует не во всякой сборке. Назначать может и чужой модуль
+	# (переопределяемый слой, подключаемые команды), так что по одному Form.xml не решить.
+	# Корпус УТ/БП/ERP: 406 таких команд на 275 формах, произведённых платформой.
 	foreach ($cmd in $cmdNodes) {
 		if ($stopped) { break }
 		$cmdName = $cmd.GetAttribute("name")
 		$actionNode = $cmd.SelectSingleNode("f:Action", $nsMgr)
 		$actionChecked++
 		if (-not $actionNode -or -not $actionNode.InnerText.Trim()) {
-			Report-Error "Command '$cmdName': missing or empty Action"
+			Report-Warn "Command '$cmdName': no Action — handler must be assigned at runtime, otherwise the command does nothing"
 			$actionErrors++
 		}
 	}
@@ -742,6 +839,41 @@ if (-not $stopped -and $isExtension) {
 			Report-OK "Extension ID ranges: $extAttrCount attr(s), $extCmdCount cmd(s) — all >= 1000000"
 		}
 	}
+
+	# 11d. Пути на основной реквизит, которого форма не объявляет.
+	# Check 5 такое пропускает: у заимствованной формы он не проверяет базовые элементы (id < 1000000),
+	# а привязки в <xr:Link> вообще вне его списка тегов. Между тем это ровно тот случай, на котором
+	# платформа отвергает загрузку: «Неверный путь к полю - Объект.X». Правило: если основной реквизит
+	# не объявлен в <Attributes> формы, любой путь с его корнем не разрешится.
+	# Корень берётся из основного реквизита BaseForm: «Объект» он только у формы объекта, у формы
+	# списка это «Список», у формы записи регистра «Запись». С зашитым «Объект» проверка на таких
+	# формах молча не срабатывала — валидатор рапортовал «чисто» на форме, которую платформа не примет.
+	$mainAttrDeclared = $false
+	foreach ($attr in $attrNodes) {
+		$maNode = $attr.SelectSingleNode("f:MainAttribute", $nsMgr)
+		if ($maNode -and $maNode.InnerText.Trim() -eq "true") { $mainAttrDeclared = $true; break }
+	}
+
+	if (-not $mainAttrDeclared) {
+		# Значения привязок ищем текстом: интересуют и обычные теги, и <xr:DataPath> внутри
+		# <ChoiceParameterLinks>, а те живут в чужом пространстве имён.
+		$rawForm = [System.IO.File]::ReadAllText($FormPath, [System.Text.Encoding]::UTF8)
+		$mainBase = $baseFormNode.SelectSingleNode("f:Attributes/f:Attribute[f:MainAttribute='true']", $bfNs)
+		$rootName = if ($mainBase -and $mainBase.GetAttribute("name")) { $mainBase.GetAttribute("name") } else { "Объект" }
+		$rootPat = [regex]::Escape($rootName)
+		$danglingPaths = @{}
+		foreach ($m in [regex]::Matches($rawForm, "<(?:\w+:)?\w*DataPath[^>]*>(${rootPat}\.[^<]+)</(?:\w+:)?\w*DataPath>")) {
+			$danglingPaths[$m.Groups[1].Value] = $true
+		}
+		if ($danglingPaths.Count -gt 0) {
+			$shown = @($danglingPaths.Keys | Sort-Object)
+			$sample = ($shown | Select-Object -First 3) -join ", "
+			$suffix = if ($shown.Count -gt 3) { " (и ещё $($shown.Count - 3))" } else { "" }
+			Report-Error "Path(s) rooted at '${rootName}' but the form declares no MainAttribute: $sample$suffix"
+		} elseif ($mainBase) {
+			Report-OK "Object paths: none dangling (MainAttribute not declared)"
+		}
+	}
 }
 
 # Check callType without BaseForm (structural warning)
@@ -796,6 +928,8 @@ $validCfgPrefixes = @(
 	"ConstantsSet","DataProcessorObject","DocumentObject","DocumentRef"
 	"DynamicList","EnumRef","ExchangePlanObject","ExchangePlanRef"
 	"ExternalDataProcessorObject","ExternalReportObject"
+	"ExternalDataSourceTableObject","ExternalDataSourceTableRecordManager"
+	"ExternalDataSourceTableRef"
 	"InformationRegisterRecordManager","InformationRegisterRecordSet"
 	"ReportObject","TaskObject","TaskRef"
 )
@@ -841,6 +975,71 @@ if (-not $stopped) {
 		Report-OK "12. Types: no type values to check"
 	} elseif ($typeOk) {
 		Report-OK "12. Types: $typeChecked values, all valid"
+	}
+}
+
+# --- Check 13: префиксы в значениях объявлены в самом файле ---
+# `cfg:DataProcessorObject.X` в <v8:Type> при незадекларированном xmlns:cfg — валидный XML, который
+# платформа не читает вовсе: «Исключение XDTO произошло при чтении файла». Ошибка типична для
+# рукописного XML: префикс скопирован из чужой формы, а объявление в корне забыто. Область видимости
+# считаем по узлу (GetNamespaceOfPrefix), а не по корню: локальная xmlns на элементе законна.
+
+if (-not $stopped) {
+	$prefixErrors = 0
+	$prefixChecked = 0
+
+	$prefixPattern = '^([A-Za-z_][A-Za-z0-9_.-]*):.+$'
+	# Значения, где префикс обязан резолвиться: тип реквизита/колонки и xsi:type
+	# Только листовые узлы: под local-name()='Type' подходит и обёртка <Type>, и вложенный <v8:Type>,
+	# а InnerText обёртки — то же значение, иначе одна ошибка сообщалась бы дважды.
+	foreach ($node in $xmlDoc.SelectNodes("//*[local-name()='Type' or local-name()='TypeSet']", $nsMgr)) {
+		if ($node.SelectSingleNode("*")) { continue }
+		$val = $node.InnerText.Trim()
+		if (-not $val) { continue }
+		$m = [regex]::Match($val, $prefixPattern)
+		if (-not $m.Success) { continue }
+		$prefixChecked++
+		$pfx = $m.Groups[1].Value
+		if (-not $node.GetNamespaceOfPrefix($pfx)) {
+			Report-Error "13. Type '$val': namespace prefix '${pfx}:' is not declared — the platform cannot read the file (XDTO)"
+			$prefixErrors++
+		}
+	}
+	foreach ($node in $xmlDoc.SelectNodes("//*[@xsi:type]", $nsMgr)) {
+		$val = $node.GetAttribute("type", "http://www.w3.org/2001/XMLSchema-instance")
+		$m = [regex]::Match($val, $prefixPattern)
+		if (-not $m.Success) { continue }
+		$prefixChecked++
+		$pfx = $m.Groups[1].Value
+		if (-not $node.GetNamespaceOfPrefix($pfx)) {
+			Report-Error "13. xsi:type='$val': namespace prefix '${pfx}:' is not declared — the platform cannot read the file (XDTO)"
+			$prefixErrors++
+		}
+	}
+
+	if ($prefixChecked -eq 0) {
+		Report-OK "13. Namespace prefixes: nothing to check"
+	} elseif ($prefixErrors -eq 0) {
+		Report-OK "13. Namespace prefixes: $prefixChecked values, all declared"
+	}
+}
+
+# --- Check 14: версия формата формы совпадает с версией выгрузки ---
+# Версию задаёт платформа, которой выгружали, и в пределах одной выгрузки она едина. Форма из
+# другой версии — «Неизвестная версия формата N загружаемого файла»: платформа не читает файл,
+# который новее её самой. Источник версии ищем общим helper-ом: он же покрывает автономную
+# внешнюю обработку/отчёт, где Configuration.xml нет и версию несёт корень самой обработки.
+
+if (-not $stopped -and $script:versionAnchor) {
+	$formVer = $root.GetAttribute("version")
+	$dumpVer = Detect-FormatVersion (Split-Path (Resolve-Path $FormPath) -Parent)
+
+	if (-not $formVer) {
+		Report-OK "14. Format version: not comparable"
+	} elseif ($formVer -ne $dumpVer) {
+		Report-Error "14. Format version $formVer differs from the dump ($dumpVer) — a dump carries one version, the platform refuses a file it cannot read"
+	} else {
+		Report-OK "14. Format version: $formVer, matches the dump"
 	}
 }
 

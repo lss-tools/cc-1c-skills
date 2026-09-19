@@ -1,0 +1,29 @@
+{
+  "name": "Режим совместимости выше платформы: сообщение классифицируется как отказ (issue #63)",
+  "fakePlatform": {
+    "log": "﻿Для работы с конфигурацией необходима версия платформы не меньше, чем 8.3.27.\r\nТекущая версия 8.3.24.1691.\r\n"
+  },
+  "preRun": [
+    {
+      "writeFile": {
+        "path": "src/Configuration.xml",
+        "content": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<MetaDataObject/>"
+      }
+    }
+  ],
+  "args_extra": [
+    "-V8Path",
+    "{fakePlatform}",
+    "-InfoBasePath",
+    "{workDir}/ib",
+    "-ConfigDir",
+    "{workDir}/src"
+  ],
+  "expect": {
+    "stdoutContains": [
+      "[warning] platform reported success, but the log contains 1 problem(s):",
+      "необходима версия платформы не меньше"
+    ]
+  },
+  "noSnapshot": "навык ничего не пишет в рабочий каталог — проверяется разбор лога платформы"
+}

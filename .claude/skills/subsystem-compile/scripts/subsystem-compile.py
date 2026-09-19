@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# subsystem-compile v1.19 — Create 1C subsystem from JSON definition
+# subsystem-compile v1.33 — Create 1C subsystem from JSON definition
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 import argparse
 import json
@@ -10,6 +10,127 @@ import sys
 import uuid
 import xml.etree.ElementTree as ET
 from lxml import etree
+
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+
+def parse_json_input(text, source, expected=None, inline=False):
+    """Разбор пользовательского JSON: одна строка в stderr вместо traceback (issue #80).
+
+    expected заполняем только для полиморфного входа: у файла подсказка
+    была бы наполнителем — имя файла и текст парсера самодостаточны. inline печатает ещё и то,
+    что доехало: у файла такого вопроса нет, он лежит на диске и его видно целиком.
+
+    Импорты внутри тела: копия функции живёт в навыках с разными именами модулей
+    (skd-decompile импортирует json локально как _json), а тело обязано быть одинаковым.
+    """
+    import json as _pj
+    import sys as _psys
+    try:
+        if not str(text).strip():
+            raise ValueError("input is empty")
+        return _pj.loads(text)
+    except ValueError as exc:
+        what = "%s expects %s" % (source, expected) if expected else "Invalid JSON in %s" % source
+        if inline:
+            got = " ".join(str(text).split())
+            label = "got"
+            if not got:
+                got = "(empty)"
+            elif len(got) > 60:
+                label = "got (first 60 chars)"
+                got = got[:60]
+            what = "%s, %s: %s" % (what, label, got)
+        print("[ERROR] %s (%s)" % (what, exc), file=_psys.stderr)
+        _psys.exit(1)
+
+
+def read_json_file(path):
+    """Чтение входного JSON-файла с кодировкой из BOM (issue #80).
+
+    BOM — объявление самого файла, поэтому ему верим; без BOM ждём строгий UTF-8. Кодовую
+    страницу не подбираем: угаданное имя уехало бы в метаданные молча.
+    """
+    import os as _pos
+    import sys as _psys
+    if not _pos.path.exists(path):
+        print("[ERROR] File not found: %s" % path, file=_psys.stderr)
+        _psys.exit(1)
+    if _pos.path.isdir(path):
+        print("[ERROR] Expected a JSON file, got a directory: %s" % path, file=_psys.stderr)
+        _psys.exit(1)
+    with open(path, "rb") as _fh:
+        data = _fh.read()
+    if data[:3] == b"\xef\xbb\xbf":
+        return data[3:].decode("utf-8")
+    if data[:2] == b"\xff\xfe":
+        return data[2:].decode("utf-16-le")
+    if data[:2] == b"\xfe\xff":
+        return data[2:].decode("utf-16-be")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        print("[ERROR] %s is not valid UTF-8: %s - save the file as UTF-8, or add a BOM if it is UTF-16"
+              % (path, exc), file=_psys.stderr)
+        _psys.exit(1)
+
+
+class CIDict(dict):
+    # Ключи храним КАК ЕСТЬ: часть из них — имена объектов (табличные части, стандартные
+    # реквизиты), они попадают в XML. Регистронезависим только поиск. Порядок вставки
+    # сохраняется — от него зависит порядок эмиссии.
+    def _actual(self, key):
+        if not isinstance(key, str) or dict.__contains__(self, key):
+            return key
+        ci = self.__dict__.get('_ci')
+        if ci is None or len(ci) != len(self):
+            ci = {k.lower(): k for k in self if isinstance(k, str)}
+            self.__dict__['_ci'] = ci
+        return ci.get(key.lower(), key)
+
+    def __getitem__(self, key):
+        return dict.__getitem__(self, self._actual(key))
+
+    def __contains__(self, key):
+        return dict.__contains__(self, self._actual(key))
+
+    def get(self, key, default=None):
+        return dict.get(self, self._actual(key), default)
+
+    def pop(self, key, *default):
+        return dict.pop(self, self._actual(key), *default)
+
+    def __setitem__(self, key, value):
+        # запись по ключу, отличающемуся регистром, обновляет существующий, а не плодит дубль
+        dict.__setitem__(self, self._actual(key), value)
+
+def ci_json(obj):
+    """Рекурсивно оборачивает разобранный JSON: словари → CIDict, списки обходятся."""
+    if isinstance(obj, dict):
+        return CIDict((k, ci_json(v)) for k, v in obj.items())
+    if isinstance(obj, list):
+        return [ci_json(v) for v in obj]
+    return obj
+
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
 
 
 # ============================================================
@@ -190,6 +311,16 @@ def assert_edit_allowed(target_path, require):
 
 def detect_format_version(d):
     while d:
+        # Автономная внешняя обработка/отчёт: своего Configuration.xml у неё нет, версию несёт
+        # корень самой обработки. Без этого форма и макет внутри обработки 2.21 писались бы 2.17.
+        ext_path = d + ".xml"
+        if os.path.isfile(ext_path):
+            with open(ext_path, "r", encoding="utf-8-sig") as f:
+                ext_head = f.read(2000)
+            if re.search(r'<(ExternalDataProcessor|ExternalReport)[ >]', ext_head):
+                m = re.search(r'<MetaDataObject[^>]+version="(\d+\.\d+)"', ext_head)
+                if m:
+                    return m.group(1)
         cfg_path = os.path.join(d, "Configuration.xml")
         if os.path.isfile(cfg_path):
             with open(cfg_path, "r", encoding="utf-8-sig") as f:
@@ -219,6 +350,11 @@ def detect_eol(text):
     return '\r\n' if '\r\n' in text else '\n'
 
 def esc_xml(s):
+    # Эскейп ЗНАЧЕНИЯ АТРИБУТА: & < > и кавычка — внутри "..." литеральная " невалидна.
+    return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+
+def esc_xml_text(s):
     """Экранирование ТЕКСТА элемента: только & < > . Кавычки платформа в тексте не экранирует
     (92142 сырых кавычки на корпус, ни одной &quot;); &quot; она принимает, но нормализует обратно."""
     return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
@@ -231,7 +367,7 @@ def emit_mltext(lines, indent, tag, text):
     lines.append(f"{indent}<{tag}>")
     lines.append(f"{indent}\t<v8:item>")
     lines.append(f"{indent}\t\t<v8:lang>ru</v8:lang>")
-    lines.append(f"{indent}\t\t<v8:content>{esc_xml(text)}</v8:content>")
+    lines.append(f"{indent}\t\t<v8:content>{esc_xml_text(text)}</v8:content>")
     lines.append(f"{indent}\t</v8:item>")
     lines.append(f"{indent}</{tag}>")
 
@@ -241,8 +377,11 @@ def new_uuid():
 
 
 def write_utf8_bom(path, content):
+    # newline='' — без трансляции: иначе текстовый режим Python дал бы CRLF на Windows
+    # и LF на macOS, то есть вывод навыка зависел бы от ОС.
     with open(path, 'w', encoding='utf-8-sig', newline='') as f:
         f.write(content)
+
 
 
 def split_camel_case(name):
@@ -295,7 +434,7 @@ def write_child_subsystem_stub(child_path, child_name, format_version):
     lines.append(f'<MetaDataObject {XMLNS_DECL} version="{format_version}">')
     lines.append(f'\t<Subsystem uuid="{child_uuid}">')
     lines.append('\t\t<Properties>')
-    lines.append(f'\t\t\t<Name>{esc_xml(child_name)}</Name>')
+    lines.append(f'\t\t\t<Name>{esc_xml_text(child_name)}</Name>')
     lines.append('\t\t\t<Synonym/>')
     lines.append('\t\t\t<Comment/>')
     lines.append('\t\t\t<IncludeHelpInContents>true</IncludeHelpInContents>')
@@ -311,6 +450,101 @@ def write_child_subsystem_stub(child_path, child_name, format_version):
     write_utf8_bom(child_path, '\r\n'.join(lines))
 
 
+# Канонический порядок видов в <ChildObjects> — эталон в docs/1c-configuration-spec.md,
+# таблица «Порядок типов в ChildObjects». Нужен, чтобы новая группа вида вставала на своё
+# место: иначе платформа переставит её при первой же выгрузке и даст диф на ровном месте.
+# Реестр карт: tests/skills/check-type-maps.mjs.
+CHILD_OBJECT_TYPES = [
+    'Language', 'Subsystem', 'StyleItem', 'Style',
+    'CommonPicture', 'SessionParameter', 'Role', 'CommonTemplate',
+    'FilterCriterion', 'CommonModule', 'CommonAttribute', 'ExchangePlan',
+    'XDTOPackage', 'WebService', 'HTTPService', 'WSReference',
+    'EventSubscription', 'ScheduledJob', 'SettingsStorage', 'FunctionalOption',
+    'FunctionalOptionsParameter', 'DefinedType', 'Bot', 'PaletteColor', 'CommonCommand', 'CommandGroup',
+    'Constant', 'CommonForm', 'Catalog', 'Document',
+    'DocumentNumerator', 'Sequence', 'DocumentJournal', 'Enum',
+    'Report', 'DataProcessor', 'InformationRegister', 'AccumulationRegister',
+    'ChartOfCharacteristicTypes', 'ChartOfAccounts', 'AccountingRegister',
+    'ChartOfCalculationTypes', 'CalculationRegister',
+    'BusinessProcess', 'Task', 'ExternalDataSource', 'IntegrationService',
+]
+
+
+def register_in_childobjects(parent_xml_path, parent_tag, child_tag, child_name):
+    """Регистрация объекта в <ChildObjects> родительского XML.
+
+    Вариант семьи: отступ берётся из самого документа, а запись дописывается в конец
+    блока. Отличие от эталона (meta-compile) осознанное: родителем бывает вложенный
+    Subsystem.xml произвольной глубины, где фиксированные три табуляции неверны,
+    а группировать записи по типу внутри подсистемы нечего — потомок там всегда один.
+    Реестр семьи: tests/skills/check-inline-drift.mjs.
+    Возвращает исход: added | already | no-childobj | no-config.
+    """
+    if not os.path.exists(parent_xml_path):
+        return 'no-config'
+
+    # newline='' => без трансляции переводов строк: иначе CRLF молча схлопнется
+    # в LF при чтении и файл будет переписан в LF.
+    with open(parent_xml_path, 'r', encoding='utf-8-sig', newline='') as f:
+        raw_text = f.read()
+
+    eol = detect_eol(raw_text)
+    doc = ET.ElementTree(ET.fromstring(raw_text))
+    root = doc.getroot()
+    md_ns = 'http://v8.1c.ru/8.3/MDClasses'
+
+    # Find ChildObjects
+    child_objects = None
+    for holder in root.iter(f'{{{md_ns}}}{parent_tag}'):
+        child_objects = holder.find(f'{{{md_ns}}}ChildObjects')
+        break
+
+    if child_objects is None:
+        return 'no-childobj'
+
+    for child in child_objects:
+        if child.tag == f'{{{md_ns}}}{child_tag}' and child.text == child_name:
+            return 'already'
+
+    # Правку ведём по сырому тексту, а не сериализацией ET: она не сохраняет отступы
+    # и теряет xmlns, объявленные только внутри значений атрибутов (#38).
+    entry = f'<{child_tag}>{esc_xml_text(child_name)}</{child_tag}>'
+    empty = re.search(r'<ChildObjects\s*/>', raw_text)
+    if empty is not None:
+        replacement = '<ChildObjects>' + eol + f'\t\t\t{entry}' + eol + '\t\t</ChildObjects>'
+        raw_text = raw_text[:empty.start()] + replacement + raw_text[empty.end():]
+    else:
+        # В корне подсистема встаёт перед первой группой вида старше по CHILD_OBJECT_TYPES:
+        # так она попадает и в канонический порядок видов, и в конец своей группы, если та уже
+        # есть. Дописать в конец блока нельзя вдвойне: платформа переставит новую группу при
+        # первой же выгрузке, а существующую подсистема покинула бы, уехав за виды ниже.
+        # Во вложенном Subsystem.xml порядок видов неприменим — потомок там всегда один.
+        anchor = None
+        if parent_tag == 'Configuration' and child_tag in CHILD_OBJECT_TYPES:
+            own_idx = CHILD_OBJECT_TYPES.index(child_tag)
+            type_rx = re.compile(r'(?m)^([ \t]*)<(\w+)>[^<]*</\2>')
+            for m in type_rx.finditer(raw_text):
+                other = m.group(2)
+                if other in CHILD_OBJECT_TYPES and CHILD_OBJECT_TYPES.index(other) > own_idx:
+                    anchor = m
+                    break
+        if anchor is not None:
+            raw_text = (raw_text[:anchor.start()] + anchor.group(1) + entry + eol
+                        + raw_text[anchor.start():])
+        else:
+            # Отступ вставки берём у закрывающего тега +1 уровень: подстановка
+            # по голому '</ChildObjects>' удваивала бы уже присутствующий отступ
+            # строки (получалось 5 табов вместо 3 — PS-порт через DOM даёт 3).
+            cm = re.search(r'([ \t]*)</ChildObjects>', raw_text)
+            if cm is None:
+                return 'no-childobj'
+            raw_text = (raw_text[:cm.start()] + cm.group(1) + '\t' + entry + eol
+                        + cm.group(1) + '</ChildObjects>' + raw_text[cm.end():])
+
+    write_utf8_bom(parent_xml_path, raw_text)
+    return 'added'
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -320,7 +554,7 @@ def main():
     parser.add_argument('-OutputDir', type=str, required=True)
     parser.add_argument('-Parent', type=str, default=None)
     parser.add_argument('-NoValidate', action='store_true', default=False)
-    args = parser.parse_args()
+    args = ci_parse_args(parser)
 
     # --- 1. Load JSON ---
     if args.DefinitionFile and args.Value:
@@ -337,12 +571,15 @@ def main():
         if not os.path.exists(def_file):
             print(f"Definition file not found: {def_file}", file=sys.stderr)
             sys.exit(1)
-        with open(def_file, 'r', encoding='utf-8-sig') as f:
-            json_text = f.read()
+        json_text = read_json_file(def_file)
+        json_source = def_file
+        json_inline = False
     else:
         json_text = args.Value
+        json_source = "-Value"
+        json_inline = True
 
-    defn = json.loads(json_text)
+    defn = ci_json(parse_json_input(json_text, json_source, inline=json_inline))
 
     if not defn.get('name'):
         print("JSON must have 'name' field", file=sys.stderr)
@@ -381,6 +618,7 @@ def main():
         'DefinedTypes': 'DefinedType', 'DocumentNumerators': 'DocumentNumerator',
         'Sequences': 'Sequence', 'Subsystems': 'Subsystem',
         'StyleItems': 'StyleItem', 'IntegrationServices': 'IntegrationService',
+        'Bots': 'Bot', 'Bot': 'Bot',
         # Russian singular → English
         'Справочник': 'Catalog', 'Каталог': 'Catalog', 'Документ': 'Document',
         'Перечисление': 'Enum', 'Константа': 'Constant',
@@ -483,14 +721,14 @@ def main():
     lines.append('\t\t<Properties>')
 
     # Name
-    lines.append(f'\t\t\t<Name>{esc_xml(obj_name)}</Name>')
+    lines.append(f'\t\t\t<Name>{esc_xml_text(obj_name)}</Name>')
 
     # Synonym
     emit_mltext(lines, '\t\t\t', 'Synonym', synonym)
 
     # Comment
     if comment:
-        lines.append(f'\t\t\t<Comment>{esc_xml(comment)}</Comment>')
+        lines.append(f'\t\t\t<Comment>{esc_xml_text(comment)}</Comment>')
     else:
         lines.append('\t\t\t<Comment/>')
 
@@ -515,7 +753,7 @@ def main():
     if len(content_items) > 0:
         lines.append('\t\t\t<Content>')
         for item in content_items:
-            lines.append(f'\t\t\t\t<xr:Item xsi:type="xr:MDObjectRef">{esc_xml(item)}</xr:Item>')
+            lines.append(f'\t\t\t\t<xr:Item xsi:type="xr:MDObjectRef">{esc_xml_text(item)}</xr:Item>')
         lines.append('\t\t\t</Content>')
     else:
         lines.append('\t\t\t<Content/>')
@@ -526,7 +764,7 @@ def main():
     if len(children) > 0:
         lines.append('\t\t<ChildObjects>')
         for ch in children:
-            lines.append(f'\t\t\t<Subsystem>{esc_xml(ch)}</Subsystem>')
+            lines.append(f'\t\t\t<Subsystem>{esc_xml_text(ch)}</Subsystem>')
         lines.append('\t\t</ChildObjects>')
     else:
         lines.append('\t\t<ChildObjects/>')
@@ -578,71 +816,25 @@ def main():
 
     # --- 5. Register in parent ---
     parent_xml_path = None
+    parent_tag = 'Configuration'
     if parent:
         parent_xml_path = parent
+        parent_tag = 'Subsystem'
     else:
         config_xml = os.path.join(output_dir, 'Configuration.xml')
         if os.path.exists(config_xml):
             parent_xml_path = config_xml
 
-    if parent_xml_path and os.path.exists(parent_xml_path):
-        # newline='' => без трансляции переводов строк: иначе CRLF молча схлопнется
-        # в LF при чтении и файл будет переписан в LF.
-        with open(parent_xml_path, 'r', encoding='utf-8-sig', newline='') as f:
-            raw_text = f.read()
-
-        eol = detect_eol(raw_text)
-        doc = ET.ElementTree(ET.fromstring(raw_text))
-        root = doc.getroot()
-        md_ns = 'http://v8.1c.ru/8.3/MDClasses'
-
-        # Find ChildObjects
-        child_objects = None
-        if parent:
-            for sub in root.iter(f'{{{md_ns}}}Subsystem'):
-                child_objects = sub.find(f'{{{md_ns}}}ChildObjects')
-                break
-        else:
-            for cfg in root.iter(f'{{{md_ns}}}Configuration'):
-                child_objects = cfg.find(f'{{{md_ns}}}ChildObjects')
-                break
-
-        if child_objects is not None:
-            # Check if already registered
-            already_exists = False
-            for child in child_objects:
-                if child.tag == f'{{{md_ns}}}Subsystem' and child.text == obj_name:
-                    already_exists = True
-                    break
-
-            if not already_exists:
-                new_el = ET.SubElement(child_objects, f'{{{md_ns}}}Subsystem')
-                new_el.text = obj_name
-
-                # Re-serialize with whitespace preservation via raw text manipulation instead
-                # Since ElementTree doesn't preserve whitespace well, use regex-based insertion
-                # Find </ChildObjects> or <ChildObjects/> and inject
-                pass  # Fall through to raw text approach below
-
-            if not already_exists:
-                # Use raw text manipulation to preserve formatting
-                if '<ChildObjects/>' in raw_text:
-                    replacement = ('<ChildObjects>' + eol + f'\t\t\t<Subsystem>{esc_xml(obj_name)}</Subsystem>' + eol + '\t\t</ChildObjects>')
-                    raw_text = raw_text.replace('<ChildObjects/>', replacement, 1)
-                elif '</ChildObjects>' in raw_text:
-                    # Отступ вставки берём у закрывающего тега +1 уровень: подстановка
-                    # по голому '</ChildObjects>' удваивала бы уже присутствующий отступ
-                    # строки (получалось 5 табов вместо 3 — PS-порт через DOM даёт 3).
-                    raw_text = re.sub(r'([ \t]*)</ChildObjects>',
-                                      lambda m: m.group(1) + '\t' + f'<Subsystem>{esc_xml(obj_name)}</Subsystem>' + eol + m.group(1) + '</ChildObjects>',
-                                      raw_text, count=1)
-
-                write_utf8_bom(parent_xml_path, raw_text)
-                print(f"[OK] Registered in: {parent_xml_path}")
-            else:
-                print(f"[SKIP] Already registered in: {parent_xml_path}")
-        else:
+    if parent_xml_path:
+        outcome = register_in_childobjects(parent_xml_path, parent_tag, 'Subsystem', obj_name)
+        if outcome == 'added':
+            print(f"[OK] Registered in: {parent_xml_path}")
+        elif outcome == 'already':
+            print(f"[SKIP] Already registered in: {parent_xml_path}")
+        elif outcome == 'no-childobj':
             print(f"[WARN] ChildObjects not found in: {parent_xml_path}")
+        else:
+            print("[INFO] No parent XML to register in")
     else:
         print("[INFO] No parent XML to register in")
 

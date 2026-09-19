@@ -1,7 +1,8 @@
-﻿# cf-validate v1.5 — Validate 1C configuration root structure
+﻿# cf-validate v1.10 — Validate 1C configuration root structure
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
+[CmdletBinding(PositionalBinding=$false)]
 param(
-	[Parameter(Mandatory)]
+	[Parameter(Mandatory, Position=0)]
 	[Alias('Path')]
 	[string]$ConfigPath,
 
@@ -89,6 +90,19 @@ $finalize = {
 	}
 }
 
+# --- Format version ---
+# Проверенный диапазон версий формата выгрузки: 2.17 (8.3.24) … 2.21 (8.5). Полная лестница —
+# docs/1c-configuration-spec.md, «Лестница версий». Версию задаёт платформа ВЫГРУЗКИ, а не режим
+# совместимости конфигурации. Версии ниже 2.17 (платформы 8.3.23 и старше) существуют, но навыки
+# на них не проверялись — это предупреждение о непокрытии, а не о некорректности файла.
+$formatVerifiedMin = "2.17"
+$formatVerifiedMax = "2.21"
+# Версия формата как число: "2.20" → 220. Строковое сравнение неверно ("2.9" > "2.17").
+function Get-FormatRank([string]$ver) {
+	if ($ver -match '^(\d+)\.(\d+)$') { return [int]$Matches[1] * 100 + [int]$Matches[2] }
+	return 0
+}
+
 # --- Reference tables ---
 $guidPattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 $identPattern = '^[A-Za-z\u0410-\u042F\u0401\u0430-\u044F\u0451_][A-Za-z0-9\u0410-\u042F\u0401\u0430-\u044F\u0451_]*$'
@@ -108,16 +122,16 @@ $validClassIds = @(
 $childObjectTypes = @(
 	"Language","Subsystem","StyleItem","Style",
 	"CommonPicture","SessionParameter","Role","CommonTemplate",
-	"FilterCriterion","CommonModule","Bot","CommonAttribute","ExchangePlan",
+	"FilterCriterion","CommonModule","CommonAttribute","ExchangePlan",
 	"XDTOPackage","WebService","HTTPService","WSReference",
 	"EventSubscription","ScheduledJob","SettingsStorage","FunctionalOption",
-	"FunctionalOptionsParameter","DefinedType","CommonCommand","CommandGroup",
+	"FunctionalOptionsParameter","DefinedType","Bot","PaletteColor","CommonCommand","CommandGroup",
 	"Constant","CommonForm","Catalog","Document",
 	"DocumentNumerator","Sequence","DocumentJournal","Enum",
 	"Report","DataProcessor","InformationRegister","AccumulationRegister",
 	"ChartOfCharacteristicTypes","ChartOfAccounts","AccountingRegister",
 	"ChartOfCalculationTypes","CalculationRegister",
-	"BusinessProcess","Task","IntegrationService"
+	"BusinessProcess","Task","ExternalDataSource","IntegrationService"
 )
 
 # Type -> directory mapping
@@ -126,6 +140,7 @@ $childTypeDirMap = @{
 	"CommonPicture"="CommonPictures"; "SessionParameter"="SessionParameters"; "Role"="Roles"
 	"CommonTemplate"="CommonTemplates"; "FilterCriterion"="FilterCriteria"; "CommonModule"="CommonModules"
 	"Bot"="Bots"
+	"PaletteColor"="PaletteColors"
 	"CommonAttribute"="CommonAttributes"; "ExchangePlan"="ExchangePlans"; "XDTOPackage"="XDTOPackages"
 	"WebService"="WebServices"; "HTTPService"="HTTPServices"; "WSReference"="WSReferences"
 	"EventSubscription"="EventSubscriptions"; "ScheduledJob"="ScheduledJobs"
@@ -142,7 +157,7 @@ $childTypeDirMap = @{
 	"ChartOfCalculationTypes"="ChartsOfCalculationTypes"
 	"CalculationRegister"="CalculationRegisters"
 	"BusinessProcess"="BusinessProcesses"; "Task"="Tasks"
-	"IntegrationService"="IntegrationServices"
+	"ExternalDataSource"="ExternalDataSources"; "IntegrationService"="IntegrationServices"
 }
 
 # Valid enum values for Configuration properties
@@ -203,11 +218,15 @@ if ($root.NamespaceURI -ne $expectedNs) {
 }
 
 $version = $root.GetAttribute("version")
+$versionRank = Get-FormatRank $version
 if (-not $version) {
 	Report-Warn "1. Missing version attribute on MetaDataObject"
-} elseif ($version -notin @("2.17", "2.18", "2.19", "2.20", "2.21")) {
-	# Лестница версий формата: 2.17 (8.3.20-8.3.24), 2.18 (8.3.25), 2.19 (8.3.26), 2.20 (8.3.27).
-	Report-Warn "1. Unusual version '$version' (expected 2.17-2.20 or 2.21)"
+} elseif ($versionRank -eq 0) {
+	Report-Error "1. Malformed version '$version' (expected N.N)"
+} elseif ($versionRank -lt (Get-FormatRank $formatVerifiedMin)) {
+	Report-Warn "1. Format version '$version' is below the tested range $formatVerifiedMin-$formatVerifiedMax — skills were not verified on it"
+} elseif ($versionRank -gt (Get-FormatRank $formatVerifiedMax)) {
+	Report-Warn "1. Format version '$version' is above the tested range $formatVerifiedMin-$formatVerifiedMax — skills were not verified on it"
 }
 
 # Must have Configuration child

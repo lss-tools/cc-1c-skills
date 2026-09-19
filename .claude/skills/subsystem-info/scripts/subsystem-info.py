@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# subsystem-info v1.2 — Compact summary of 1C subsystem structure
+# subsystem-info v1.6 — Compact summary of 1C subsystem structure
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 import argparse
@@ -12,6 +12,28 @@ from lxml import etree
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
+
 # --- Argument parsing ---
 parser = argparse.ArgumentParser(description="Analyze 1C subsystem structure", allow_abbrev=False)
 parser.add_argument("-SubsystemPath", "-Path", required=True, help="Path to subsystem XML or Subsystems/ directory")
@@ -20,7 +42,7 @@ parser.add_argument("-Name", default="", help="Filter by name/type")
 parser.add_argument("-Limit", type=int, default=150, help="Max lines to show")
 parser.add_argument("-Offset", type=int, default=0, help="Lines to skip")
 parser.add_argument("-OutFile", default="", help="Write output to file")
-args = parser.parse_args()
+args = ci_parse_args(parser)
 
 # --- Output helper ---
 lines_buf = []
@@ -83,7 +105,7 @@ def load_subsystem_xml(xml_path):
     doc_root = tree.getroot()
     sub = doc_root.find("md:Subsystem", NS)
     if sub is None:
-        print(f"[ERROR] Not a valid subsystem XML: {xml_path}", file=sys.stderr)
+        print(f"[ERROR] Not a valid subsystem XML: {xml_path}")
         sys.exit(1)
     return {"Doc": doc_root, "Sub": sub}
 
@@ -150,7 +172,7 @@ def get_support_status_for_path(target_path):
             except Exception:
                 pass
             return None
-        def is_external_root(xml_path):
+        def _sg_is_external_root(xml_path):
             if not os.path.isfile(xml_path):
                 return False
             try:
@@ -164,14 +186,14 @@ def get_support_status_for_path(target_path):
         rp = os.path.abspath(target_path)
         # The target file itself may be the element meta-xml (e.g. Subsystems/X.xml).
         elem_uuid = root_uuid(rp)
-        if is_external_root(rp):
+        if _sg_is_external_root(rp):
             return None
         bin_path = None
         d = os.path.dirname(rp)
         for _ in range(12):
             if not d:
                 break
-            if is_external_root(d + ".xml"):
+            if _sg_is_external_root(d + ".xml"):
                 return None
             if not elem_uuid:
                 elem_uuid = root_uuid(d + ".xml")
@@ -386,7 +408,7 @@ if args.Mode == "tree":
         root_dir = subsystem_path
     else:
         if not os.path.isfile(subsystem_path):
-            print(f"[ERROR] File not found: {subsystem_path}", file=sys.stderr)
+            print(f"[ERROR] File not found: {subsystem_path}")
             sys.exit(1)
         root_xml = subsystem_path
 
@@ -466,7 +488,7 @@ if args.Mode == "tree":
         if args.Name:
             xml_files = [f for f in xml_files if os.path.splitext(f)[0] == args.Name]
             if not xml_files:
-                print(f"[ERROR] Subsystem '{args.Name}' not found in {root_dir}", file=sys.stderr)
+                print(f"[ERROR] Subsystem '{args.Name}' not found in {root_dir}")
                 sys.exit(1)
         for i, fname in enumerate(xml_files):
             build_tree_entry(os.path.join(root_dir, fname), "", i == len(xml_files) - 1, True)
@@ -478,7 +500,7 @@ elif args.Mode == "ci":
     # Mode: ci -- CommandInterface.xml
     # ============================================================
     if os.path.isdir(subsystem_path):
-        print("[ERROR] ci mode requires a subsystem .xml file, not a directory", file=sys.stderr)
+        print("[ERROR] ci mode requires a subsystem .xml file, not a directory")
         sys.exit(1)
     # File not found -- check Dir/Name/Name.xml -> Dir/Name.xml
     if not os.path.isfile(subsystem_path):
@@ -489,7 +511,7 @@ elif args.Mode == "ci":
             if os.path.isfile(c):
                 subsystem_path = c
     if not os.path.isfile(subsystem_path):
-        print(f"[ERROR] File not found: {subsystem_path}", file=sys.stderr)
+        print(f"[ERROR] File not found: {subsystem_path}")
         sys.exit(1)
 
     parsed = load_subsystem_xml(subsystem_path)
@@ -513,7 +535,7 @@ else:
         elif os.path.isfile(sibling):
             subsystem_path = sibling
         else:
-            print(f"[ERROR] No {dir_name}.xml found in directory. Use -Mode tree for directory listing.", file=sys.stderr)
+            print(f"[ERROR] No {dir_name}.xml found in directory. Use -Mode tree for directory listing.")
             sys.exit(1)
 
     # File not found -- check Dir/Name/Name.xml -> Dir/Name.xml
@@ -525,7 +547,7 @@ else:
             if os.path.isfile(c):
                 subsystem_path = c
     if not os.path.isfile(subsystem_path):
-        print(f"[ERROR] File not found: {subsystem_path}", file=sys.stderr)
+        print(f"[ERROR] File not found: {subsystem_path}")
         sys.exit(1)
 
     parsed = load_subsystem_xml(subsystem_path)

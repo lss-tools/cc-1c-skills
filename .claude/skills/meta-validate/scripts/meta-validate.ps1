@@ -1,7 +1,8 @@
-﻿# meta-validate v1.14 — Validate 1C metadata object structure (+корневой <Type>: скаляр без структуры = ошибка)
+﻿# meta-validate v1.28 — Validate 1C metadata object structure
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
+[CmdletBinding(PositionalBinding=$false)]
 param(
-	[Parameter(Mandatory)]
+	[Parameter(Mandatory, Position=0)]
 	[Alias('Path')]
 	[string]$ObjectPath,
 
@@ -153,6 +154,19 @@ $finalize = {
 	}
 }
 
+# --- Format version ---
+# Проверенный диапазон версий формата выгрузки: 2.17 (8.3.24) … 2.21 (8.5). Полная лестница —
+# docs/1c-configuration-spec.md, «Лестница версий». Версию задаёт платформа ВЫГРУЗКИ, а не режим
+# совместимости конфигурации. Версии ниже 2.17 (платформы 8.3.23 и старше) существуют, но навыки
+# на них не проверялись — это предупреждение о непокрытии, а не о некорректности файла.
+$formatVerifiedMin = "2.17"
+$formatVerifiedMax = "2.21"
+# Версия формата как число: "2.20" → 220. Строковое сравнение неверно ("2.9" > "2.17").
+function Get-FormatRank([string]$ver) {
+	if ($ver -match '^(\d+)\.(\d+)$') { return [int]$Matches[1] * 100 + [int]$Matches[2] }
+	return 0
+}
+
 # --- Reference tables ---
 
 $guidPattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
@@ -165,7 +179,9 @@ $validTypes = @(
 	"BusinessProcess","Task","ExchangePlan","DocumentJournal",
 	"Report","DataProcessor",
 	"CommonModule","ScheduledJob","EventSubscription",
-	"HTTPService","WebService","DefinedType"
+	"HTTPService","WebService","DefinedType",
+	# Внешний источник данных и его таблица (корень файла таблицы — <Table>).
+	"ExternalDataSource","Table"
 )
 
 # Валидные типы метаданных без глубоких правил валидации — раньше падали как "Unrecognized"
@@ -173,6 +189,7 @@ $validTypes = @(
 $structuralOnlyTypes = @(
 	"Subsystem","Role","CommonForm","CommonCommand","CommandGroup","CommonAttribute",
 	"CommonTemplate","CommonPicture","SessionParameter","SettingsStorage","FilterCriterion",
+	"IntegrationService","Bot",
 	"FunctionalOption","FunctionalOptionsParameter","Language","Style","StyleItem",
 	"WSReference","XDTOPackage","DocumentNumerator","Sequence"
 )
@@ -197,6 +214,10 @@ $generatedTypeCategories = @{
 	"Report"                     = @("Object","Manager")
 	"DataProcessor"              = @("Object","Manager")
 	"DefinedType"                = @("DefinedType")
+	"ExternalDataSource"         = @("Manager","TablesManager","CubesManager")
+	# Таблица внешнего источника: имя элемента трёхчастное (Префикс.Источник.Таблица),
+	# но проверка «имя оканчивается на .ИмяОбъекта» на нём работает как есть.
+	"Table"                      = @("Manager","Object","Ref","List","Record","RecordSet","RecordKey","RecordManager")
 }
 
 # Types that have NO InternalInfo / GeneratedType
@@ -209,15 +230,25 @@ $standardAttributesByType = @{
 	"Enum"                       = @("Order","Ref")
 	"InformationRegister"        = @("Active","LineNumber","Recorder","Period")
 	"AccumulationRegister"       = @("Active","LineNumber","Recorder","Period","RecordType")
-	"AccountingRegister"         = @("Active","Period","Recorder","LineNumber","Account")
+	"AccountingRegister"         = @("Active","Period","Recorder","LineNumber","Account","PeriodAdjustment","RecordType")
 	"CalculationRegister"        = @("Active","Recorder","LineNumber","RegistrationPeriod","CalculationType","ReversingEntry","ActionPeriod","BegOfActionPeriod","EndOfActionPeriod","BegOfBasePeriod","EndOfBasePeriod")
 	"ChartOfAccounts"            = @("PredefinedDataName","Predefined","Ref","DeletionMark","Description","Code","Parent","Order","Type","OffBalance")
 	"ChartOfCharacteristicTypes" = @("PredefinedDataName","Predefined","Ref","DeletionMark","Description","Code","Parent","IsFolder","ValueType")
 	"ChartOfCalculationTypes"    = @("PredefinedDataName","Predefined","Ref","DeletionMark","Description","Code","ActionPeriodIsBasic")
 	"BusinessProcess"            = @("Ref","DeletionMark","Date","Number","Started","Completed","HeadTask")
 	"Task"                       = @("Ref","DeletionMark","Date","Number","Executed","Description","RoutePoint","BusinessProcess")
-	"ExchangePlan"               = @("Ref","DeletionMark","Code","Description","ThisNode","SentNo","ReceivedNo")
+	"ExchangePlan"               = @("Ref","DeletionMark","Code","Description","ThisNode","SentNo","ReceivedNo","ExchangeDate")
 	"DocumentJournal"            = @("Type","Ref","Date","Posted","DeletionMark","Number")
+}
+
+# Стандартные реквизиты, присутствие которых зависит от свойств объекта: у бухрегистра
+# PeriodAdjustment — от длины периода корректировки, RecordType — от корреспонденции; у регистра
+# накопления RecordType — от вида регистра. Их отсутствие законно, в «Missing» не попадают.
+$stdAttrConditionalNames = @{
+	"AccountingRegister"   = @("PeriodAdjustment","RecordType")
+	"AccumulationRegister" = @("RecordType")
+	# ExchangeDate — легаси-реквизит, объявлен лишь у части планов обмена: допустим, но не обязателен.
+	"ExchangePlan"         = @("ExchangeDate")
 }
 
 # Types that have StandardAttributes block
@@ -248,6 +279,9 @@ $childObjectRules = @{
 	"DocumentJournal"            = @("Column","Form","Template","Command")
 	"HTTPService"                = @("URLTemplate")
 	"WebService"                 = @("Operation")
+	# Внешний источник: таблицы перечислены именами, функции лежат полными узлами.
+	"ExternalDataSource"         = @("Table","Function","Cube")
+	"Table"                      = @("Field","Form","Template","Command")
 	"Constant"                   = @("Form")
 	"DefinedType"                = @()
 	"CommonModule"               = @()
@@ -270,7 +304,8 @@ $validPropertyValues = @{
 	"RealTimePosting"                = @("Allow","Deny")
 	"RegisterRecordsDeletion"        = @("AutoDelete","AutoDeleteOnUnpost","AutoDeleteOff")
 	"RegisterRecordsWritingOnPost"   = @("WriteModified","WriteSelected","WriteAll")
-	"DataLockControlMode"            = @("Automatic","Managed")
+	# AutomaticAndManaged — только у внешнего источника данных и его таблиц.
+	"DataLockControlMode"            = @("Automatic","Managed","AutomaticAndManaged")
 	"FullTextSearch"                 = @("Use","DontUse")
 	"DefaultPresentation"            = @("AsDescription","AsCode")
 	"HierarchyType"                  = @("HierarchyFoldersAndItems","HierarchyOfItems")
@@ -279,7 +314,7 @@ $validPropertyValues = @{
 	"InformationRegisterPeriodicity" = @("Nonperiodical","Second","Day","Month","Quarter","Year","RecorderPosition")
 	"RegisterType"                   = @("Balance","Turnovers")
 	"ReturnValuesReuse"              = @("DontUse","DuringRequest","DuringSession")
-	"ReuseSessions"                  = @("DontUse","AutoUse")
+	"ReuseSessions"                  = @("DontUse","Use","AutoUse")
 	"FillChecking"                   = @("DontCheck","ShowError","ShowWarning")
 	"Indexing"                       = @("DontIndex","Index","IndexWithAdditionalOrder")
 	"DataHistory"                    = @("Use","DontUse")
@@ -342,12 +377,15 @@ if ($root.NamespaceURI -ne $expectedNs) {
 
 # Version attribute
 $version = $root.GetAttribute("version")
+$versionRank = Get-FormatRank $version
 if (-not $version) {
 	Report-Warn "1. Missing version attribute on MetaDataObject"
-} elseif ($version -notin @("2.17", "2.18", "2.19", "2.20", "2.21")) {
-	# Лестница версий формата: 2.17 (8.3.20-8.3.24), 2.18 (8.3.25), 2.19 (8.3.26),
-	# 2.20 (8.3.27), 2.21 (8.5). Версию задаёт платформа ВЫГРУЗКИ, а не режим совместимости.
-	Report-Warn "1. Unusual version '$version' (expected 2.17-2.21)"
+} elseif ($versionRank -eq 0) {
+	Report-Error "1. Malformed version '$version' (expected N.N)"
+} elseif ($versionRank -lt (Get-FormatRank $formatVerifiedMin)) {
+	Report-Warn "1. Format version '$version' is below the tested range $formatVerifiedMin-$formatVerifiedMax — skills were not verified on it"
+} elseif ($versionRank -gt (Get-FormatRank $formatVerifiedMax)) {
+	Report-Warn "1. Format version '$version' is above the tested range $formatVerifiedMin-$formatVerifiedMax — skills were not verified on it"
 }
 
 # Detect type element — exactly one child element in md namespace
@@ -607,11 +645,9 @@ if ($typesWithStdAttrs -contains $mdType) {
 			if ($saName) {
 				$foundNames += $saName
 				if ($expectedStdAttrs -notcontains $saName) {
-					# AccountingRegister has dynamic ExtDimension{N}/ExtDimensionType{N} and optional PeriodAdjustment
-					$isDynamic = ($mdType -eq "AccountingRegister" -and ($saName -match '^ExtDimension\d+$' -or $saName -match '^ExtDimensionType\d+$' -or $saName -eq "PeriodAdjustment"))
-					# CalculationRegister has conditional period attrs
-					$isCalcDynamic = ($mdType -eq "CalculationRegister" -and $saName -in @("ActionPeriod","BegOfActionPeriod","EndOfActionPeriod","BegOfBasePeriod","EndOfBasePeriod"))
-					if (-not $isDynamic -and -not $isCalcDynamic) {
+					# AccountingRegister: пары субконто, число которых задаётся планом счетов
+					$isDynamic = ($mdType -eq "AccountingRegister" -and ($saName -match '^ExtDimension\d+$' -or $saName -match '^ExtDimensionType\d+$'))
+					if (-not $isDynamic) {
 						Report-Warn "5. Unexpected StandardAttribute '$saName' for $mdType"
 					}
 				}
@@ -622,7 +658,8 @@ if ($typesWithStdAttrs -contains $mdType) {
 		}
 
 		if ($expectedStdAttrs) {
-			$missingAttrs = @($expectedStdAttrs | Where-Object { $foundNames -notcontains $_ })
+			$condNames = $stdAttrConditionalNames[$mdType]; if (-not $condNames) { $condNames = @() }
+			$missingAttrs = @($expectedStdAttrs | Where-Object { $foundNames -notcontains $_ -and $condNames -notcontains $_ })
 			if ($missingAttrs.Count -gt 0) {
 				Report-Warn "5. Missing StandardAttributes: $($missingAttrs -join ', ')"
 			}
@@ -714,16 +751,14 @@ function Check-ChildElement {
 	}
 
 	if ($requireType) {
+		# Пустой <Type/> — это тип «Произвольный», штатная конструкция: в типовых так описаны
+		# служебные реквизиты обработок, платформа принимает и сохраняет её без изменений
+		# (проверено round-trip). Ошибкой здесь был бы отказ там, где платформа не отказывает.
 		$typeEl = $elProps.SelectSingleNode("md:Type", $ns)
 		if (-not $typeEl) {
-			Report-Error "7. $kind '$nameVal' missing Type block"
-			return $false
-		}
-		$v8Types = $typeEl.SelectNodes("v8:Type", $ns)
-		$v8TypeSets = $typeEl.SelectNodes("v8:TypeSet", $ns)
-		if ($v8Types.Count -eq 0 -and $v8TypeSets.Count -eq 0) {
-			Report-Error "7. $kind '$nameVal' Type block has no v8:Type or v8:TypeSet"
-			return $false
+			# Блока Type нет вовсе: загрузка проходит, но платформа молча подставляет тип нового
+			# реквизита — Строка(10). Загрузку это не рвёт, а замысел теряет, отсюда WARN.
+			Report-Warn "7. $kind '$nameVal' — блок Type не задан; при загрузке платформа подставит Строка(10)"
 		}
 	}
 
@@ -985,7 +1020,12 @@ if ($propsNode) {
 	# HierarchyType set but Hierarchical = false
 	$hierarchical = $propsNode.SelectSingleNode("md:Hierarchical", $ns)
 	$hierarchyType = $propsNode.SelectSingleNode("md:HierarchyType", $ns)
-	if ($hierarchical -and $hierarchyType -and $hierarchical.InnerText -eq "false" -and $hierarchyType.InnerText) {
+	# HierarchyType платформа пишет всегда, независимо от Hierarchical, и при выключенной иерархии
+	# просто его игнорирует (проверено: значение переживает round-trip). Дефолтное значение поэтому
+	# ни о чём не говорит — предупреждаем только о явно заданном другом типе иерархии: это похоже
+	# на "тип иерархии выбрали, а саму иерархию включить забыли".
+	if ($hierarchical -and $hierarchyType -and $hierarchical.InnerText -eq "false" -and
+		$hierarchyType.InnerText -and $hierarchyType.InnerText -ne "HierarchyFoldersAndItems") {
 		Report-Warn "10. HierarchyType='$($hierarchyType.InnerText)' but Hierarchical=false"
 		$check10Issues++
 	}
@@ -1018,13 +1058,17 @@ if ($propsNode) {
 
 		# Empty Source
 		$source = $propsNode.SelectSingleNode("md:Source", $ns)
+		# Источник задают и наборами типов (<v8:TypeSet>cfg:CatalogObject</v8:TypeSet>) — в типовых
+		# так описана каждая четвёртая подписка. Реально пустой источник платформа отвергает:
+		# «ПодпискаНаСобытие.X - Источник событий должен быть задан», поэтому это ошибка.
 		$hasSource = $false
 		if ($source) {
 			$sourceTypes = $source.SelectNodes("v8:Type", $ns)
-			if ($sourceTypes.Count -gt 0) { $hasSource = $true }
+			$sourceTypeSets = $source.SelectNodes("v8:TypeSet", $ns)
+			if ($sourceTypes.Count -gt 0 -or $sourceTypeSets.Count -gt 0) { $hasSource = $true }
 		}
 		if (-not $hasSource) {
-			Report-Warn "10. EventSubscription: no Source types specified"
+			Report-Error "10. EventSubscription: источник событий не задан — платформа отвергнет загрузку"
 			$check10Issues++
 		}
 	}
@@ -1086,13 +1130,17 @@ if ($propsNode) {
 	# DocumentJournal: RegisteredDocuments should not be empty
 	if ($mdType -eq "DocumentJournal") {
 		$regDocs = $propsNode.SelectSingleNode("md:RegisteredDocuments", $ns)
+		# Регистрируемые документы платформа перечисляет как <xr:Item xsi:type="xr:MDObjectRef">,
+		# так же их пишет meta-compile; форма с <v8:Type> сохранена на случай иных выгрузок.
+		# Пустой состав платформа отвергает: «Для журнала не заданы регистрируемые документы».
 		$hasRegDocs = $false
 		if ($regDocs) {
 			$items = $regDocs.SelectNodes("v8:Type", $ns)
-			if ($items.Count -gt 0) { $hasRegDocs = $true }
+			$refItems = $regDocs.SelectNodes("xr:Item", $ns)
+			if ($items.Count -gt 0 -or $refItems.Count -gt 0) { $hasRegDocs = $true }
 		}
 		if (-not $hasRegDocs) {
-			Report-Warn "10. DocumentJournal: no RegisteredDocuments specified"
+			Report-Error "10. DocumentJournal: регистрируемые документы не заданы — платформа отвергнет загрузку"
 			$check10Issues++
 		}
 	}
@@ -1349,11 +1397,17 @@ if ($propsNode -and $mdType -in @("EventSubscription","ScheduledJob") -and $scri
 				if (Test-Path $bslPath) {
 					$bslContent = [System.IO.File]::ReadAllText($bslPath, [System.Text.Encoding]::UTF8)
 					# Match: Procedure/Function ProcName(...) Export or Процедура/Функция ProcName(...) Экспорт
-					$exportPattern = "(?mi)^[\s]*(Procedure|Function|Процедура|Функция)\s+$([regex]::Escape($procName))\s*\(.*\)\s+(Export|Экспорт)"
+					# Список параметров переносится на следующие строки, и Экспорт оказывается не на
+					# строке с именем — в типовых так объявлена каждая обработчик-процедура с длинной
+					# сигнатурой. Отсюда (?s) для содержимого скобок и \s (а не пробел) перед Экспорт.
+					$exportPattern = "(?smi)^[ 	]*(Procedure|Function|Процедура|Функция)[ 	]+$([regex]::Escape($procName))[ 	]*\([^)]*\)\s+(Export|Экспорт)"
 					if (-not [regex]::IsMatch($bslContent, $exportPattern)) {
 						Report-Warn "13. ${mdType}.${propLabel}: procedure '$procName' not found as exported in CommonModule '$cmName'"
 						$check13Ok = $false
 					}
+				} elseif (Test-Path ([System.IO.Path]::ChangeExtension($bslPath, "bin"))) {
+					# Модуль поставщика выгружен в двоичном виде (Module.bin) — текста нет by design,
+					# проверять нечего. Предупреждать здесь значило бы шуметь о норме.
 				} else {
 					Report-Warn "13. ${mdType}.${propLabel}: BSL file not found ($bslPath), cannot verify procedure"
 				}
@@ -1442,17 +1496,70 @@ if ($childObjNode) {
 	}
 }
 
+# --- Состав конфигурации (ChildObjects из Configuration.xml) ---
+# Платформа судит о существовании объекта по СОСТАВУ, а не по наличию файла. Файла может не быть
+# в частичной выгрузке: такой фрагмент грузится через /LoadConfigFromFiles -listFile слиянием с базой,
+# и ссылка на невыгруженный объект остаётся рабочей. Отсюда два разных исхода:
+#   нет в составе        -> платформа отвергнет загрузку всегда -> ERROR
+#   в составе, файла нет -> полная загрузка упадёт, частичная пройдёт -> WARN
+# ChildObjects конфигурации — плоский список <Вид>Имя</Вид>, поэтому ищем подстроку в границах секции
+# без копирования и без разбора XML. Кэш живёт только в пределах одного объекта: в batch-режиме
+# каждый следующий разбирается заново (в PS — новая область видимости скрипта при вызове через &,
+# в py — вовсе новый процесс), так что полная карта (~100 мс) оплачивалась бы каждым объектом.
+
+$script:cfgText = $null
+$script:cfgChildStart = -1
+$script:cfgChildLen = 0
+$script:cfgTextLoaded = $false
+
+function Initialize-ConfigText {
+	if ($script:cfgTextLoaded) { return }
+	$script:cfgTextLoaded = $true
+	if (-not $script:configDir) { return }
+	$cfgPath = Join-Path $script:configDir "Configuration.xml"
+	if (-not (Test-Path $cfgPath)) { return }
+	try {
+		$script:cfgText = [System.IO.File]::ReadAllText($cfgPath, [System.Text.Encoding]::UTF8)
+	} catch {
+		$script:cfgText = $null
+		return
+	}
+	$s = $script:cfgText.IndexOf('<ChildObjects>', [System.StringComparison]::Ordinal)
+	$e = $script:cfgText.LastIndexOf('</ChildObjects>', [System.StringComparison]::Ordinal)
+	if ($s -ge 0 -and $e -gt $s) {
+		$script:cfgChildStart = $s
+		$script:cfgChildLen = $e - $s
+	}
+}
+
+function Test-ConfigIsExtension {
+	Initialize-ConfigText
+	if (-not $script:cfgText) { return $false }
+	return $script:cfgText.Contains("ConfigurationExtensionPurpose")
+}
+
+# $true — объект есть в составе; $false — нет; $null — состав неизвестен (нет Configuration.xml
+# или в нём нет ChildObjects), тогда вызывающий оставляет мягкий уровень.
+function Test-InConfigComposition([string]$kind, [string]$name) {
+	Initialize-ConfigText
+	if ($script:cfgChildStart -lt 0) { return $null }
+	$needle = "<$kind>$name</$kind>"
+	if ($script:cfgText.IndexOf($needle, $script:cfgChildStart, $script:cfgChildLen, [System.StringComparison]::Ordinal) -ge 0) {
+		return $true
+	}
+	# Промах по точному совпадению — сверяем без учёта регистра, как это делает платформа.
+	# Порядок именно такой: Ordinal на порядок дешевле, а промахи редки.
+	return ($script:cfgText.IndexOf($needle, $script:cfgChildStart, $script:cfgChildLen, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+}
+
 # --- Check 16: Reference type existence — типы вида CatalogRef.X должны разрешаться в объекты конфигурации ---
-# WARN-уровень: ложное срабатывание на частичных выгрузках хуже пропуска. Расширения (CFE) пропускаем —
-# их типы ссылаются на объекты базовой конфигурации, которых нет в выгрузке расширения.
+# Уровень выбирается по составу конфигурации: типа нет в ChildObjects — «Неизвестное имя типа» при
+# загрузке (ERROR); объект в составе есть, а файла в выгрузке нет — частичная выгрузка (WARN).
+# Расширения (CFE) пропускаем — их типы ссылаются на объекты базовой конфигурации, которых в выгрузке
+# расширения нет.
 
 if ($script:configDir) {
-	$isExtension = $false
-	$cfgXmlPath = Join-Path $script:configDir "Configuration.xml"
-	if (Test-Path $cfgXmlPath) {
-		$cfgContent = [System.IO.File]::ReadAllText($cfgXmlPath, [System.Text.Encoding]::UTF8)
-		if ($cfgContent.Contains("ConfigurationExtensionPurpose")) { $isExtension = $true }
-	}
+	$isExtension = Test-ConfigIsExtension
 	if (-not $isExtension) {
 		$refDirMap = @{
 			"CatalogRef"="Catalogs"; "DocumentRef"="Documents"; "EnumRef"="Enums"
@@ -1462,7 +1569,9 @@ if ($script:configDir) {
 		}
 		$typeNodes = $xmlDoc.SelectNodes("//v8:Type", $ns)
 		$checkedRefs = @{}   # refKey -> $true если найден; для OK-условия
-		$missingRefs = @{}   # refKey -> refDir
+		$missingRefs = @{}   # refKey -> refDir; объект есть в составе, файла в выгрузке нет
+		$absentRefs = @{}    # refKey -> refDir; объекта нет в составе конфигурации
+		$unknownRefs = @{}   # refKey -> refDir; состав неизвестен (Configuration.xml без ChildObjects)
 		foreach ($tn in $typeNodes) {
 			$tv = $tn.InnerText.Trim()
 			if (-not $tv) { continue }
@@ -1482,17 +1591,138 @@ if ($script:configDir) {
 				$checkedRefs[$refKey] = $true
 			} else {
 				$checkedRefs[$refKey] = $false
-				$missingRefs[$refKey] = $refDir
+				# Вид метаданных в ChildObjects — это тип без суффикса Ref (CatalogRef -> Catalog);
+				# DefinedType суффикса не имеет и пишется в состав как есть.
+				$refKindTag = if ($refCat.EndsWith("Ref")) { $refCat.Substring(0, $refCat.Length - 3) } else { $refCat }
+				$inComposition = Test-InConfigComposition $refKindTag $refName
+				if ($inComposition -eq $false) {
+					$absentRefs[$refKey] = $refDir
+				} elseif ($inComposition -eq $true) {
+					$missingRefs[$refKey] = $refDir
+				} else {
+					$unknownRefs[$refKey] = $refDir
+				}
+			}
+		}
+		if ($absentRefs.Count -gt 0) {
+			foreach ($ak in ($absentRefs.Keys | Sort-Object)) {
+				Report-Error "16. Ссылочный тип '$ak' — объекта нет в составе конфигурации ($($absentRefs[$ak])/) — «Неизвестное имя типа» при загрузке"
 			}
 		}
 		if ($missingRefs.Count -gt 0) {
 			foreach ($mk in ($missingRefs.Keys | Sort-Object)) {
-				Report-Warn "16. Ссылочный тип '$mk' не найден в конфигурации ($($missingRefs[$mk])/) — при загрузке будет ошибка неизвестного типа"
+				Report-Warn "16. Ссылочный тип '$mk' — объект есть в составе конфигурации, файла объекта в выгрузке нет ($($missingRefs[$mk])/)"
 			}
-		} elseif ($checkedRefs.Count -gt 0) {
+		}
+		if ($unknownRefs.Count -gt 0) {
+			foreach ($uk in ($unknownRefs.Keys | Sort-Object)) {
+				Report-Warn "16. Ссылочный тип '$uk' не найден в конфигурации ($($unknownRefs[$uk])/)"
+			}
+		}
+		if ($absentRefs.Count -eq 0 -and $missingRefs.Count -eq 0 -and $unknownRefs.Count -eq 0 -and $checkedRefs.Count -gt 0) {
 			Report-OK "16. Reference types: $($checkedRefs.Count) resolved"
 		}
 	}
+}
+
+# --- Check 22: имя типа — грамматика (уровень 1) и словарь по контексту владельца (уровень 2) ---
+# УРОВЕНЬ 1 не зависит ни от версии платформы, ни от состава конфигурации: содержимое <v8:Type>
+# всегда несёт префикс пространства имён (xs:/v8:/cfg:/dNpM:/ent:/…). Голое имя платформа не примет
+# никогда — так выглядит и тип СУБД («varchar(150)»), и опечатка («Srting(20)»).
+# УРОВЕНЬ 2 — словарь: у хранимого объекта набор типов у́же, чем у обработки или отчёта, где
+# доступны ТаблицаЗначений, ОписаниеТипов, Картинка и прочие рантайм-типы. Здесь только
+# предупреждение: список конечен, но пополняется с версиями платформы.
+$knownXsTypes = @("xs:string", "xs:decimal", "xs:boolean", "xs:dateTime", "xs:base64Binary")
+$knownV8Types = @("ValueStorage", "UUID", "Null", "Type", "ValueTable", "ValueTree", "ValueList",
+	"ValueListType", "StandardPeriod", "StandardBeginningDate", "PointInTime", "TypeDescription",
+	"FixedArray", "FixedMap", "FixedStructure", "FillChecking", "Universal")
+# Ссылочные метатипы: с именем объекта (<Метатип>.<Имя>) — конкретный тип, без имени — множество.
+$refMetaTypes = @("CatalogRef", "DocumentRef", "EnumRef", "ChartOfAccountsRef",
+	"ChartOfCharacteristicTypesRef", "ChartOfCalculationTypesRef", "ExchangePlanRef",
+	"BusinessProcessRef", "BusinessProcessRoutePointRef", "TaskRef", "AnyRef", "AnyIBRef")
+# Прочие имена пространства current-config без точки — платформенные, состав конфигурации их не меняет.
+$cfgBareNames = @("ConstantsSet", "ReportBuilder", "FilterCriterion", "DynamicList")
+# Виды, чьи реквизиты ХРАНЯТСЯ в базе: там рантайм-типы недопустимы. У обработки и отчёта — наоборот.
+$storedOwnerTypes = @("Catalog", "Document", "DocumentJournal", "InformationRegister",
+	"AccumulationRegister", "AccountingRegister", "CalculationRegister", "ChartOfAccounts",
+	"ChartOfCharacteristicTypes", "ChartOfCalculationTypes", "ExchangePlan", "BusinessProcess",
+	"Task", "Constant", "Table")
+
+function Test-StorableType([string]$t) {
+	if ($knownXsTypes -contains $t) { return $true }
+	if ($t -eq "v8:ValueStorage" -or $t -eq "v8:UUID" -or $t -eq "v8:Null") { return $true }
+	$m = [regex]::Match($t, '^(?:cfg|d\d+p\d+):(.+)$')
+	if (-not $m.Success) { return $false }
+	$name = $m.Groups[1].Value
+	$base = if ($name.Contains('.')) { $name.Substring(0, $name.IndexOf('.')) } else { $name }
+	if ($refMetaTypes -contains $base) { return $true }
+	if ($base -eq "DefinedType" -or $base -eq "Characteristic" -or $base -eq "ExternalDataSourceTableRef") { return $true }
+	return $false
+}
+
+$typeNodes22 = @($xmlDoc.SelectNodes("//v8:Type", $ns)) + @($xmlDoc.SelectNodes("//v8:TypeSet", $ns))
+# Уровень 2 смотрит только на типы САМИХ реквизитов: параметры команд, характеристики и стандартные
+# реквизиты живут по другим правилам, и мешать их в один котёл нельзя.
+$attrTypePaths = @("Attribute", "Dimension", "Resource", "Column", "Field", "AddressingAttribute",
+	"AccountingFlag", "ExtDimensionAccountingFlag")
+$badGrammar = @{}
+$unknownVocab = @{}
+$notStorable = @{}
+$typesSeen = 0
+foreach ($tn in $typeNodes22) {
+	$t = "$($tn.InnerText)".Trim()
+	if (-not $t) { continue }
+	$typesSeen++
+	if (-not $t.Contains(':')) {
+		$badGrammar[$t] = $true
+		continue
+	}
+	$prefix = $t.Substring(0, $t.IndexOf(':'))
+	$local = $t.Substring($t.IndexOf(':') + 1)
+	if ($prefix -eq "xs") {
+		if ($knownXsTypes -notcontains $t) { $unknownVocab[$t] = $true }
+	} elseif ($prefix -eq "v8") {
+		if ($knownV8Types -notcontains $local) { $unknownVocab[$t] = $true }
+	} elseif ($prefix -eq "cfg" -or $prefix -match '^d\d+p\d+$') {
+		# Имя объекта конфигурации проверяет Check 16; здесь — только форма и платформенная часть.
+		if (-not $local.Contains('.')) {
+			if (($refMetaTypes -notcontains $local) -and ($cfgBareNames -notcontains $local) -and
+			    ($local -notmatch '^[A-Za-z][A-Za-z0-9]*(Object|Manager|List|Selection|RecordSet|RecordKey|RecordManager)$')) {
+				$unknownVocab[$t] = $true
+			}
+		} elseif ($local -notmatch '^[A-Za-z][A-Za-z0-9]*\.[^.]+(\.[^.]+)?$') {
+			$badGrammar[$t] = $true
+		}
+	}
+	# Прочие пространства (ent:, v8ui:, dcs*:, mxl: …) — форму имени не навязываем: там свои словари.
+
+	if ($storedOwnerTypes -contains $mdType) {
+		$owner = $tn.ParentNode          # <Type>
+		$props = if ($owner) { $owner.ParentNode } else { $null }     # <Properties>
+		$child = if ($props) { $props.ParentNode } else { $null }     # <Attribute>/<Field>/…
+		if ($child -and ($attrTypePaths -contains $child.LocalName) -and -not (Test-StorableType $t)) {
+			$notStorable[$t] = $child.LocalName
+		}
+	}
+}
+
+if ($badGrammar.Count -gt 0) {
+	foreach ($bk in ($badGrammar.Keys | Sort-Object)) {
+		Report-Error "22. Тип '$bk' — не имя типа платформы: нет префикса пространства имён либо неверна форма ссылочного типа. При загрузке — «Неизвестное имя типа»"
+	}
+}
+if ($notStorable.Count -gt 0) {
+	foreach ($nk in ($notStorable.Keys | Sort-Object)) {
+		Report-Warn "22. Тип '$nk' у элемента $($notStorable[$nk]) объекта ${mdType}: такие типы бывают у реквизитов обработок и отчётов, но не у хранимых в базе"
+	}
+}
+if ($unknownVocab.Count -gt 0) {
+	foreach ($uk in ($unknownVocab.Keys | Sort-Object)) {
+		Report-Warn "22. Тип '$uk' не в списке известных платформенных типов — проверьте написание (список пополняется с версиями платформы)"
+	}
+}
+if ($badGrammar.Count -eq 0 -and $notStorable.Count -eq 0 -and $unknownVocab.Count -eq 0 -and $typesSeen -gt 0) {
+	Report-OK "22. Type names: $typesSeen checked"
 }
 
 # --- Check 18: свойства, появившиеся в новых версиях формата ---
@@ -1508,12 +1738,7 @@ $versionedProps = @{
 	"AuxiliaryVariantForm"           = "2.21"   # вспомогательная форма варианта отчёта
 	"UseInInterfaceCompatibilityMode" = "2.21"  # использование общей формы в режиме совместимости интерфейса
 }
-# Версия формата как число: "2.20" → 220. Строковое сравнение неверно ("2.9" > "2.17").
-function Get-FormatRank([string]$v) {
-	if ($v -match '^(\d+)\.(\d+)$') { return [int]$Matches[1] * 100 + [int]$Matches[2] }
-	return 0
-}
-$fileRank = Get-FormatRank $version
+$fileRank = $versionRank
 if ($fileRank -gt 0) {
 	foreach ($vp in ($versionedProps.Keys | Sort-Object)) {
 		$nodes = $xmlDoc.SelectNodes("//md:$vp | //xr:$vp", $ns)
@@ -1561,6 +1786,207 @@ if ($mdRefNodes -and $mdRefNodes.Count -gt 0) {
 	}
 	if ($badRefForm.Count -eq 0 -and $unknownRoot.Count -eq 0) {
 		Report-OK "17. MDObjectRef form: $($mdRefNodes.Count) checked"
+	}
+}
+
+# --- Check 20: Default*Form / Auxiliary*Form — ссылка на существующую форму ---
+# Платформа отвергает загрузку: «Неизвестный объект метаданных - Catalog.Товары.Form.НетТакойФормы».
+# Две формы записи: "CommonForm.Имя" и "<Вид>.<Объект>.Form.<Форма>", причём объект может быть чужим
+# (DefaultListForm документа указывает на форму журнала документов). Для СВОЕГО объекта проверяем
+# регистрацию формы в ChildObjects — работает и на одиночном файле; для чужого и общей формы нужна
+# конфигурация. Заимствованные объекты расширения (ObjectBelonging=Adopted) пропускаем: их формы
+# живут в основной конфигурации, в выгрузке расширения их нет.
+#
+# Уровень везде выбирается по составу, а не по наличию файла (см. Test-InConfigComposition):
+# нет в ChildObjects — платформа откажет и при полной, и при частичной загрузке (ERROR);
+# в составе есть, а файла в выгрузке нет — это фрагмент частичной выгрузки, и загрузится он или нет,
+# зависит от состояния конфигурации БД, которого валидатору не видно (WARN).
+
+$formOwnerDirMap = @{
+	"Catalog"="Catalogs"; "Document"="Documents"; "DocumentJournal"="DocumentJournals"
+	"Enum"="Enums"; "Report"="Reports"; "DataProcessor"="DataProcessors"
+	"InformationRegister"="InformationRegisters"; "AccumulationRegister"="AccumulationRegisters"
+	"AccountingRegister"="AccountingRegisters"; "CalculationRegister"="CalculationRegisters"
+	"ChartOfAccounts"="ChartsOfAccounts"; "ChartOfCharacteristicTypes"="ChartsOfCharacteristicTypes"
+	"ChartOfCalculationTypes"="ChartsOfCalculationTypes"; "BusinessProcess"="BusinessProcesses"
+	"Task"="Tasks"; "ExchangePlan"="ExchangePlans"; "SettingsStorage"="SettingsStorages"
+	"FilterCriterion"="FilterCriteria"; "ExternalDataSource"="ExternalDataSources"
+}
+
+$belongingNode = $typeNode.SelectSingleNode("md:Properties/md:ObjectBelonging", $ns)
+$isAdopted = $belongingNode -and $belongingNode.InnerText.Trim() -eq "Adopted"
+
+if (-not $isAdopted) {
+	$isExtension20 = Test-ConfigIsExtension
+
+	# формы своего объекта: имена из ChildObjects (сравнение регистронезависимое — как у платформы)
+	$ownForms = @{}
+	if ($childObjNode) {
+		foreach ($child in $childObjNode.ChildNodes) {
+			if ($child.NodeType -eq 'Element' -and $child.LocalName -eq "Form") {
+				$fn = $child.InnerText.Trim()
+				if ($fn) { $ownForms[$fn.ToLowerInvariant()] = $fn }
+			}
+		}
+	}
+	$ownDir = Join-Path (Split-Path $resolvedPath) $objName
+
+	function Test-FormFile20 {
+		param([string]$baseDir, [string]$formName)
+		$formsDir = Join-Path $baseDir "Forms"
+		if (Test-Path (Join-Path $formsDir "$formName.xml")) { return $true }
+		if (Test-Path (Join-Path (Join-Path $formsDir $formName) "Form.xml")) { return $true }
+		if (Test-Path (Join-Path (Join-Path (Join-Path $formsDir $formName) "Ext") "Form.xml")) { return $true }
+		return $false
+	}
+
+	$formRefNodes = @($xmlDoc.SelectNodes("//*[substring(local-name(), string-length(local-name()) - 3) = 'Form']"))
+	$formRefsChecked = 0
+	$formRefBad = $false
+	foreach ($frn in $formRefNodes) {
+		$tag = $frn.LocalName
+		# ChoiceForm — «форма выбора» реквизита, ссылка того же вида, что и Default*Form.
+		if ($tag -notmatch '^(Default|Auxiliary)[A-Za-z]*Form$' -and $tag -ne 'ChoiceForm') { continue }
+		$ref = $frn.InnerText.Trim()
+		if (-not $ref) { continue }
+		# Значением бывает GUID (erp: Report.СверкаДанныхОУиБУ, DefaultVariantForm) — проверить
+		# его без обхода всех форм нельзя; cf-validate (Check 9) такие тоже пропускает.
+		if ($ref -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { continue }
+		$parts = $ref.Split('.')
+		$formRefsChecked++
+
+		if ($parts.Count -eq 2 -and $parts[0] -eq "CommonForm") {
+			if ($isExtension20 -or -not $script:configDir) { continue }
+			$cfDir = Join-Path (Join-Path $script:configDir "CommonForms") $parts[1]
+			$cfOk = (Test-Path "$cfDir.xml") -or (Test-Path (Join-Path (Join-Path $cfDir "Ext") "Form.xml")) -or (Test-Path (Join-Path $cfDir "Form.xml"))
+			if (-not $cfOk) {
+				$cfInComposition = Test-InConfigComposition "CommonForm" $parts[1]
+				if ($cfInComposition -eq $true) {
+					Report-Warn "20. $tag '$ref' — общая форма есть в составе конфигурации, файла формы в выгрузке нет (CommonForms/$($parts[1]))"
+				} else {
+					Report-Error "20. $tag '$ref' — общей формы нет в составе конфигурации (CommonForms/$($parts[1])) — «Неизвестный объект метаданных» при загрузке"
+					$formRefBad = $true
+				}
+			}
+			continue
+		}
+
+		# Ссылка на форму таблицы внешнего источника — шестичастная:
+		# ExternalDataSource.<Источник>.Table.<Таблица>.Form.<Форма>. Сводим её к четырём частям
+		# (вид = Table, объект = имя таблицы), дальше проверка общая.
+		if ($parts.Count -eq 6 -and $parts[0] -eq "ExternalDataSource" -and $parts[2] -eq "Table" -and $parts[4] -eq "Form") {
+			$parts = @("Table", $parts[3], "Form", $parts[5])
+		}
+
+		if ($parts.Count -ne 4 -or $parts[2] -ne "Form") {
+			Report-Warn "20. $tag '$ref' — неожиданный вид ссылки на форму (ожидается 'CommonForm.Имя' или '<Вид>.<Объект>.Form.<Форма>')"
+			continue
+		}
+
+		$refKind = $parts[0]; $refObj = $parts[1]; $refForm = $parts[3]
+
+		if ($refKind.ToLowerInvariant() -eq $mdType.ToLowerInvariant() -and $refObj.ToLowerInvariant() -eq $objName.ToLowerInvariant()) {
+			if (-not $ownForms.ContainsKey($refForm.ToLowerInvariant())) {
+				$known = if ($ownForms.Count -gt 0) { ($ownForms.Values | Sort-Object) -join ", " } else { "нет форм" }
+				Report-Error "20. $tag '$ref' — форма '$refForm' не зарегистрирована в ChildObjects объекта (есть: $known) — «Неизвестный объект метаданных» при загрузке"
+				$formRefBad = $true
+			} elseif ((Test-Path $ownDir) -and -not (Test-FormFile20 $ownDir $refForm)) {
+				# Форма в составе объекта есть, файла нет. Для дерева, претендующего на полноту
+				# (рядом лежит Configuration.xml), это ошибка целостности — полная загрузка упадёт
+				# на «Файл объекта не существует». Для фрагмента частичной выгрузки — норма:
+				# такой файл грузится через -listFile слиянием с конфигурацией БД.
+				if ($script:configDir) {
+					Report-Error "20. $tag '$ref' — форма зарегистрирована в ChildObjects, но файл формы отсутствует ($objName/Forms/$refForm)"
+					$formRefBad = $true
+				} else {
+					Report-Warn "20. $tag '$ref' — форма есть в ChildObjects, файла формы в выгрузке нет ($objName/Forms/$refForm)"
+				}
+			}
+			continue
+		}
+
+		# чужой объект (например журнал документов) — нужна конфигурация
+		if ($isExtension20 -or -not $script:configDir) { continue }
+		$refDir20 = $formOwnerDirMap[$refKind]
+		if (-not $refDir20) {
+			Report-Warn "20. $tag '$ref' — неизвестный вид метаданных '$refKind' (опечатка?)"
+			continue
+		}
+		$refObjXml = Join-Path (Join-Path $script:configDir $refDir20) "$refObj.xml"
+		if (-not (Test-Path $refObjXml)) {
+			$objInComposition = Test-InConfigComposition $refKind $refObj
+			if ($objInComposition -eq $false) {
+				Report-Error "20. $tag '$ref' — объекта '$refKind.$refObj' нет в составе конфигурации ($refDir20/) — «Неизвестный объект метаданных» при загрузке"
+				$formRefBad = $true
+			} elseif ($objInComposition -eq $true) {
+				Report-Warn "20. $tag '$ref' — объект '$refKind.$refObj' есть в составе конфигурации, файла объекта в выгрузке нет ($refDir20/)"
+			} else {
+				Report-Warn "20. $tag '$ref' — объект '$refKind.$refObj' не найден в конфигурации ($refDir20/)"
+			}
+			continue
+		}
+		if (-not (Test-FormFile20 (Join-Path (Join-Path $script:configDir $refDir20) $refObj) $refForm)) {
+			Report-Error "20. $tag '$ref' — форма '$refForm' не найдена у объекта '$refKind.$refObj' — «Неизвестный объект метаданных» при загрузке"
+			$formRefBad = $true
+		}
+	}
+
+	if ($formRefsChecked -gt 0 -and -not $formRefBad) {
+		Report-OK "20. Form refs: $formRefsChecked resolved"
+	}
+}
+
+# --- Check 21: таблица внешнего источника — ссылки на поля и наличие ключа ---
+# Свойства таблицы ссылаются на её же поля полным путём. Опечатка в имени поля даёт
+# «Неизвестный объект метаданных» при загрузке, а найти её глазами в шестичастном пути трудно.
+if ($mdType -eq "Table") {
+	$fieldNames = @{}
+	if ($childObjNode) {
+		foreach ($f in $childObjNode.SelectNodes("md:Field/md:Properties/md:Name", $ns)) {
+			$fieldNames[$f.InnerText] = $true
+		}
+	}
+	$edsRefsChecked = 0
+	$edsRefsBad = $false
+	foreach ($spec in @(
+		@("KeyFields", "xr:Field"), @("InputByString", "xr:Field"), @("DataLockFields", "xr:Field"),
+		@("PresentationField", $null), @("ParentField", $null), @("DataVersionField", $null))) {
+		$tag = $spec[0]
+		$refs = @()
+		if ($spec[1]) {
+			foreach ($n in $propsNode.SelectNodes("md:$tag/$($spec[1])", $ns)) { $refs += $n.InnerText }
+		} else {
+			$n = $propsNode.SelectSingleNode("md:$tag", $ns)
+			if ($n -and $n.InnerText) { $refs += $n.InnerText }
+		}
+		foreach ($ref in $refs) {
+			$edsRefsChecked++
+			$parts = $ref -split '\.'
+			# Ожидается ExternalDataSource.<Источник>.Table.<Таблица>.Field.<Поле>
+			if ($parts.Count -ne 6 -or $parts[0] -ne "ExternalDataSource" -or $parts[2] -ne "Table" -or $parts[4] -ne "Field") {
+				Report-Error "21. $tag '$ref' — ожидается ExternalDataSource.<Источник>.Table.<Таблица>.Field.<Поле>"
+				$edsRefsBad = $true
+				continue
+			}
+			if ($parts[3] -ne $objName) {
+				Report-Error "21. $tag '$ref' — ссылка на поле ЧУЖОЙ таблицы (эта: $objName)"
+				$edsRefsBad = $true
+				continue
+			}
+			if (-not $fieldNames.ContainsKey($parts[5])) {
+				$known = if ($fieldNames.Count -gt 0) { ($fieldNames.Keys | Sort-Object) -join ", " } else { "полей нет" }
+				Report-Error "21. $tag '$ref' — поля '$($parts[5])' нет в таблице (есть: $known)"
+				$edsRefsBad = $true
+			}
+		}
+	}
+	if ($edsRefsChecked -gt 0 -and -not $edsRefsBad) { Report-OK "21. Field refs: $edsRefsChecked resolved" }
+
+	# Ключ: загрузка XML таблицу без ключа принимает (проверено на платформе), а Конфигуратор
+	# интерактивно требует. Отсюда предупреждение, а не ошибка: рабочие конфигурации без ключа есть.
+	$keyNodes = @($propsNode.SelectNodes("md:KeyFields/xr:Field", $ns))
+	if ($keyNodes.Count -eq 0) {
+		Report-Warn "21. KeyFields пуст — платформа такую таблицу загрузит, но форма записи и набор записей будут недоступны"
 	}
 }
 

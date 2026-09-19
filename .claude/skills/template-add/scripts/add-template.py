@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# template-add v1.21 — Add template to 1C object
+# template-add v1.23 — Add template to 1C object (+write_xml_file/write_utf8_bom: общий эталон записи)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 import argparse
@@ -10,6 +10,28 @@ import sys
 import uuid
 
 from lxml import etree
+
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
 
 NSMAP = {"md": "http://v8.1c.ru/8.3/MDClasses"}
 
@@ -246,15 +268,12 @@ def save_xml_with_bom(tree, path):
         f.write(xml_bytes)
 
 
-def write_text_with_bom(path, text):
-    """Write text to file with UTF-8 BOM.
+def write_utf8_bom(path, content):
+    # newline='' — без трансляции: иначе текстовый режим Python дал бы CRLF на Windows
+    # и LF на macOS, то есть вывод навыка зависел бы от ОС.
+    with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+        f.write(content)
 
-    newline="" обязателен: в текстовом режиме Python на Windows превратил бы \\n в
-    \\r\\n, а на macOS оставил \\n — вывод навыка зависел бы от ОС. Через эту функцию
-    идёт HTML-макет, а его платформа хранит именно с LF (корпус: 399 LF из 400).
-    """
-    with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        f.write(text)
 
 
 def write_xml_file(path, content):
@@ -266,7 +285,7 @@ def write_xml_file(path, content):
     HTML-макет сюда НЕ идёт — платформа хранит его с LF.
     """
     text = content.replace('\r\n', '\n').replace('\n', '\r\n').rstrip('\r\n')
-    write_text_with_bom(path, text)
+    write_utf8_bom(path, text)
 
 
 def detect_format_version(d):
@@ -312,7 +331,7 @@ def main():
     parser.add_argument("-Synonym", default=None)
     parser.add_argument("-SrcDir", default="src")
     parser.add_argument("-SetMainSKD", action="store_true")
-    args = parser.parse_args()
+    args = ci_parse_args(parser)
 
     object_name = args.ObjectName
     template_name = args.TemplateName
@@ -451,10 +470,10 @@ def main():
             '</body>\n'
             '</html>'
         )
-        write_text_with_bom(template_file_path, content)
+        write_utf8_bom(template_file_path, content)
 
     elif template_type == "Text":
-        write_text_with_bom(template_file_path, "")
+        write_utf8_bom(template_file_path, "")
 
     elif template_type == "SpreadsheetDocument":
         # Пустой макет — самозакрывающимся корнем: пустых пар платформа не пишет

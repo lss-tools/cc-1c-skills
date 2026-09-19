@@ -79,6 +79,28 @@ JSON DSL для описания объектов метаданных конф�
 | `Time` | `xs:dateTime` + DateFractions=Time (только время) |
 | `ValueStorage` | `v8:ValueStorage` (ХранилищеЗначения) |
 | `UUID` | `v8:UUID` (УникальныйИдентификатор) |
+| `BinaryData` или `BinaryData(N[,fixed\|variable])` | `xs:base64Binary` + BinaryDataQualifiers (ДвоичныеДанные) |
+| `v8:Null` | `v8:Null` — тип «Null»; задаётся только с префиксом, голого синонима нет |
+
+Типы СУБД на входе компилятор переводит сам — соответствие замерено на стенде PostgreSQL и совпадает
+с тем, что делает Конфигуратор при импорте структуры таблицы:
+
+| Тип СУБД | Тип 1С | | Тип СУБД | Тип 1С |
+|---|---|---|---|---|
+| `integer`, `int`, `int4` | `Number(10,0)` | | `timestamp` | `DateTime` |
+| `bigint`, `int8` | `Number(19,0)` | | `date` | `Date` |
+| `smallint`, `int2` | `Number(5,0)` | | `uuid` | `UUID` |
+| `varchar(n)`, `character varying(n)` | `String(n)` | | `bytea` | `BinaryData` |
+| `numeric(p,s)`, `decimal(p,s)` | `Number(p,s)` | | | |
+
+Имя типа без префикса, которое не совпало ни с одной из форм выше, компилятор отвергает: так выглядит
+и опечатка, и неподдержанный тип СУБД. А вот имя С префиксом проходит как есть — так задаются
+типы, у которых нет синонима в DSL: `v8:Null`, `v8:ValueTable`, `ent:AccountType`, `v8ui:Color`.
+
+Важное ограничение: типы 1С получает ОТ ДРАЙВЕРА ODBC, а не из схемы БД. Поэтому `boolean`
+в список НЕ входит: в DSL это Булево, а psqlODBC при реальном импорте отдаёт `Строка(5)` (опция
+драйвера *Bools as Char*). `text`, `real`, `double precision`, `money`, `json` и массивы не поддержаны —
+для них замера нет.
 
 ### 3.2 Ссылочные типы
 
@@ -96,6 +118,13 @@ JSON DSL для описания объектов метаданных конф�
 | `DefinedType.Xxx` | `cfg:DefinedType.Xxx` (через `v8:TypeSet`) |
 | `Characteristic.Xxx` | `cfg:Characteristic.Xxx` (через `v8:TypeSet`) |
 | `CatalogRef` / `DocumentRef` / … / `AnyRef` / `AnyIBRef` (голый, без имени) | `cfg:<метатип>` (через `v8:TypeSet`) |
+| `BusinessProcessRoutePointRef.Xxx` | `cfg:BusinessProcessRoutePointRef.Xxx` (точка маршрута) |
+| `ExternalDataSourceTableRef.<Источник>.<Таблица>` | `cfg:ExternalDataSourceTableRef.И.Т` (имя трёхчастное) |
+
+
+Ссылаться на таблицу внешнего источника можно, только если у неё `tableDataType: ObjectData`.
+При `NonobjectData` платформа отвечает «Неизвестное имя типа» — хотя категория `Ref` в `GeneratedType`
+такой таблицы объявлена наравне с остальными семью. Замерено на 8.3.24.1691.
 
 **Тип-множество (`v8:TypeSet`)** — тип, подразумевающий набор типов:
 - `DefinedType.Xxx` (Определяемый тип) и `Characteristic.Xxx` (значение Характеристики из ПВХ — «Вид субконто»/
@@ -944,6 +973,9 @@ choiceParameters/indexing/fullTextSearch/dataHistory/…, см. §3–4). При
 Признаки измерения — флаги shorthand (`denyIncomplete`, `nouseintotals`) ЛИБО object-ключи (`denyIncompleteValues`,
 `useInTotals`: bool, дефолт true). Ресурс РН НЕ имеет `<Indexing>` (только `<FullTextSearch>`).
 
+Стандартные реквизиты РН: RecordType, Active, LineNumber, Recorder, Period — в этом порядке.
+`RecordType` есть только у регистра остатков (`registerType=Balance`); у оборотного его нет.
+
 ### 7.6a AccountingRegister (Регистр бухгалтерии)
 
 | Поле JSON | Умолчание | XML элемент |
@@ -957,8 +989,15 @@ choiceParameters/indexing/fullTextSearch/dataHistory/…, см. §3–4). При
 | `dimensions` / `resources` / `attributes` / `commands` | `[]` | → ChildObjects |
 
 Измерения/ресурсы РБ несут `balance` (bool), `accountingFlag` (ссылка `ChartOfAccounts.X.AccountingFlag.Y`);
-ресурсы дополнительно `extDimensionAccountingFlag`, измерения — `denyIncompleteValues`. Стандартные реквизиты
-ExtDimension1..N связаны с Account через `linkByType` (в блоке `standardAttributes`, §7.1.1; DataPath полный).
+ресурсы дополнительно `extDimensionAccountingFlag`, измерения — `denyIncompleteValues`.
+
+Стандартные реквизиты РБ: PeriodAdjustment, Account, RecordType, Active, LineNumber, Recorder, Period,
+далее пары субконто ExtDimensionN/ExtDimensionTypeN (их число задаётся `maxExtDimensionCount` плана счетов).
+Два реквизита условны: `PeriodAdjustment` — при `periodAdjustmentLength > 0`, `RecordType` — при
+`correspondence=false`. ExtDimensionN связаны с Account через `linkByType` (DataPath
+`AccountingRegister.<Имя>.StandardAttribute.Account`, LinkItem = номер), ExtDimensionTypeN — нет.
+Пары берутся из плана счетов, на который ссылается регистр; описывать их в `standardAttributes`
+(§7.1.1) нужно только ради переопределений.
 
 ### 7.6b CalculationRegister (Регистр расчёта)
 
@@ -974,6 +1013,10 @@ ExtDimension1..N связаны с Account через `linkByType` (в блок�
 
 Измерения РР несут `denyIncompleteValues`, `baseDimension` (bool), `scheduleLink` (ссылка на измерение графика);
 реквизиты — `scheduleLink`; ресурсы — только `<FullTextSearch>` (без Indexing).
+
+Стандартные реквизиты РР: RegistrationPeriod, ReversingEntry, Active, EndOfBasePeriod, BegOfBasePeriod,
+EndOfActionPeriod, BegOfActionPeriod, ActionPeriod, CalculationType, LineNumber, Recorder — в этом порядке
+и все сразу, независимо от `actionPeriod` / `basePeriod` / `periodicity`.
 
 ### 7.6c BusinessProcess (Бизнес-процесс)
 
@@ -1944,3 +1987,200 @@ ChildObjects и модулей.
 | `direction` | `In` | Направление: `In` / `Out` / `InOut` |
 
 Если значение — строка, интерпретируется как `type`.
+
+---
+
+## 18. Внешние источники данных (ExternalDataSource)
+
+Источник описывается одним JSON целиком: сам источник, его таблицы с полями и функции. Компилятор
+пишет `ExternalDataSources/<Имя>.xml` плюс по файлу на таблицу в `<Имя>/Tables/` — единственный вид,
+у которого объект складывается более чем из одного XML.
+
+Параметров соединения в конфигурации нет: строка соединения, пользователь, пароль и тип СУБД
+задаются в режиме «Предприятие» (стандартная функция «Управление внешними источниками данных»)
+и хранятся в информационной базе.
+
+```json
+{
+  "type": "ExternalDataSource",
+  "name": "PG",
+  "dataLockControlMode": "AutomaticAndManaged",
+  "tables": {
+    "prices": ["product_id: Number(10,0)", "period: Date", "price: Number(15,2)"],
+    "products": {
+      "nameInDataSource": "eds.public.products",
+      "tableDataType": "ObjectData",
+      "keyFields": ["id"],
+      "presentationField": "name",
+      "parentField": "parent_id",
+      "fields": [
+        "id: Number(10,0)",
+        "name: String(150)",
+        "article: String(50) | nullable",
+        "parent_id: ExternalDataSourceTableRef.PG.products | nullable"
+      ]
+    }
+  },
+  "functions": {
+    "total": { "expression": "public.f_total(&1, &2)", "returns": "Number(15,2)" },
+    "nextKey": "NEXT VALUE FOR public.seq_key"
+  }
+}
+```
+
+### 18.1 Свойства источника
+
+| Ключ | Умолчание | Значения |
+|------|-----------|----------|
+| `synonym` / `comment` | авто из имени / пусто | как у прочих объектов (§2, §4.4) |
+| `dataLockControlMode` | `Automatic` | `Automatic` / `Managed` / `AutomaticAndManaged` |
+| `tables` | `{}` | таблицы (§18.2) |
+| `functions` | `{}` | функции (§18.4) |
+
+`AutomaticAndManaged` — значение, которого нет у прочих объектов: оно отдаёт решение о режиме
+блокировок каждой таблице. При конкретном значении (`Automatic`/`Managed`) одноимённое свойство
+таблицы платформа игнорирует.
+
+### 18.2 Таблицы
+
+Ключ — имя таблицы в конфигурации. Значение — **массив полей** либо **объект** со свойствами и
+ключом `fields`: та же двойственность, что у `tabularSections` (§5).
+
+| Ключ | XML | Умолчание | Значения |
+|------|-----|-----------|----------|
+| `synonym` / `comment` | Synonym / Comment | авто из имени / пусто | ML (§4.4) |
+| `tableType` | TableType | `Table` | `Table` — реальная таблица или представление; `Expression` — табличная функция/выражение |
+| `nameInDataSource` | NameInDataSource | = имя таблицы | имя физической таблицы; платформа пишет три части `<база>.<схема>.<таблица>`. У `Expression` — пусто |
+| `expressionInDataSource` | ExpressionInDataSource | пусто | выражение для `Expression`, напр. `public.f_by_parent(&1)`; имя базы в нём НЕ указывается |
+| `tableDataType` | TableDataType | `NonobjectData` | `ObjectData` — запись определяется одним полем (аналог справочника); `NonobjectData` — составным ключом (аналог регистра сведений) |
+| `keyFields` | KeyFields | `[]` | имена ключевых полей |
+| `presentationField` | PresentationField | пусто | имя поля представления (осмысленно только у `ObjectData`) |
+| `parentField` | ParentField | пусто | имя поля родителя; его тип обязан быть ссылкой на эту же таблицу |
+| `inputByString` | InputByString | = `[presentationField]` | имена полей ввода по строке |
+| `dataVersionField` | DataVersionField | пусто | имя поля, растущего при каждой записи (ловит конкурентное изменение) |
+| `dataLockFields` | DataLockFields | `[]` | имена полей управляемой блокировки |
+| `readOnly` | ReadOnly | `false` | запрет записи |
+| `transactionsIsolationLevel` | TransactionsIsolationLevel | `Auto` | `Auto` / `ReadUncommitted` / `ReadCommitted` / `RepeatableRead` / `Serializable` |
+| `dataLockControlMode` | DataLockControlMode | `Automatic` | `Automatic` / `Managed` / `AutomaticAndManaged` |
+| `basedOn` | BasedOn | `[]` | ввод на основании, `MDObjectRef` verbatim (`Catalog.Контрагенты`) |
+| `useStandardCommands` | UseStandardCommands | `true` | bool |
+| `quickChoice` | QuickChoice | `false` | bool |
+| `editType` | EditType | `InDialog` | `InDialog` / `InList` |
+| `fields` | ChildObjects/Field | `[]` | поля (§18.3); синоним ключа — `columns` |
+
+Прочие свойства — представления (`objectPresentation`, `extendedObjectPresentation`,
+`recordPresentation`, `extendedRecordPresentation`, `listPresentation`, `extendedListPresentation`),
+формы по умолчанию (`defaultObjectForm`, `defaultRecordForm`, `defaultListForm`, `defaultChoiceForm`),
+`characteristics`, `explanation`, `includeHelpInContents`, `createOnInput`,
+`searchStringModeOnInputByString`, `choiceDataGetModeOnInputByString`, `choiceHistoryOnInput` —
+общий слой, как у справочника.
+
+**Ссылки на поля** (`keyFields`, `presentationField`, `parentField`, `dataVersionField`,
+`inputByString`, `dataLockFields`) задаются короткими именами полей этой же таблицы — конвенция §7.1.5.
+Компилятор разворачивает их в полный путь `ExternalDataSource.<Источник>.Table.<Таблица>.Field.<Поле>`,
+декомпилятор сворачивает обратно. Это единственные **шестичастные** ссылки в метаданных, поэтому
+разбор с конца (как в ролях) на них не работает.
+
+**`inputByString` — presence-aware.** Ключа нет → компилятор выводит список из `presentationField`
+(так делает платформа при загрузке). Явный список, в том числе пустой `[]`, уважается как есть.
+
+**Значение незаполненного родителя в DSL отсутствует намеренно.** Платформа сбрасывает его в пустое
+при любой загрузке XML — включая загрузку собственной выгрузки (измерено на 8.3.24.1691 тремя
+независимыми прогонами: значением `0` от Конфигуратора, `5` из XML и `1`, выставленным в Конфигураторе
+осознанно). Задать его можно только интерактивно, поэтому компилятор эмитит форму, которая получается
+после загрузки: `xsi:type="xs:string"` пусто при заданном `parentField`, иначе `xsi:nil="true"`.
+
+### 18.3 Поля таблицы
+
+Строковая и объектная форма — те же, что у реквизитов (§4). Своих ключа три:
+
+| Ключ | XML | Умолчание | Значения |
+|------|-----|-----------|----------|
+| `nameInDataSource` | NameInDataSource | = имя поля | имя колонки. Значение в одинарных кавычках уходит в SQL как есть; без кавычек экранируется двойными при спецсимволах |
+| `readOnly` | ReadOnly | `false` | поле не записывается (вычисляемые, автоинкрементные, ключевые) |
+| `allowNull` | AllowNull | `false` | допускает `NULL`; в форме показывается как «Не заполнено» |
+
+Флаги строковой формы: `readonly`, `nullable`.
+
+```json
+"fields": [
+  "id: Number(10,0) | readonly",
+  { "name": "article", "type": "String(50)", "nameInDataSource": "art_code", "allowNull": true }
+]
+```
+
+Допустимые типы поля: `Number`, `String`, `Date`, `Boolean`, `UUID`, `BinaryData` и ссылка на таблицу
+внешнего источника — `ExternalDataSourceTableRef.<Источник>.<Таблица>`.
+
+Формы `BinaryData`:
+
+| Запись | Length | AllowedLength |
+|---|---|---|
+| `BinaryData` | 4294967292 | Fixed |
+| `BinaryData(N)` | N | Variable |
+| `BinaryData(N,fixed)` | N | Fixed |
+| `BinaryData(N,variable)` | N | Variable |
+
+Голая форма — то, что пишет платформа при импорте поля из СУБД. Декомпилятор
+сворачивает в неё только точное совпадение 4294967292/Fixed; любая другая длина возвращается
+со скобками. Посторонний текст в скобках (`BinaryData(abc)`) — ошибка компиляции.
+
+`BinaryData` (ДвоичныеДанные) — **не** `ValueStorage`: это разные типы и разные узлы XML —
+`xs:base64Binary` и `v8:ValueStorage` соответственно. Квалификаторы их НЕ различают: `xs:base64Binary`
+без `BinaryDataQualifiers` — тоже двоичные данные, просто безлимитные. Замерено на 8.3.24.1691:
+такой узел загружается и выгружается обратно как `Length 0` / `AllowedLength Variable`, то есть
+`BinaryData(0)` — именно так его возвращает декомпилятор. Рукописный XML — единственное место,
+где узел без квалификаторов встречается: сама платформа их пишет всегда.
+
+**Составной тип у поля платформа запрещает** — при загрузке отвечает «Поле не может иметь составной
+тип», хотя «Руководство разработчика» (17.5.2.3.4) его разрешает. Документация опережает реализацию.
+
+Набор свойств поля — канонический блок реквизита (§4) без `ChoiceFoldersAndItems`, `LinkByType`,
+`Indexing`, `Use`, `FullTextSearch`, `DataHistory`: индексами и полнотекстовым поиском чужой таблицы
+1С не владеет. `ChoiceForm` у поля стоит ПОСЛЕ `ChoiceHistoryOnInput`, а не перед — порядок снят
+с выгрузки платформы.
+
+### 18.4 Функции
+
+Ключ — имя функции. Значение — строка (интерпретируется как `expression`) либо объект: как
+`urlTemplates` (§16) и `operations` (§17).
+
+| Ключ | XML | Умолчание | Значения |
+|------|-----|-----------|----------|
+| `expression` | ExpressionInDataSource | — | выражение в источнике, обязательный |
+| `returns` | Type | `String` | тип возвращаемого значения |
+| `returnValue` | ReturnValue | `true` | `false` — процедура, тип не пишется |
+| `synonym` / `comment` | Synonym / Comment | авто из имени / пусто | ML (§4.4) |
+
+Функция лежит полным узлом внутри файла источника, отдельного файла у неё нет.
+
+**Параметры функции не являются объектами метаданных.** Формальные параметры записываются прямо
+в выражении как `&1`, `&2`; необязательные — в фигурных скобках `f(&1{, &2})`; переменное число —
+`&n[]` (только последним в списке). Отдельного ключа для них нет и быть не может.
+
+### 18.5 Границы
+
+- **Кубы OLAP** (`Cube`, `DimensionTable`, `Dimension`, `Resource`) не поддерживаются: проверить их
+  платформой нечем — SSAS в контейнер не ставится, а эмит вслепую по документации уже давал осечку.
+- **Формы, макеты и модули** таблиц компилятор не создаёт — как и у прочих объектов (`form-add`,
+  `form-compile`, `template-add`). У форм таблицы ссылки трёхчастные
+  (`ExternalDataSource.<И>.Table.<Т>.Form.<Ф>`, главный реквизит `ExternalDataSourceTableObject.<И>.<Т>`),
+  а набор назначений зависит от `tableDataType` — замерено на 8.3.24.1691:
+
+  | tableDataType | Допустимые назначения |
+  |---|---|
+  | `ObjectData` (ключ из одного поля) | Object, List, Choice, Custom |
+  | `NonobjectData` (составной ключ) | Record, List, Choice, Custom |
+
+  Неверная пара не отвергается схемой формы — она валит загрузку всей конфигурации
+  «Исключением XDTO при чтении файла», не называя причины, поэтому `form-add` проверяет её сам.
+- Слоты `default*Form` таблицы декомпилятор снимает — как у прочих объектов. Собранная из такого
+  DSL конфигурация сама по себе не загрузится («Неизвестный объект метаданных — …Form.ФормаСписка»): файлы форм
+  создаёт навык `form-add`. Это та же договорённость, что для справочников и документов.
+- **Таблица без ключевых полей** собирается: загрузку XML платформа принимает молча, хотя
+  Конфигуратор интерактивно ключ требует. `meta-validate` предупреждает, но не отвергает — рабочие
+  конфигурации без ключей существуют. Без ключа недоступны форма записи и набор записей.
+- `meta-compile` описывает источник **целиком**: повторный запуск заменяет его файл, выдаёт новый uuid,
+  а таблицы, которых нет в описании, остаются на диске сиротами. Дописать таблицу или функцию
+  в существующий источник умеет `meta-edit` (`add.tables` / `add.functions`), удалить таблицу —
+  `meta-remove ExternalDataSource.<Источник>.Table.<Таблица>`.

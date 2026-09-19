@@ -1,18 +1,44 @@
 #!/usr/bin/env python3
-# cf-init v1.8 — Create empty 1C configuration scaffold
+# cf-init v1.15 — Create empty 1C configuration scaffold (+write_xml_file/write_utf8_bom: общий эталон записи)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 """Generates minimal XML source files for a 1C configuration."""
 import sys, os, argparse, re, uuid
 
-def esc_xml(s):
-    return s.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;')
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
+
+def esc_xml_text(s):
+    # Эскейп ТЕКСТА элемента: только & < > — кавычку и апостроф платформа держит сырыми.
+    return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 def new_uuid():
     return str(uuid.uuid4())
 
 def write_utf8_bom(path, content):
+    # newline='' — без трансляции: иначе текстовый режим Python дал бы CRLF на Windows
+    # и LF на macOS, то есть вывод навыка зависел бы от ОС.
     with open(path, 'w', encoding='utf-8-sig', newline='') as f:
         f.write(content)
+
 
 def write_xml_file(path, content):
     """XML в каноне выгрузки Конфигуратора: CRLF в разделителях, без перевода в конце.
@@ -22,6 +48,16 @@ def write_xml_file(path, content):
     """
     text = content.replace('\r\n', '\n').replace('\n', '\r\n').rstrip('\r\n')
     write_utf8_bom(path, text)
+
+
+def format_rank(ver):
+    """"2.20" → 220, "2.9" → 209. Строковое сравнение неверно ("2.9" > "2.17")."""
+    m = re.match(r'^(\d+)\.(\d+)$', ver or '')
+    return int(m.group(1)) * 100 + int(m.group(2)) if m else 0
+
+
+FORMAT_VERIFIED_MIN = "2.17"
+FORMAT_VERIFIED_MAX = "2.21"
 
 
 def main():
@@ -34,12 +70,32 @@ def main():
     parser.add_argument('-Version', dest='Version', default='')
     parser.add_argument('-Vendor', dest='Vendor', default='')
     parser.add_argument('-CompatibilityMode', dest='CompatibilityMode', default='Version8_3_24')
-    # Версия формата выгрузки (MDClasses) — её задаёт ПЛАТФОРМА, а не режим совместимости:
-    # 8.3.20-8.3.24 пишут 2.17, 8.3.25 — 2.18, 8.3.26 — 2.19, 8.3.27 — 2.20.
-    # Дефолт консервативный: 2.17 читается всеми платформами.
-    parser.add_argument('-FormatVersion', dest='FormatVersion', default='2.17',
-                        choices=['2.17', '2.18', '2.19', '2.20', '2.21'])
-    args = parser.parse_args()
+    # Версия формата выгрузки (MDClasses) — её задаёт ПЛАТФОРМА, а не режим совместимости.
+    # Дефолт 2.17 — нижняя граница проверенного диапазона.
+    parser.add_argument('-FormatVersion', dest='FormatVersion', default='2.17')
+    args = ci_parse_args(parser)
+
+    # Проверенный диапазон: 2.17 (8.3.24) … 2.21 (8.5). Полная лестница —
+    # docs/1c-configuration-spec.md, «Лестница версий». Версии ниже 2.17 (платформы 8.3.23 и
+    # старше) реальны, поэтому запретом их не закрываем: за пределами диапазона —
+    # ПРЕДУПРЕЖДЕНИЕ, скаффолд всё равно выпускается. Ошибка — только на нечисловое значение.
+    format_rank_value = format_rank(args.FormatVersion)
+    if format_rank_value == 0:
+        print(f"Malformed -FormatVersion '{args.FormatVersion}' (expected N.N, e.g. 2.17)", file=sys.stderr)
+        sys.exit(1)
+    if not (format_rank(FORMAT_VERIFIED_MIN) <= format_rank_value <= format_rank(FORMAT_VERIFIED_MAX)):
+        print(f"WARNING: Format version '{args.FormatVersion}' is outside the tested range "
+              f"{FORMAT_VERIFIED_MIN}-{FORMAT_VERIFIED_MAX} — the scaffold is emitted as requested "
+              f"but was not verified on that platform", file=sys.stderr)
+
+    # «Не использовать» в Конфигураторе хранится как версия ТЕКУЩЕЙ платформы, а не как DontUse:
+    # свежая база получает Version8_3_<своя>, и ни одна типовая в корпусе DontUse не содержит.
+    # Само значение легально — платформа принимает его без ошибок, — но не выживает: замерено на
+    # 8.3.25 и 8.3.27, выгрузка обоих возвращает Version8_3_8. Поэтому предупреждение, а не запрет.
+    # Сравнение регистронезависимо ЯВНО: в PS -eq таков по умолчанию, в py — нет, и молчаливое
+    # расхождение портов началось бы прямо здесь.
+    if (args.CompatibilityMode or "").lower() == "dontuse":
+        print("WARNING: CompatibilityMode 'DontUse' is not \"no restrictions\" — the platform stores it as Version8_3_8. For no compatibility restrictions use the target platform version (e.g. Version8_3_27 for 8.3.27).", file=sys.stderr)
 
     name = args.Name
     synonym = args.Synonym if args.Synonym else name
@@ -65,8 +121,9 @@ def main():
 
     # --- Mobile functionalities ---
     # Версия формата как число — по ней ниже включаются вставки 2.21.
-    _fm = re.match(r'^(\d+)\.(\d+)$', args.FormatVersion)
-    is_221 = bool(_fm) and int(_fm.group(1)) * 100 + int(_fm.group(2)) >= 221
+    is_221 = format_rank_value >= 221
+    # TextToSpeech приехал раньше остальных вставок 8.5 — своей ступенью, поэтому гейт отдельный.
+    is_218 = format_rank_value >= 218
 
     mobile_funcs = [
         ("Biometrics","true"), ("Location","false"), ("BackgroundLocation","false"),
@@ -84,9 +141,12 @@ def main():
         ("DocumentScanning","false"), ("SpeechToText","false"), ("Geofences","false"),
         ("IncomingShareRequests","false"), ("AllIncomingShareRequestsTypesProcessing","false"),
     ]
-    # TextToSpeech — возможность мобильного приложения, добавленная форматом 2.21 (8.5),
-    # последней в списке. На младших форматах платформа её не пишет.
-    if is_221:
+    # TextToSpeech — возможность мобильного приложения, добавленная форматом 2.18 (8.3.25),
+    # последней в списке; в 2.21 список не менялся. Замерено выгрузками пустой ИБ шести платформ:
+    # 2.13/2.17 — 37 записей без неё, 2.18-2.21 — 38 с ней. Гейт обязателен и в обе стороны:
+    # на 2.17 тег ломает загрузку XDTO-ошибкой (проверено на 8.3.24), без тега на 2.18+ платформа
+    # подставит дефолт false и допишет его при выгрузке — то есть разойдётся роундтрип.
+    if is_218:
         mobile_funcs.append(("TextToSpeech", "false"))
 
     mobile_xml = ""
@@ -96,12 +156,12 @@ def main():
     # --- Synonym XML ---
     synonym_xml = ""
     if synonym:
-        synonym_xml = f"\r\n\t\t\t\t<v8:item>\r\n\t\t\t\t\t<v8:lang>ru</v8:lang>\r\n\t\t\t\t\t<v8:content>{esc_xml(synonym)}</v8:content>\r\n\t\t\t\t</v8:item>\r\n\t\t\t"
+        synonym_xml = f"\r\n\t\t\t\t<v8:item>\r\n\t\t\t\t\t<v8:lang>ru</v8:lang>\r\n\t\t\t\t\t<v8:content>{esc_xml_text(synonym)}</v8:content>\r\n\t\t\t\t</v8:item>\r\n\t\t\t"
 
     # Элемент целиком, а не значение внутри пары: при пустом значении Конфигуратор
     # пишет <Vendor/>, а не <Vendor></Vendor>.
-    vendor_el = f"<Vendor>{esc_xml(vendor)}</Vendor>" if vendor else "<Vendor/>"
-    version_el = f"<Version>{esc_xml(version)}</Version>" if version else "<Version/>"
+    vendor_el = f"<Vendor>{esc_xml_text(vendor)}</Vendor>" if vendor else "<Vendor/>"
+    version_el = f"<Version>{esc_xml_text(version)}</Version>" if version else "<Version/>"
 
     class_ids = [
         "9cd510cd-abfc-11d4-9434-004095e12fc7",
@@ -148,7 +208,7 @@ def main():
 \t\t<InternalInfo>
 {contained_objects}\t\t</InternalInfo>
 \t\t<Properties>
-\t\t\t<Name>{esc_xml(name)}</Name>
+\t\t\t<Name>{esc_xml_text(name)}</Name>
 \t\t\t<Synonym>{synonym_xml}</Synonym>
 \t\t\t<Comment/>
 \t\t\t<NamePrefix/>

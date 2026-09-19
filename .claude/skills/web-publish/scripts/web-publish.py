@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# web-publish v1.5 — Publish 1C infobase via Apache
+# web-publish v1.9 — Publish 1C infobase via Apache (+_version_dir/_version_key: общий эталон db-семейства)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 """
@@ -24,6 +24,28 @@ import zipfile
 
 import psutil
 
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
+
 
 def _find_project_v8path():
     """Walk up from CWD to find .v8-project.json and read its v8path."""
@@ -46,10 +68,17 @@ def _find_project_v8path():
         d = parent
 
 
+def _version_dir(p):
+    """Version dir for both Windows (.../1cv8/<ver>/bin/1cv8.exe) and *nix (.../1cv8/<ver>/1cv8)."""
+    parent = os.path.dirname(p)
+    if os.path.basename(parent).lower() == "bin":
+        parent = os.path.dirname(parent)
+    return os.path.basename(parent)
+
+
 def _version_key(p):
-    """Numeric sort key from version dir name (.../1cv8/<ver>/bin/1cv8.exe)."""
-    ver = os.path.basename(os.path.dirname(os.path.dirname(p)))
-    return [int(x) for x in re.findall(r"\d+", ver)]
+    """Numeric sort key from version dir name."""
+    return [int(x) for x in re.findall(r"\d+", _version_dir(p))]
 
 
 def get_our_httpd(httpd_exe_norm):
@@ -101,7 +130,7 @@ def main():
     parser.add_argument('-ApachePath', type=str, default='', help='Apache root (default: tools\\apache24)')
     parser.add_argument('-Port', type=int, default=8081, help='Port (default: 8081)')
     parser.add_argument('-Manual', action='store_true', help='Do not download Apache — only check and give instructions')
-    args = parser.parse_args()
+    args = ci_parse_args(parser)
 
     # --- Resolve V8Path ---
     v8_path = args.V8Path
@@ -118,7 +147,7 @@ def main():
             ver = os.path.basename(os.path.dirname(v8_path))
             print(f'Auto-selected platform {ver}: {v8_path}')
         else:
-            print('Error: платформа 1С не найдена. Укажите -V8Path', file=sys.stderr)
+            print('Error: платформа 1С не найдена. Укажите -V8Path')
             sys.exit(1)
     elif os.path.isfile(v8_path):
         v8_path = os.path.dirname(v8_path)
@@ -126,12 +155,12 @@ def main():
     # Validate wsap24.dll
     wsap_dll = os.path.join(v8_path, 'wsap24.dll')
     if not os.path.exists(wsap_dll):
-        print(f'Error: wsap24.dll не найден в {v8_path}', file=sys.stderr)
+        print(f'Error: wsap24.dll не найден в {v8_path}')
         sys.exit(1)
 
     # --- Validate connection ---
     if not args.InfoBasePath and (not args.InfoBaseServer or not args.InfoBaseRef):
-        print('Error: укажите -InfoBasePath или -InfoBaseServer + -InfoBaseRef', file=sys.stderr)
+        print('Error: укажите -InfoBasePath или -InfoBaseServer + -InfoBaseRef')
         sys.exit(1)
 
     # --- Resolve ApachePath ---
@@ -184,7 +213,7 @@ def main():
                     zip_url = f'https://www.apachelounge.com{zip_url}'
                 print(f'Найдено: {zip_url}')
             else:
-                print('Не удалось определить ссылку автоматически.', file=sys.stderr)
+                print('Не удалось определить ссылку автоматически.')
                 print(f'Скачайте вручную: {download_page}')
                 sys.exit(1)
 
@@ -192,7 +221,7 @@ def main():
         except SystemExit:
             raise
         except Exception as e:
-            print(f'Error: не удалось скачать Apache: {e}', file=sys.stderr)
+            print(f'Error: не удалось скачать Apache: {e}')
             print('Скачайте вручную: https://www.apachelounge.com/download/')
             sys.exit(1)
 
@@ -215,7 +244,7 @@ def main():
             if found_inner:
                 inner_dir = found_inner
             else:
-                print('Error: каталог Apache24 не найден в архиве', file=sys.stderr)
+                print('Error: каталог Apache24 не найден в архиве')
                 sys.exit(1)
 
         os.makedirs(apache_path, exist_ok=True)
@@ -268,7 +297,7 @@ def main():
     app_name = app_name.lower()
 
     if not app_name:
-        print('Error: не удалось определить имя публикации. Укажите -AppName', file=sys.stderr)
+        print('Error: не удалось определить имя публикации. Укажите -AppName')
         sys.exit(1)
 
     print(f'Публикация: {app_name}')
@@ -311,7 +340,7 @@ def main():
     # --- Update httpd.conf ---
     conf_file = os.path.join(apache_path, 'conf', 'httpd.conf')
     if not os.path.exists(conf_file):
-        print(f'Error: httpd.conf не найден: {conf_file}', file=sys.stderr)
+        print(f'Error: httpd.conf не найден: {conf_file}')
         sys.exit(1)
 
     with open(conf_file, 'r', encoding='utf-8-sig') as f:
@@ -386,7 +415,7 @@ def main():
                 holder_name = f'{holder_proc.name()} (PID: {holder_pid})'
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 holder_name = f'PID {holder_pid}'
-            print(f'Error: порт {port} занят процессом {holder_name}', file=sys.stderr)
+            print(f'Error: порт {port} занят процессом {holder_name}')
             print('Укажите другой порт: -Port 9090')
             sys.exit(1)
 
@@ -422,7 +451,7 @@ def main():
     if httpd_check:
         print(f'Apache запущен (PID: {httpd_check[0].pid})')
     else:
-        print('Apache не удалось запустить', file=sys.stderr)
+        print('Apache не удалось запустить')
         # Run config test for diagnostics
         try:
             result = subprocess.run(

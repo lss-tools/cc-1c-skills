@@ -1,4 +1,4 @@
-# meta-info v1.8 — Compact summary of 1C metadata object (Python port)
+# meta-info v1.14 — Compact summary of 1C metadata object (Python port)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 import argparse
 import os
@@ -10,6 +10,28 @@ from lxml import etree
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
+
 # ── arg parsing ──────────────────────────────────────────────
 
 parser = argparse.ArgumentParser(allow_abbrev=False)
@@ -19,7 +41,7 @@ parser.add_argument("-Name", default="")
 parser.add_argument("-Limit", type=int, default=150)
 parser.add_argument("-Offset", type=int, default=0)
 parser.add_argument("-OutFile", default="")
-args = parser.parse_args()
+args = ci_parse_args(parser)
 
 object_path = args.ObjectPath
 mode = args.Mode
@@ -155,6 +177,7 @@ type_name_map = {
     "DefinedType": "Определяемый тип", "CommonModule": "Общий модуль",
     "ScheduledJob": "Регламентное задание", "EventSubscription": "Подписка на событие",
     "HTTPService": "HTTP-сервис", "WebService": "Веб-сервис",
+    "ExternalDataSource": "Внешний источник данных", "Table": "Таблица внешнего источника",
 }
 
 ref_type_map = {
@@ -163,6 +186,7 @@ ref_type_map = {
     "ChartOfCharacteristicTypesRef": "ПВХСсылка", "ChartOfCalculationTypesRef": "ПВРСсылка",
     "ExchangePlanRef": "ПланОбменаСсылка", "BusinessProcessRef": "БизнесПроцессСсылка",
     "TaskRef": "ЗадачаСсылка",
+    "ExternalDataSourceTableRef": "ВнешнийИсточникДанныхТаблицаСсылка",
 }
 
 reg_type_map = {
@@ -295,6 +319,11 @@ def format_single_type(raw, parent_node):
         return "ХранилищеЗначения"
     if raw == "v8:UUID":
         return "УникальныйИдентификатор"
+    if raw == "xs:base64Binary":
+        # xs:base64Binary — всегда ДвоичныеДанные, и без квалификаторов тоже: замерено
+        # на 8.3.24.1691 — такой узел платформа загружает и выгружает обратно как безлимитные
+        # двоичные данные (Length 0, AllowedLength Variable), а не как ХранилищеЗначения.
+        return "ДвоичныеДанные"
     if raw == "v8:Null":
         return "Null"
     # Normalize d5p1:/dNpN: → cfg: (both map to same namespace)
@@ -674,7 +703,7 @@ def get_ws_operations(child_objs):
 # ── Support status of this object (Ext/ParentConfigurations.bin) ──
 # See docs/1c-support-state-spec.md. Walks up to the config root, decodes the
 # object's support rule. Never throws — degrades to "не на поддержке".
-def _meta_is_external_root(xml_path):
+def _sg_is_external_root(xml_path):
     if not os.path.isfile(xml_path):
         return False
     try:
@@ -689,7 +718,7 @@ def _meta_is_external_root(xml_path):
 
 def get_object_support_status(obj_uuid):
     try:
-        if _meta_is_external_root(object_path):
+        if _sg_is_external_root(object_path):
             return None
         d = os.path.dirname(object_path)
         bin_path = None
@@ -1340,6 +1369,85 @@ if not drill_done:
                 ml = get_max_name_len(res)
                 for r in res:
                     out(format_attr_line(r, ml))
+
+        # Внешний источник данных: таблицы и функции
+        if md_type == "ExternalDataSource":
+            dlcm = props.find("md:DataLockControlMode", NS)
+            if dlcm is not None:
+                out(f"Блокировка данных: {dlcm.text or ''}")
+            if child_objs is not None:
+                tables = get_simple_children(child_objs, "Table")
+                if tables:
+                    out("")
+                    out(f"Таблицы ({len(tables)}): {', '.join(tables)}")
+                fns = child_objs.findall("md:Function", NS)
+                if fns:
+                    out("")
+                    out(f"Функции ({len(fns)}):")
+                    for fn in fns:
+                        fp = fn.find("md:Properties", NS)
+                        fn_name = fp.find("md:Name", NS).text or ""
+                        fn_expr = fp.find("md:ExpressionInDataSource", NS)
+                        fn_type = format_type(fp.find("md:Type", NS))
+                        ret_node = fp.find("md:ReturnValue", NS)
+                        ret = "процедура" if (ret_node is not None and ret_node.text == "false") else fn_type
+                        expr = (fn_expr.text or "") if fn_expr is not None else ""
+                        out(f"  {fn_name} → {expr}" + (f" : {ret}" if ret else ""))
+
+        # Таблица внешнего источника: свойства и поля
+        if md_type == "Table":
+            def _g(tag):
+                n = props.find(f"md:{tag}", NS)
+                return (n.text or "") if n is not None else ""
+
+            def _short(ref):
+                return ref.split(".")[-1] if ref else ""
+
+            table_type = _g("TableType")
+            head = ["Вид: " + ("выражение" if table_type == "Expression" else "таблица")]
+            src = _g("ExpressionInDataSource") if table_type == "Expression" else _g("NameInDataSource")
+            if src:
+                head.append(f"в источнике: {src}")
+            head.append("данные: " + ("объектные" if _g("TableDataType") == "ObjectData" else "необъектные"))
+            if _g("ReadOnly") == "true":
+                head.append("только чтение")
+            out(" | ".join(head))
+
+            keys = [_short(f.text) for f in props.findall("md:KeyFields/xr:Field", NS)]
+            refs = []
+            if keys:
+                refs.append(f"ключ: {', '.join(keys)}")
+            for tag, label in (("PresentationField", "представление"), ("ParentField", "родитель"),
+                               ("DataVersionField", "версия данных")):
+                v = _short(_g(tag))
+                if v:
+                    refs.append(f"{label}: {v}")
+            ibs = [_short(f.text) for f in props.findall("md:InputByString/xr:Field", NS)]
+            if ibs:
+                refs.append(f"ввод по строке: {', '.join(ibs)}")
+            if refs:
+                out(" | ".join(refs))
+
+            if child_objs is not None:
+                fields = get_attributes(child_objs, "Field")
+                if fields:
+                    out("")
+                    out(f"Поля ({len(fields)}):")
+                    ml = get_max_name_len(fields)
+                    for f in fields:
+                        fp = f["Props"]
+                        marks = []
+                        nids = fp.find("md:NameInDataSource", NS)
+                        if nids is not None and nids.text and nids.text != f["Name"]:
+                            marks.append(f"→ {nids.text}")
+                        ro = fp.find("md:ReadOnly", NS)
+                        if ro is not None and ro.text == "true":
+                            marks.append("только чтение")
+                        an = fp.find("md:AllowNull", NS)
+                        if an is not None and an.text == "true":
+                            marks.append("NULL")
+                        tail = f"  [{', '.join(marks)}]" if marks else ""
+                        out(f"  {f['Name'].ljust(ml)} {f['Type']}{tail}")
 
         # Attributes
         if child_objs is not None and md_type != "Enum":

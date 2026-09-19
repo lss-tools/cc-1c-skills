@@ -3,11 +3,15 @@
 // Usage: node tests/skills/runner.mjs [filter] [--update-snapshots] [--runtime python] [--json report.json] [--concurrency N] [--with-validation]
 
 import { execFileSync, execFile } from 'child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync,
-         readdirSync, statSync, cpSync, copyFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, unlinkSync, readFileSync, writeFileSync,
+         readdirSync, statSync, copyFileSync, chmodSync } from 'fs';
 import { createHash } from 'crypto';
 import { join, resolve, dirname, relative, basename, extname } from 'path';
 import { tmpdir, cpus } from 'os';
+// fs.rmSync/fs.cpSync напрямую не зовём: на Windows они молча ничего не делают, когда в пути
+// есть не-ASCII символы — кириллическое имя пользователя в %TEMP%, кириллическое имя объекта 1С
+// в deletePath. Подробности и таблица сборок — в самом модуле.
+import { removePathSync, copyTreeSync } from '../common/fsutil.mjs';
 
 // ─── Paths ──────────────────────────────────────────────────────────────────
 
@@ -158,7 +162,7 @@ function ensureSetup(setupName, runtime, skillCasesDir) {
     const want = fixtureStamp(EMPTY_CONFIGS[setupName]);
     if (existsSync(cached)) {
       if (existsSync(stamp) && readFileSync(stamp, 'utf8') === want) return cached;
-      rmSync(cached, { recursive: true, force: true });
+      removePathSync(cached);
     }
 
     mkdirSync(cached, { recursive: true });
@@ -167,7 +171,9 @@ function ensureSetup(setupName, runtime, skillCasesDir) {
       execSkillRaw(runtime, script, ['-Name', 'TestConfig', '-OutputDir', cached, ...EMPTY_CONFIGS[setupName]]);
       writeFileSync(stamp, want, 'utf8');
     } catch (e) {
-      rmSync(cached, { recursive: true, force: true });
+      // Недоснятая фикстура, оставшаяся на диске, молча уехала бы в следующий прогон.
+      try { removePathSync(cached); }
+      catch (cleanupError) { console.warn(`Warning: failed to remove partial fixture ${cached}: ${cleanupError.message}`); }
       throw new Error(`Failed to create ${setupName} fixture: ${e.message}`);
     }
     return cached;
@@ -232,7 +238,9 @@ function execSkillAsync(runtime, scriptPath, args, cwd) {
         err.stderr = stderr || '';
         reject(err);
       } else {
-        resolve(stdout);
+        // Оба потока, а не только stdout: предупреждение навыка уходит в stderr при exit 0,
+        // и на успешном прогоне оно раньше терялось — expect.stderrContains не мог сработать.
+        resolve({ stdout, stderr: stderr || '' });
       }
     });
   });
@@ -247,7 +255,7 @@ function createWorkspace(fixturePath, readOnly) {
   }
   const tmp = mkdtempSync(join(tmpdir(), 'skill-test-'));
   if (fixturePath) {
-    cpSync(fixturePath, tmp, { recursive: true });
+    copyTreeSync(fixturePath, tmp);
   }
   return { path: tmp, readOnly: false };
 }
@@ -255,16 +263,44 @@ function createWorkspace(fixturePath, readOnly) {
 function cleanupWorkspace(ws) {
   if (ws.readOnly) return;
   // On Windows, file handles from db-update (1cv8) may linger briefly after the
-  // process exits — rmSync then throws EBUSY. Retry a few times, then swallow:
+  // process exits — removal then throws EBUSY. Retry a few times, then swallow:
   // a leaked tmp dir is preferable to crashing the entire runner.
   try {
-    rmSync(ws.path, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    removePathSync(ws.path, { maxRetries: 10, retryDelay: 200 });
   } catch (e) {
     console.warn(`Warning: failed to clean workspace ${ws.path}: ${e.message}`);
   }
 }
 
 // ─── Arg building ───────────────────────────────────────────────────────────
+
+// Байты входного файла в заданной кодировке. Нужно для кейсов про кодировку: writeFileSync
+// пишет только UTF-8, а навык обязан одинаково вести себя на UTF-16 с BOM (принять) и на
+// cp1251 (отвергнуть, а не молча подменить кириллицу на U+FFFD). cp1251 в Node нет — кодируем
+// формулой по диапазонам, которые встречаются в кейсах (ASCII + кириллица); прочее — ошибка кейса.
+function encodeInput(text, encoding) {
+  if (!encoding || encoding === 'utf-8' || encoding === 'utf8') return Buffer.from(text, 'utf8');
+  if (encoding === 'utf-16le') return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, 'utf16le')]);
+  if (encoding === 'utf-16be') {
+    const le = Buffer.from(text, 'utf16le');
+    const be = Buffer.alloc(le.length);
+    for (let i = 0; i < le.length; i += 2) { be[i] = le[i + 1]; be[i + 1] = le[i]; }
+    return Buffer.concat([Buffer.from([0xfe, 0xff]), be]);
+  }
+  if (encoding === 'cp1251') {
+    const out = Buffer.alloc(text.length);
+    for (let i = 0; i < text.length; i++) {
+      const c = text.codePointAt(i);
+      if (c < 0x80) out[i] = c;
+      else if (c >= 0x410 && c <= 0x44f) out[i] = c - 0x350;
+      else if (c === 0x401) out[i] = 0xa8;
+      else if (c === 0x451) out[i] = 0xb8;
+      else throw new Error(`inputEncoding cp1251: символ U+${c.toString(16)} вне поддержанного набора (ASCII + кириллица)`);
+    }
+    return out;
+  }
+  throw new Error(`inputEncoding: неизвестная кодировка "${encoding}"`);
+}
 
 function buildArgs(skillConfig, caseData, workDir, inputFilePath, runtime) {
   const args = [];
@@ -275,7 +311,10 @@ function buildArgs(skillConfig, caseData, workDir, inputFilePath, runtime) {
 
     switch (mapping.from) {
       case 'inputFile':
-        args.push(inputFilePath);
+        // inputFrom: взять вход из файла в workDir, а не из case.input. Нужно, когда вход
+        // производит preRun (например, декомпилятор) — case.input пишется ПОСЛЕ preRun и
+        // затёр бы его.
+        args.push(caseData.inputFrom ? join(workDir, caseData.inputFrom) : inputFilePath);
         break;
       case 'workDir':
         args.push(workDir);
@@ -316,12 +355,53 @@ function buildArgs(skillConfig, caseData, workDir, inputFilePath, runtime) {
   }
 
   // Append extra args from case (for optional params like -Vendor, -Version).
-  // Supports {workDir} substitution for tests that need absolute paths inside the workspace.
+  // Supports {workDir} substitution for tests that need absolute paths inside the workspace,
+  // and {fakePlatform} — путь к фейковой платформе, которую раскладывает writeFakePlatform.
   if (caseData.args_extra) {
-    args.push(...caseData.args_extra.map(a => typeof a === 'string' ? a.replace('{workDir}', workDir) : a));
+    const fakePath = join(workDir, process.platform === 'win32' ? 'fake.cmd' : 'fake.sh');
+    args.push(...caseData.args_extra.map(a => typeof a === 'string'
+      ? a.replace('{workDir}', workDir).replace('{fakePlatform}', fakePath)
+      : a));
   }
 
   return { scriptPath, args };
+}
+
+
+// ─── Фейковая платформа ─────────────────────────────────────────────────────
+// Кейс объявляет ЛОГ и код возврата, а не механику запуска. Раннер сам кладёт .cmd или .sh
+// под текущую ОС, поэтому один кейс проверяется на обеих. Раньше каждый такой сценарий
+// приходилось дублировать -posix двойником, и забытый двойник означал дыру: у db-repo на
+// маке выполнялся 1 кейс из 12, и заметили это случайно.
+// Второй ответ — на проверку применимости расширения: навык запускает её ОТДЕЛЬНЫМ процессом
+// (в одной командной строке платформа выполнила бы только последнюю команду), поэтому фейк
+// отличает проверку по составу аргументов, а не по номеру вызова.
+const FAKE_PLATFORM_CMD = "@echo off\r\nrem SELF запоминаем ДО цикла: shift сдвигает и %0, после него %~dp0 указывает не на скрипт\r\nset SELF=%~dp0\r\nset KIND=main\r\n:loop\r\nif \"%~1\"==\"\" goto done\r\nif /i \"%~1\"==\"/Out\" set OUT=%~2\r\nif /i \"%~1\"==\"/CheckCanApplyConfigurationExtensions\" set KIND=check\r\nif /i \"%~1\"==\"/CheckConfig\" set KIND=check\r\nshift\r\ngoto loop\r\n:done\r\nif \"%KIND%\"==\"check\" if exist \"%SELF%log_check.txt\" (copy /y \"%SELF%log_check.txt\" \"%OUT%\" >nul & exit /b CHECKCODE)\r\ncopy /y \"%SELF%log.txt\" \"%OUT%\" >nul\r\nexit /b EXITCODE\r\n";
+const FAKE_PLATFORM_SH = "#!/bin/sh\n# Фейк платформы для *nix: вычитывает путь из /Out и кладёт туда готовый лог.\n# Значение /Out несёт кавычки ВНУТРИ токена (соглашение 1С, см. run_v8) — в batch их\n# снимает %~2, в sh их надо снять руками, иначе cp целится в имя с кавычками.\nSELF=$(dirname \"$0\")\nOUT=\"\"\nKIND=main\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"/CheckCanApplyConfigurationExtensions\" ] || [ \"$1\" = \"/CheckConfig\" ]; then\n    KIND=check\n  fi\n  if [ \"$1\" = \"/Out\" ]; then\n    OUT=\"$2\"\n    OUT=\"${OUT#\\\"}\"\n    OUT=\"${OUT%\\\"}\"\n  fi\n  shift\ndone\nif [ \"$KIND\" = check ] && [ -f \"$SELF/log_check.txt\" ]; then\n  cp \"$SELF/log_check.txt\" \"$OUT\"\n  exit CHECKCODE\nfi\ncp \"$SELF/log.txt\" \"$OUT\"\nexit EXITCODE\n";
+
+function writeFakePlatform(workDir, spec) {
+  const isWin = process.platform === 'win32';
+  const code = Number.isInteger(spec.exit) ? spec.exit : 0;
+  // spec.check — ответ платформы на отдельный запуск проверки
+  // (/CheckCanApplyConfigurationExtensions у расширений, /CheckConfig у внешних обработок)
+  const checkCode = spec.check && Number.isInteger(spec.check.exit) ? spec.check.exit : 0;
+  const body = (isWin ? FAKE_PLATFORM_CMD : FAKE_PLATFORM_SH)
+    .replaceAll('EXITCODE', String(code))
+    .replaceAll('CHECKCODE', String(checkCode));
+  const exe = join(workDir, isWin ? 'fake.cmd' : 'fake.sh');
+  writeFileSync(exe, body, 'utf8');
+  // Бит исполнения: на *nix навык запускает платформу через exec, без +x фейк не стартует.
+  if (!isWin) chmodSync(exe, 0o755);
+  // Лог пишется как есть — вместе с BOM и CRLF, если кейс их объявил: /Out платформы
+  // выглядит именно так, и разбор должен проверяться на настоящей форме.
+  writeFileSync(join(workDir, 'log.txt'), spec.log ?? '', 'utf8');
+  if (spec.check) writeFileSync(join(workDir, 'log_check.txt'), spec.check.log ?? '', 'utf8');
+  // Заглушка базы: навыки отказываются работать, не найдя 1Cv8.1CD, и это правильно.
+  if (spec.baseStub !== false) {
+    const ib = join(workDir, 'ib');
+    mkdirSync(ib, { recursive: true });
+    writeFileSync(join(ib, '1Cv8.1CD'), 'stub', 'utf8');
+  }
 }
 
 // ─── Snapshot normalization ─────────────────────────────────────────────────
@@ -406,14 +486,37 @@ function checkFileContains(workDir, spec, expectPresent) {
 // который молча ничего не проверяет (так уже было с 9 кейсами meta-edit) —
 // поэтому он ошибка, а не игнор.
 const KNOWN_EXPECT_KEYS = new Set([
-  'files', 'stdoutContains', 'stdoutNotContains', 'preserves',
-  'fileContains', 'fileNotContains',
+  'files', 'filesAbsent', 'stdoutContains', 'stdoutNotContains', 'stderrContains', 'preserves',
+  'fileContains', 'fileNotContains', 'filesEqual',
 ]);
 
 function checkExpectKeys(caseData) {
   if (!caseData.expect) return [];
   const unknown = Object.keys(caseData.expect).filter(k => !KNOWN_EXPECT_KEYS.has(k));
   return unknown.map(k => `expect.${k}: раннер такого ключа не знает — кейс ничего не проверяет`);
+}
+
+// ─── Побайтовое равенство двух файлов ───────────────────────────────────────
+// Нужно там, где эталон — не наш снэпшот, а файл, произведённый ПЛАТФОРМОЙ: снэпшот
+// такую проверку не заменяет, потому что --update-snapshots молча принял бы дрейф.
+// spec: { actual, expected }. Пути относительно workDir.
+function checkFilesEqual(workDir, spec) {
+  const errs = [];
+  const a = join(workDir, spec.actual);
+  const b = join(workDir, spec.expected);
+  if (!existsSync(a)) { errs.push(`filesEqual: нет файла ${spec.actual}`); return errs; }
+  if (!existsSync(b)) { errs.push(`filesEqual: нет файла ${spec.expected}`); return errs; }
+  const bufA = readFileSync(a);
+  const bufB = readFileSync(b);
+  if (bufA.equals(bufB)) return errs;
+  const linesA = bufA.toString('utf8').split('\n');
+  const linesB = bufB.toString('utf8').split('\n');
+  let i = 0;
+  while (i < linesA.length && i < linesB.length && linesA[i] === linesB[i]) i++;
+  errs.push(`filesEqual: ${spec.actual} != ${spec.expected}, первое расхождение в строке ${i + 1}`
+    + `\n        ожидалось: ${(linesB[i] ?? '<конец файла>').trim()}`
+    + `\n        получено:  ${(linesA[i] ?? '<конец файла>').trim()}`);
+  return errs;
 }
 
 // ─── Byte-style preservation check (round-trip #44/#46/#47, канон #57) ──────
@@ -608,8 +711,8 @@ function updateSnapshot(workDir, snapshotDir, snapshotConfig, caseData) {
   // дорисовал бы эталон и сам породил противоречие с opt-out.
   if (caseData?.noSnapshot) return;
 
-  // Remove old snapshot
-  if (existsSync(snapshotDir)) rmSync(snapshotDir, { recursive: true, force: true });
+  // Remove old snapshot. Тихий отказ здесь оставил бы в эталоне стейл — и он уехал бы в коммит.
+  if (existsSync(snapshotDir)) removePathSync(snapshotDir);
 
   // Determine which files to snapshot — all files in workDir that were created by the skill
   // For "workDir" root mode, we need to figure out what files the skill added.
@@ -685,7 +788,9 @@ async function runCaseAsync(testCase, opts) {
 
   // osOnly: gate a case to one OS (e.g. a fake platform written as a .cmd cannot run on
   // macOS/Linux at all, whatever the port). Values are process.platform strings.
-  if (caseData.osOnly && caseData.osOnly !== process.platform) {
+  // Значение — строка или массив строк process.platform: фейк платформы бывает нужен и на
+  // darwin, и на linux, а дублировать кейс ради второй ОС смысла нет.
+  if (caseData.osOnly && ![].concat(caseData.osOnly).includes(process.platform)) {
     return { id: testCase.id, skill: testCase.skillDir, name: testCase.name, passed: true, skipped: true, errors: [], elapsed: '0.0s' };
   }
 
@@ -706,6 +811,26 @@ async function runCaseAsync(testCase, opts) {
     workDir = workspace.path;
     copyCaseFiles(caseData, workDir, skillCasesDir);
 
+    // Каталог расширения не должен совпадать по имени — БЕЗ УЧЁТА РЕГИСТРА — с тем, что фикстура
+    // уже положила в корень конфигурации. На регистронезависимой ФС (Windows, APFS) такие каталоги
+    // сливаются в один: кейсы cfe-* просили `ext`, а cf-init создаёт платформенный `Ext/`, и эталон
+    // годами фиксировал слипшееся дерево, верное только на этих ФС (issue #74).
+    const extRel = caseData.params?.extensionPath || caseData.params?.outputDir;
+    if (typeof extRel === 'string' && extRel && extRel !== '.' && !extRel.includes('/') && !extRel.includes('\\')) {
+      const clash = readdirSync(workDir).find(e => e.toLowerCase() === extRel.toLowerCase());
+      if (clash) {
+        throw new Error(
+          `Каталог расширения "${extRel}" совпадает с "${clash}" из фикстуры конфигурации.\n`
+          + `  На регистронезависимой ФС это один каталог — эталон зафиксирует слипшееся дерево.\n`
+          + `  Назовите каталог иначе (в кейсах cfe-* принято "cfe").`);
+      }
+    }
+
+    // Фейковая платформа раскладывается ДО preRun: шаги preRun могут на неё опираться.
+    if (caseData.fakePlatform) {
+      writeFakePlatform(workDir, caseData.fakePlatform);
+    }
+
     // Pre-run steps
     if (caseData.preRun) {
       for (const step of caseData.preRun) {
@@ -717,6 +842,15 @@ async function runCaseAsync(testCase, opts) {
             : JSON.stringify(step.writeFile.content, null, 2);
           mkdirSync(dirname(wfPath), { recursive: true });
           writeFileSync(wfPath, wfContent, 'utf8');
+          // Бит исполнения: на *nix навык запускает платформу через exec, и фейк без +x
+          // не стартует вовсе. На Windows chmod — no-op.
+          if (step.writeFile.executable) chmodSync(wfPath, 0o755);
+          continue;
+        }
+        // deletePath step — убрать файл или каталог из workDir: так выражается состояние,
+        // которое навыки сами не создают (например, пометка свойства без файла модуля).
+        if (step.deletePath) {
+          removePathSync(join(workDir, step.deletePath));
           continue;
         }
         const preScript = resolveScript(step.script, opts.runtime);
@@ -740,14 +874,19 @@ async function runCaseAsync(testCase, opts) {
         } catch (e) {
           throw new Error(`preRun step "${step.script}" failed: ${e.stderr || e.message}`);
         }
-        if (preInputFile && existsSync(preInputFile)) rmSync(preInputFile);
+        if (preInputFile && existsSync(preInputFile)) unlinkSync(preInputFile);
       }
     }
 
     // Write input
-    if (caseData.input !== undefined) {
+    // inputRaw пишется дословно: негативный кейс про битый JSON через case.input невыразим —
+    // JSON.stringify всегда даёт валидный документ.
+    if (caseData.inputRaw !== undefined) {
       inputFile = join(workDir, '__input.json');
-      writeFileSync(inputFile, JSON.stringify(caseData.input, null, 2), 'utf8');
+      writeFileSync(inputFile, encodeInput(caseData.inputRaw, caseData.inputEncoding));
+    } else if (caseData.input !== undefined) {
+      inputFile = join(workDir, '__input.json');
+      writeFileSync(inputFile, encodeInput(JSON.stringify(caseData.input, null, 2), caseData.inputEncoding));
     }
 
     // Execute
@@ -755,14 +894,14 @@ async function runCaseAsync(testCase, opts) {
     let stdout = '', stderr = '', exitCode = 0;
     try {
       const execCwd = (caseData.cwd || skillConfig.cwd) === 'workDir' ? workDir : undefined;
-      stdout = await execSkillAsync(opts.runtime, scriptPath, args, execCwd);
+      ({ stdout, stderr } = await execSkillAsync(opts.runtime, scriptPath, args, execCwd));
     } catch (e) {
       exitCode = e.status ?? 1;
       stdout = e.stdout || '';
       stderr = e.stderr || '';
     }
 
-    if (inputFile && existsSync(inputFile)) rmSync(inputFile);
+    if (inputFile && existsSync(inputFile)) unlinkSync(inputFile);
 
     // Assertions
     const errors = [];
@@ -799,23 +938,52 @@ async function runCaseAsync(testCase, opts) {
           if (stdout.includes(needle)) errors.push(`stdout unexpectedly contains "${needle}"`);
         }
       }
+      // Предупреждение — не отказ: навык печатает его в stderr и продолжает работу. Без
+      // отдельного ключа такой кейс проверял бы только exit 0, то есть молчание вместо текста.
+      if (caseData.expect?.stderrContains) {
+        const needles = Array.isArray(caseData.expect.stderrContains)
+          ? caseData.expect.stderrContains : [caseData.expect.stderrContains];
+        for (const needle of needles) {
+          if (!stderr.includes(needle)) errors.push(`stderr does not contain "${needle}"`);
+        }
+      }
+      // Отсутствие файла — тоже утверждение, и нужно оно чаще всего НЕГАТИВНОМУ кейсу:
+      // «отказ произошёл до записи». В позитивной ветке (где живёт expect.files) такой
+      // проверки не было бы ровно там, где она единственная содержательная.
+      if (caseData.expect?.filesAbsent) {
+        const paths = Array.isArray(caseData.expect.filesAbsent)
+          ? caseData.expect.filesAbsent : [caseData.expect.filesAbsent];
+        for (const p of paths) {
+          if (existsSync(join(workDir, p))) errors.push(`File must not exist: ${p}`);
+        }
+      }
+    }
+    // Файловые ожидания проверяются И У НЕГАТИВНОГО кейса: навык мог отказать, но до
+    // отказа что-то написать — именно это и проверяется. Под `!expectError` остаются только
+    // снэпшот и идемпотентность: эталон с аварийного состояния снимать нельзя. Раньше
+    // всё лежало под `!expectError`, и кейс с expectError + fileContains молча проходил
+    // при любом содержимом файла (тот же класс, что когда-то был со stdout).
+    if (caseData.expect?.preserves) {
+      const specs = Array.isArray(caseData.expect.preserves)
+        ? caseData.expect.preserves : [caseData.expect.preserves];
+      for (const spec of specs) errors.push(...checkPreserves(workDir, spec));
+    }
+    if (caseData.expect?.filesEqual) {
+      const specs = Array.isArray(caseData.expect.filesEqual)
+        ? caseData.expect.filesEqual : [caseData.expect.filesEqual];
+      for (const spec of specs) errors.push(...checkFilesEqual(workDir, spec));
+    }
+    if (caseData.expect?.fileContains) {
+      const specs = Array.isArray(caseData.expect.fileContains)
+        ? caseData.expect.fileContains : [caseData.expect.fileContains];
+      for (const spec of specs) errors.push(...checkFileContains(workDir, spec, true));
+    }
+    if (caseData.expect?.fileNotContains) {
+      const specs = Array.isArray(caseData.expect.fileNotContains)
+        ? caseData.expect.fileNotContains : [caseData.expect.fileNotContains];
+      for (const spec of specs) errors.push(...checkFileContains(workDir, spec, false));
     }
     if (!caseData.expectError) {
-      if (caseData.expect?.preserves) {
-        const specs = Array.isArray(caseData.expect.preserves)
-          ? caseData.expect.preserves : [caseData.expect.preserves];
-        for (const spec of specs) errors.push(...checkPreserves(workDir, spec));
-      }
-      if (caseData.expect?.fileContains) {
-        const specs = Array.isArray(caseData.expect.fileContains)
-          ? caseData.expect.fileContains : [caseData.expect.fileContains];
-        for (const spec of specs) errors.push(...checkFileContains(workDir, spec, true));
-      }
-      if (caseData.expect?.fileNotContains) {
-        const specs = Array.isArray(caseData.expect.fileNotContains)
-          ? caseData.expect.fileNotContains : [caseData.expect.fileNotContains];
-        for (const spec of specs) errors.push(...checkFileContains(workDir, spec, false));
-      }
       if (errors.length === 0 && !caseData.expectError && !workspace.readOnly) {
         const snapshotConfig = { ...skillConfig.snapshot, runtime: opts.runtime };
         if (opts.updateSnapshots) {
@@ -938,14 +1106,17 @@ function runCase(testCase, opts) {
         } catch (e) {
           throw new Error(`preRun step "${step.script}" failed: ${e.stderr || e.message}`);
         }
-        if (preInputFile && existsSync(preInputFile)) rmSync(preInputFile);
+        if (preInputFile && existsSync(preInputFile)) unlinkSync(preInputFile);
       }
     }
 
-    // 3. Write input JSON if needed
-    if (caseData.input !== undefined) {
+    // 3. Write input JSON if needed (inputRaw — дословно, см. выше)
+    if (caseData.inputRaw !== undefined) {
       inputFile = join(workDir, '__input.json');
-      writeFileSync(inputFile, JSON.stringify(caseData.input, null, 2), 'utf8');
+      writeFileSync(inputFile, encodeInput(caseData.inputRaw, caseData.inputEncoding));
+    } else if (caseData.input !== undefined) {
+      inputFile = join(workDir, '__input.json');
+      writeFileSync(inputFile, encodeInput(JSON.stringify(caseData.input, null, 2), caseData.inputEncoding));
     }
 
     // 4. Build CLI args and execute
@@ -962,7 +1133,7 @@ function runCase(testCase, opts) {
     }
 
     // Remove temp input file from workDir before snapshot comparison
-    if (inputFile && existsSync(inputFile)) rmSync(inputFile);
+    if (inputFile && existsSync(inputFile)) unlinkSync(inputFile);
 
     // 4. Assertions
     const errors = [];
@@ -1010,24 +1181,53 @@ function runCase(testCase, opts) {
           if (stdout.includes(needle)) errors.push(`stdout unexpectedly contains "${needle}"`);
         }
       }
+      // Предупреждение — не отказ: навык печатает его в stderr и продолжает работу. Без
+      // отдельного ключа такой кейс проверял бы только exit 0, то есть молчание вместо текста.
+      if (caseData.expect?.stderrContains) {
+        const needles = Array.isArray(caseData.expect.stderrContains)
+          ? caseData.expect.stderrContains : [caseData.expect.stderrContains];
+        for (const needle of needles) {
+          if (!stderr.includes(needle)) errors.push(`stderr does not contain "${needle}"`);
+        }
+      }
+      // Отсутствие файла — тоже утверждение, и нужно оно чаще всего НЕГАТИВНОМУ кейсу:
+      // «отказ произошёл до записи». В позитивной ветке (где живёт expect.files) такой
+      // проверки не было бы ровно там, где она единственная содержательная.
+      if (caseData.expect?.filesAbsent) {
+        const paths = Array.isArray(caseData.expect.filesAbsent)
+          ? caseData.expect.filesAbsent : [caseData.expect.filesAbsent];
+        for (const p of paths) {
+          if (existsSync(join(workDir, p))) errors.push(`File must not exist: ${p}`);
+        }
+      }
     }
 
+    // Файловые ожидания проверяются И У НЕГАТИВНОГО кейса: навык мог отказать, но до
+    // отказа что-то написать — именно это и проверяется. Под `!expectError` остаются только
+    // снэпшот и идемпотентность: эталон с аварийного состояния снимать нельзя. Раньше
+    // всё лежало под `!expectError`, и кейс с expectError + fileContains молча проходил
+    // при любом содержимом файла (тот же класс, что когда-то был со stdout).
+    if (caseData.expect?.preserves) {
+      const specs = Array.isArray(caseData.expect.preserves)
+        ? caseData.expect.preserves : [caseData.expect.preserves];
+      for (const spec of specs) errors.push(...checkPreserves(workDir, spec));
+    }
+    if (caseData.expect?.filesEqual) {
+      const specs = Array.isArray(caseData.expect.filesEqual)
+        ? caseData.expect.filesEqual : [caseData.expect.filesEqual];
+      for (const spec of specs) errors.push(...checkFilesEqual(workDir, spec));
+    }
+    if (caseData.expect?.fileContains) {
+      const specs = Array.isArray(caseData.expect.fileContains)
+        ? caseData.expect.fileContains : [caseData.expect.fileContains];
+      for (const spec of specs) errors.push(...checkFileContains(workDir, spec, true));
+    }
+    if (caseData.expect?.fileNotContains) {
+      const specs = Array.isArray(caseData.expect.fileNotContains)
+        ? caseData.expect.fileNotContains : [caseData.expect.fileNotContains];
+      for (const spec of specs) errors.push(...checkFileContains(workDir, spec, false));
+    }
     if (!caseData.expectError) {
-      if (caseData.expect?.preserves) {
-        const specs = Array.isArray(caseData.expect.preserves)
-          ? caseData.expect.preserves : [caseData.expect.preserves];
-        for (const spec of specs) errors.push(...checkPreserves(workDir, spec));
-      }
-      if (caseData.expect?.fileContains) {
-        const specs = Array.isArray(caseData.expect.fileContains)
-          ? caseData.expect.fileContains : [caseData.expect.fileContains];
-        for (const spec of specs) errors.push(...checkFileContains(workDir, spec, true));
-      }
-      if (caseData.expect?.fileNotContains) {
-        const specs = Array.isArray(caseData.expect.fileNotContains)
-          ? caseData.expect.fileNotContains : [caseData.expect.fileNotContains];
-        for (const spec of specs) errors.push(...checkFileContains(workDir, spec, false));
-      }
 
       // Snapshot comparison (skip for external/read-only workspaces)
       if (errors.length === 0 && !caseData.expectError && !workspace.readOnly) {
@@ -1312,6 +1512,9 @@ async function runIntegrationOnce(test, opts, engine, labelEngine) {
           const abs = target.includes(':') || target.startsWith('/') ? target : join(workDir, target);
           mkdirSync(dirname(abs), { recursive: true });
           writeFileSync(abs, step.content ?? '', 'utf8');
+          // Бит исполнения: на *nix навык запускает платформу через exec, и фейк без +x
+          // не стартует вовсе. На Windows chmod — no-op.
+          if (step.executable) chmodSync(abs, 0o755);
           const stepElapsed = ((performance.now() - stepT0) / 1000).toFixed(1);
           stepResults.push({ name: step.name, passed: true, elapsed: `${stepElapsed}s` });
         } catch (e) {
@@ -1377,14 +1580,14 @@ async function runIntegrationOnce(test, opts, engine, labelEngine) {
       // Execute
       let stdout = '', stderr = '';
       try {
-        stdout = await execSkillAsync(opts.runtime, script, args);
+        ({ stdout, stderr } = await execSkillAsync(opts.runtime, script, args));
       } catch (e) {
         const detail = e.stderr?.trim() || e.stdout?.trim() || e.message;
         stepResults.push({ name: step.name, passed: false, error: `Step ${i + 1} failed: ${detail.substring(0, 1000)}` });
         break; // stop on first failure
       }
 
-      if (inputFile && existsSync(inputFile)) rmSync(inputFile);
+      if (inputFile && existsSync(inputFile)) unlinkSync(inputFile);
 
       // Post-step validation
       if (opts.withValidation && step.validate) {
@@ -1410,8 +1613,8 @@ async function runIntegrationOnce(test, opts, engine, labelEngine) {
     // Cache result if configured
     if (test.cache && stepResults.every(s => s.passed)) {
       const cachePath = join(CACHE, test.cache);
-      if (existsSync(cachePath)) rmSync(cachePath, { recursive: true, force: true });
-      cpSync(workDir, cachePath, { recursive: true });
+      if (existsSync(cachePath)) removePathSync(cachePath);
+      copyTreeSync(workDir, cachePath);
     }
 
     const allPassed = stepResults.every(s => s.passed);

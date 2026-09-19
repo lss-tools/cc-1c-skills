@@ -1,0 +1,9 @@
+{
+  "name": "GUID вместо имени формы не считается битой ссылкой",
+  "setup": "fixture:catalog-guid-form-ref",
+  "params": { "objectPath": "Catalogs/Товары.xml" },
+  "expect": {
+    "stdoutNotContains": "20."
+  },
+  "skipPlatformVerify": "фикстура — одиночный объект без Configuration.xml: загружать нечего"
+}

@@ -1,0 +1,20 @@
+{
+  "name": "Картинки: пустая запись и пиксель прозрачного цвета",
+  "input": {
+    "columns": 2,
+    "pictures": {
+      "пусто": {},
+      "значок": { "ref": "v8ui:Стоп48", "transparent": false },
+      "точка": {
+        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==",
+        "transparent": { "x": 3, "y": 5 }
+      }
+    },
+    "areas": [{ "rows": [["Бланк"]] }],
+    "drawings": [
+      { "type": "Picture", "picture": "точка",
+        "begin": { "row": 1, "col": 1 }, "end": { "row": 2, "col": 2 } }
+    ]
+  },
+  "params": { "outputPath": "Template.xml" }
+}

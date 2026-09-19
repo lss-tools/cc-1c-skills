@@ -1,4 +1,4 @@
-﻿# db-dump-xml v1.14 — Dump 1C configuration to XML files
+﻿# db-dump-xml v1.21 — Dump 1C configuration to XML files
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 # NB: *nix-раскладку платформы (/opt/1cv8/<ver>/1cv8, без .exe) знает только .py-порт — PS на *nix не исполняется.
 <#
@@ -61,7 +61,7 @@
     .\db-dump-xml.ps1 -InfoBasePath "C:\Bases\MyDB" -ConfigDir "C:\src" -Mode Partial -Objects "Справочник.Номенклатура,Документ.Заказ"
 #>
 
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding=$false)]
 param(
     [Parameter(Mandatory=$false)]
     [string]$V8Path,
@@ -85,8 +85,10 @@ param(
     [string]$ConfigDir,
 
     [Parameter(Mandatory=$false)]
-    [ValidateSet("Full", "Changes", "Partial", "UpdateInfo")]
-    [string]$Mode = "Changes",
+    # Пустое значение = режим не задан. Прежнее умолчание Changes подставляется ниже, после
+    # того как станет видно, перечислены ли объекты.
+    [ValidateSet("", "Full", "Changes", "Partial", "UpdateInfo")]
+    [string]$Mode = "",
 
     [Parameter(Mandatory=$false)]
     [string]$Objects,
@@ -102,6 +104,18 @@ param(
     [string]$Format = "Hierarchical",
 
     [Parameter(Mandatory=$false)]
+    [string]$ObjectsFile,
+
+    [Parameter(Mandatory=$false)]
+    [string]$RepositoryPath,
+
+    [Parameter(Mandatory=$false)]
+    [string]$RepositoryUser,
+
+    [Parameter(Mandatory=$false)]
+    [string]$RepositoryPassword,
+
+    [Parameter(Mandatory=$false)]
     [string[]]$AdditionalV8Arguments = @(),
 
     [Parameter(Mandatory=$false)]
@@ -110,6 +124,90 @@ param(
 
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+# --- Реквизиты хранилища из .v8-project.json ---
+# Модель их не передаёт: скрипт сопоставляет параметры соединения с записью в databases[]
+# и берёт repository оттуда. Тот же приём, что в cf-edit.ps1 (сопоставление по configSrc).
+function Find-V8Project([string]$startDir) {
+	$d = $startDir
+	for ($i = 0; $i -lt 20 -and $d; $i++) {
+		$pj = Join-Path $d ".v8-project.json"
+		if (Test-Path $pj) { return $pj }
+		$parent = [System.IO.Path]::GetDirectoryName($d)
+		if ($parent -eq $d) { break }
+		$d = $parent
+	}
+	return $null
+}
+function Test-SamePath {
+    param([string]$A, [string]$B)
+    if (-not $A -or -not $B) { return $false }
+    try {
+        $na = [System.IO.Path]::GetFullPath($A).TrimEnd('\', '/')
+        $nb = [System.IO.Path]::GetFullPath($B).TrimEnd('\', '/')
+        return $na.Equals($nb, [System.StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+
+function Find-ProjectDatabase {
+    # Запись базы в реестре, соответствующая переданному соединению. $null, если не найдена.
+    $pf = Find-V8Project (Get-Location).Path
+    if (-not $pf) { return $null }
+    try { $proj = Get-Content $pf -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
+    if (-not $proj.databases) { return $null }
+    foreach ($db in $proj.databases) {
+        if ($InfoBasePath -and $db.path -and (Test-SamePath $db.path $InfoBasePath)) { return $db }
+        if ($InfoBaseServer -and $InfoBaseRef -and $db.server -and $db.ref) {
+            if ($db.server.Equals($InfoBaseServer, [System.StringComparison]::OrdinalIgnoreCase) -and
+                $db.ref.Equals($InfoBaseRef, [System.StringComparison]::OrdinalIgnoreCase)) { return $db }
+        }
+    }
+    return $null
+}
+
+function Resolve-RepositorySettings {
+    # Возвращает @{ Path; User; Password; FromRegistry }. Явные -Repository* всегда сильнее реестра.
+    $dbRec = Find-ProjectDatabase
+    $rec = $null
+    if ($dbRec) {
+        if ($Extension) {
+            # У расширения СВОЁ хранилище со своим путём (проверено): выбирается парой
+            # /ConfigurationRepositoryF"<путь расширения>" + -Extension "<Имя>".
+            if ($dbRec.extensions) {
+                foreach ($ext in $dbRec.extensions) {
+                    if ($ext.name -and $ext.name.Equals($Extension, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $rec = $ext.repository
+                        break
+                    }
+                }
+            }
+        } else {
+            $rec = $dbRec.repository
+        }
+    }
+    $path = if ($RepositoryPath) { $RepositoryPath } elseif ($rec -and $rec.path) { [string]$rec.path } else { $null }
+    $user = if ($RepositoryUser) { $RepositoryUser } elseif ($rec -and $rec.user) { [string]$rec.user } else { $null }
+    # Пустой пароль = отсутствующий: 1С требует опускать ключ целиком, а не передавать пустое значение.
+    $pwd  = if ($RepositoryPassword) { $RepositoryPassword } elseif ($rec -and $rec.password) { [string]$rec.password } else { $null }
+    return @{
+        Path         = if ($path) { $path.Trim().Trim('"') } else { $null }
+        User         = $user
+        Password     = $pwd
+        FromRegistry = [bool]($rec -and $rec.path)
+        DbRecord     = $dbRec
+    }
+}
+
+function Get-RepositoryArgs {
+    # Ключи доступа к хранилищу. Форма — кавычки ВНУТРИ токена, как у /N и /P.
+    param([hashtable]$Repo)
+    $a = @()
+    if (-not $Repo -or -not $Repo.Path) { return $a }
+    $a += "/ConfigurationRepositoryF`"$($Repo.Path)`""
+    if ($Repo.User) { $a += "/ConfigurationRepositoryN`"$($Repo.User)`"" }
+    if ($Repo.Password) { $a += "/ConfigurationRepositoryP`"$($Repo.Password)`"" }
+    return $a
+}
 
 function Protect-Secrets {
     # Redact literal secret values from a display string (String.Replace is literal, not regex).
@@ -127,12 +225,23 @@ $script:V8OwnedKeys = @(
     '/DumpConfigToFiles', '/LoadConfigFromFiles', '/UpdateDBCfg',
     '/DumpExternalDataProcessorOrReportToFiles', '/LoadExternalDataProcessorOrReportFromFiles'
 )
+# Пакетные команды платформы. В одной командной строке DESIGNER выполняет ТОЛЬКО ПОСЛЕДНЮЮ,
+# остальные молча отбрасывает (проверено на 8.3.24: /LoadConfigFromFiles вместе с
+# /CheckCanApplyConfigurationExtensions завершились кодом 0 с пустым логом, и загрузка НЕ
+# состоялась). Такая команда в дополнительных аргументах подменяет собой операцию навыка, а навык
+# отчитывается успехом. Дополнительные аргументы — это опции, а не режимы.
+$script:V8BatchKeys = @(
+    '/CheckConfig', '/CheckModules', '/CheckCanApplyConfigurationExtensions',
+    '/DumpDBCfgList', '/DeleteCfg', '/UpdateCfg', '/CompareCfg', '/MergeCfg',
+    '/ManageCfgSupport', '/RollbackCfg', '/ConvertFiles'
+)
+
 $script:IbcmdOwnedKeys = @(
     '--db-path', '--data', '--out', '--file', '--load', '--restore',
     '--import', '--export', '--apply', '--force', '--create-database',
     '--user', '--password'
 )
-$script:V8SecretKeys = @('/P', '/UC', '/WSP', '/AWSP')
+$script:V8SecretKeys = @('/P', '/UC', '/WSP', '/AWSP', '/ConfigurationRepositoryP')
 $script:IbcmdSecretKeys = @('--password', '--token', '--db-pwd')
 
 function Test-ArgKeyMatch {
@@ -176,6 +285,14 @@ function Assert-ExtraArgs {
         if ($Engine -eq 'ibcmd' -and $tok -notmatch '^-') {
             Write-Host "Error: '$tok' is a positional token — pass values as --key=value ($paramName cannot extend the ibcmd command)" -ForegroundColor Red
             exit 1
+        }
+        if ($Engine -ne 'ibcmd') {
+            foreach ($b in $script:V8BatchKeys) {
+                if (Test-ArgKeyMatch $tok $b) {
+                    Write-Host "Error: $b is a batch command; passed via $paramName it would replace the skill's own operation (a command line runs only its last batch command)" -ForegroundColor Red
+                    exit 1
+                }
+            }
         }
         foreach ($k in $owned) {
             if (Test-ArgKeyMatch $tok $k) {
@@ -415,8 +532,33 @@ if ($engine -eq "ibcmd") {
 }
 
 # --- Validate Partial mode ---
+# Список объектов приходит либо строкой, либо файлом: файл нужен, чтобы не перепечатывать
+# то, что уже напечатал другой навык (например /db-repo update со списком полученных объектов).
+if ($ObjectsFile) {
+    if (-not (Test-Path $ObjectsFile)) {
+        Write-Host "Error: -ObjectsFile not found: $ObjectsFile" -ForegroundColor Red
+        exit 1
+    }
+    $fromFile = @([System.IO.File]::ReadAllLines($ObjectsFile, [System.Text.Encoding]::UTF8) |
+        ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
+    $Objects = (@(@($Objects -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) + $fromFile) -join ',')
+}
+# Перечислены объекты — операция частичная. Иначе список молча игнорировался бы: умолчание
+# Changes выгружает «изменённое с прошлой выгрузки», а не то, что просили.
+if ($Objects) {
+    if ($Mode -eq "UpdateInfo") {
+        # Не «шире/уже», а другая операция: обновление ConfigDumpInfo без выгрузки файлов.
+        Write-Host "Error: -Mode UpdateInfo does not take an object list — it only refreshes ConfigDumpInfo.xml" -ForegroundColor Red
+        exit 1
+    }
+    if ($Mode -eq "Full" -or $Mode -eq "Changes") {
+        Write-Host "[note] перечислены объекты — выгружаются только они; -Mode $Mode не применён" -ForegroundColor Yellow
+    }
+    $Mode = "Partial"
+}
+if (-not $Mode) { $Mode = "Changes" }
 if ($Mode -eq "Partial" -and -not $Objects) {
-    Write-Host "Error: -Objects required for Partial mode" -ForegroundColor Red
+    Write-Host "Error: -Objects or -ObjectsFile required for Partial mode" -ForegroundColor Red
     exit 1
 }
 
@@ -486,6 +628,11 @@ try {
     if ($UserName) { $arguments += "/N`"$UserName`"" }
     if ($Password) { $arguments += "/P`"$Password`"" }
 
+    # База под хранилищем не примет НИ ОДНОЙ операции конфигуратора без этих реквизитов, а для
+    # базы вне хранилища они безвредны — поэтому подставляем всегда, когда они известны.
+    $__repo = Resolve-RepositorySettings
+    $arguments += Get-RepositoryArgs $__repo
+
     $arguments += "/DumpConfigToFiles", "`"$ConfigDir`""
     $arguments += "-Format", $Format
 
@@ -530,7 +677,7 @@ try {
     $arguments += $extraArgs
 
     # --- Execute ---
-    Write-Host "Running: 1cv8.exe $(Protect-Secrets ((Format-ArgsForDisplay $arguments $engine) -join ' ') @($Password, $UserName))"
+    Write-Host "Running: 1cv8.exe $(Protect-Secrets ((Format-ArgsForDisplay $arguments $engine) -join ' ') @($Password, $UserName, $__repo.Password))"
     $__v8 = Invoke-PlatformProcess $V8Path $arguments -PreQuoted
     $exitCode = $__v8.ExitCode
 

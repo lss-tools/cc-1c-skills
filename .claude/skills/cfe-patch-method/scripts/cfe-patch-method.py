@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# cfe-patch-method v2.5 — Source-aware method interceptor for 1C extension (CFE)
+# cfe-patch-method v2.11 — Source-aware method interceptor for 1C extension (CFE)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 import argparse
@@ -10,6 +10,28 @@ import sys
 import tempfile
 import xml.etree.ElementTree as ET
 
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
+
 TYPE_DIR_MAP = {
     "Catalog": "Catalogs", "Document": "Documents", "Enum": "Enums",
     "CommonModule": "CommonModules", "Report": "Reports", "DataProcessor": "DataProcessors",
@@ -19,6 +41,24 @@ TYPE_DIR_MAP = {
     "BusinessProcess": "BusinessProcesses", "Task": "Tasks",
     "InformationRegister": "InformationRegisters", "AccumulationRegister": "AccumulationRegisters",
     "AccountingRegister": "AccountingRegisters", "CalculationRegister": "CalculationRegisters",
+    # Прощающий ввод: имя каталога принимается наравне с именем типа (Catalogs.X ≡ Catalog.X) —
+    # PS1-порт так умел с самого начала, PY отставал.
+    "Catalogs": "Catalogs",
+    "Documents": "Documents",
+    "Enums": "Enums",
+    "CommonModules": "CommonModules",
+    "Reports": "Reports",
+    "DataProcessors": "DataProcessors",
+    "ExchangePlans": "ExchangePlans",
+    "ChartsOfAccounts": "ChartsOfAccounts",
+    "ChartsOfCharacteristicTypes": "ChartsOfCharacteristicTypes",
+    "ChartsOfCalculationTypes": "ChartsOfCalculationTypes",
+    "BusinessProcesses": "BusinessProcesses",
+    "Tasks": "Tasks",
+    "InformationRegisters": "InformationRegisters",
+    "AccumulationRegisters": "AccumulationRegisters",
+    "AccountingRegisters": "AccountingRegisters",
+    "CalculationRegisters": "CalculationRegisters",
 }
 # accept plural forms too
 for _v in list(TYPE_DIR_MAP.values()):
@@ -33,6 +73,99 @@ DECORATOR_MAP = {
 CONTEXT_RE = re.compile(
     r'^&(НаКлиенте|НаСервере|НаСервереБезКонтекста|НаКлиентеНаСервереБезКонтекста|НаКлиентеНаСервере)\s*$'
 )
+
+
+# --- Пометка расширенного свойства (<xr:PropertyState>) ---
+# Свойство появилось в формате 2.19 (8.3.26): на 2.18 и ниже платформа молча выбрасывает элемент
+# при загрузке. С 2.19 Конфигуратор ставит его сам при выгрузке. Правило: флаг ставит тот, кто
+# создал файл модуля, — здесь это мы. Имя свойства = базовое имя файла модуля.
+# Копии этих функций есть в cfe-borrow (навыки автономны); держать их одинаковыми — сознательно.
+def detect_format_version(d):
+    while d:
+        # Автономная внешняя обработка/отчёт: своего Configuration.xml у неё нет, версию несёт
+        # корень самой обработки. Без этого форма и макет внутри обработки 2.21 писались бы 2.17.
+        ext_path = d + ".xml"
+        if os.path.isfile(ext_path):
+            with open(ext_path, "r", encoding="utf-8-sig") as f:
+                ext_head = f.read(2000)
+            if re.search(r'<(ExternalDataProcessor|ExternalReport)[ >]', ext_head):
+                m = re.search(r'<MetaDataObject[^>]+version="(\d+\.\d+)"', ext_head)
+                if m:
+                    return m.group(1)
+        cfg_path = os.path.join(d, "Configuration.xml")
+        if os.path.isfile(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8-sig") as f:
+                head = f.read(2000)
+            m = re.search(r'<MetaDataObject[^>]+version="(\d+\.\d+)"', head)
+            if m:
+                return m.group(1)
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return "2.17"
+
+
+def format_rank(ver):
+    """"2.20" → 220, "2.9" → 209. Строковое сравнение неверно ("2.9" > "2.17")."""
+    m = re.match(r'^(\d+)\.(\d+)$', ver or '')
+    return int(m.group(1)) * 100 + int(m.group(2)) if m else 0
+
+
+def build_property_state_xml(property_name, indent):
+    return "\n".join([
+        f"{indent}<xr:PropertyState>",
+        f"{indent}\t<xr:Property>{property_name}</xr:Property>",
+        f"{indent}\t<xr:State>Extended</xr:State>",
+        f"{indent}</xr:PropertyState>",
+    ])
+
+
+def set_property_state_flag(obj_file, property_name, format_version):
+    if format_rank(format_version) < 219:
+        return
+    if not os.path.isfile(obj_file):
+        return
+
+    with open(obj_file, "r", encoding="utf-8-sig", newline="") as fh:
+        text = fh.read()
+    nl = "\r\n" if "\r\n" in text else "\n"
+
+    # ПЕРВЫЙ <InternalInfo> в файле — собственный у объекта: у реквизитов и подобъектов свои,
+    # но они лежат ниже, внутри <ChildObjects>.
+    empty = re.search(r"([ \t]*)<InternalInfo\s*/>", text)
+    opened = re.search(r"([ \t]*)<InternalInfo>(.*?)</InternalInfo>", text, re.S)
+
+    if empty and (not opened or empty.start() < opened.start()):
+        ind = empty.group(1)
+        block = build_property_state_xml(property_name, ind + "\t")
+        replacement = f"{ind}<InternalInfo>{nl}{block}{nl}{ind}</InternalInfo>"
+        text = text[:empty.start()] + replacement + text[empty.end():]
+    elif opened:
+        if re.search(rf"<xr:Property>{re.escape(property_name)}</xr:Property>", opened.group(2)):
+            return
+        ind = opened.group(1)
+        block = build_property_state_xml(property_name, ind + "\t")
+        # Дописываем в КОНЕЦ InternalInfo: у Конфигуратора PropertyState идёт после GeneratedType.
+        close_at = opened.end() - len("</InternalInfo>") - len(ind)
+        text = text[:close_at] + block + nl + text[close_at:]
+    else:
+        return
+
+    with open(obj_file, "w", encoding="utf-8-sig", newline="") as fh:
+        fh.write(text)
+
+
+# Модуль формы сюда не попадает: у формы флаг называется Form и ставится при заимствовании,
+# а не при появлении модуля (замер на 8.3.26 — пустой модуль формы платформа не выгружает).
+def get_module_flag_target(rel_parts, ext_root):
+    if len(rel_parts) != 4 or rel_parts[2] != "Ext":
+        return None
+    prop = os.path.splitext(rel_parts[3])[0]
+    return {
+        "file": os.path.join(ext_root, rel_parts[0], f"{rel_parts[1]}.xml"),
+        "property": prop,
+    }
 
 
 def get_module_rel_path(module_path):
@@ -358,6 +491,21 @@ def normalize(line):
     return re.sub(r'\s+', ' ', line).strip()
 
 
+# Control comparison key, as the platform compares a &ИзменениеИКонтроль copy with the original:
+# each line trimmed, blank lines dropped, everything else byte-for-byte and case-sensitive
+# (inner spaces, comments and letter case are significant). Measured on 8.3.24 and 8.3.27.
+def control_key(lines):
+    return "\n".join([k for k in (x.strip() for x in lines) if k != ""])
+
+
+# Parameter count of a signature params text. The platform compares only the number of
+# parameters of a &ИзменениеИКонтроль copy (names and default values it ignores).
+def param_count(params_text):
+    if not params_text or not params_text.strip():
+        return 0
+    return len([p for p in split_top_level(params_text) if p.strip()])
+
+
 def parse_marked_body(body_lines):
     v1 = []
     ops = []
@@ -539,7 +687,7 @@ def main():
                         choices=["", "Before", "After", "Instead", "ModificationAndControl"])
     parser.add_argument("-Check", action="store_true")
     parser.add_argument("-Actualize", action="store_true")
-    args = parser.parse_args()
+    args = ci_parse_args(parser)
 
     extension_path = args.ExtensionPath
     config_path = args.ConfigPath
@@ -801,6 +949,12 @@ def main():
 
     place_new(ext_bsl, ext_lines, ext_exists, method["chain"], core)
 
+    # Модуль в расширении есть — отражаем это в метаданных объекта (формат ≥ 2.19).
+    flag_target = get_module_flag_target(rel_parts, extension_path)
+    if flag_target:
+        set_property_state_flag(flag_target["file"], flag_target["property"],
+                                detect_format_version(extension_path))
+
     # emit summary
     placement = place_new.placement
     print('[OK] Перехватчик &%s("%s") — %s' % (decorator_ru, method_name, placement))
@@ -990,7 +1144,7 @@ def resync_one(ext_bsl, ext_lines, dup, method, logical_module, conflict_folder,
     sig = read_signature(ext_lines, sig_line_idx)
     if not sig:
         return {"id": method_id, "status": "ОШИБКА", "ext_bsl": ext_bsl, "reason": "не разобрать сигнатуру"}
-    _params, sig_end = sig
+    ext_params_text, sig_end = sig
     is_func = bool(re.match(r'^\s*(?:Асинх\s+)?Функция\b', ext_lines[sig_line_idx], re.IGNORECASE))
     end_re = re.compile(r'^\s*КонецФункции\b' if is_func else r'^\s*КонецПроцедуры\b', re.IGNORECASE)
     block_end = -1
@@ -1007,7 +1161,15 @@ def resync_one(ext_bsl, ext_lines, dup, method, logical_module, conflict_folder,
     v1norm = [normalize(x) for x in v1]
     v2norm = [normalize(x) for x in v2]
 
-    if "\n".join(v1norm) == "\n".join(v2norm):
+    # Signature: the platform rejects the interceptor when the parameter COUNT differs, so a
+    # body-only comparison would miss a vendor-added parameter. Names/defaults it ignores.
+    ext_param_count = param_count(ext_params_text)
+    src_param_count = param_count(method["params_text"])
+    params_drift = ext_param_count != src_param_count
+    params_reason = ("список параметров: в оригинале %d, в перехватчике %d"
+                     % (src_param_count, ext_param_count)) if params_drift else ""
+
+    if not params_drift and control_key(v1) == control_key(v2):
         return {"id": method_id, "status": "АКТУАЛЕН", "ext_bsl": ext_bsl}
 
     insert_top = []; insert_after = {}; del_start = set(); del_end = set(); disputed = []; transferred = 0; absorbed = 0; absorbed_notes = []
@@ -1069,7 +1231,11 @@ def resync_one(ext_bsl, ext_lines, dup, method, logical_module, conflict_folder,
             st = "ПЕРЕНЕСЕНО В ОСНОВНУЮ"
         else:
             st = "ДРЕЙФ"
+        if params_drift and st == "ПЕРЕНЕСЕНО В ОСНОВНУЮ":
+            st = "ДРЕЙФ"
         rsn = conflict_reason(disputed) if disputed else ("все правки уже в основной конфигурации" if st == "ПЕРЕНЕСЕНО В ОСНОВНУЮ" else "")
+        if params_drift:
+            rsn = ("%s; %s" % (params_reason, rsn)) if rsn else params_reason
         return {"id": method_id, "status": st, "ext_bsl": ext_bsl, "transferred": transferred,
                 "absorbed": absorbed, "disputed": len(disputed), "reason": rsn, "absorbed_notes": absorbed_notes}
 

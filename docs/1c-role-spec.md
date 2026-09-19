@@ -1,6 +1,6 @@
 # Спецификация формата ролей 1С:Предприятия 8.3
 
-Полное описание XML-формата ролей в выгрузке конфигурации. Версии формата: 2.17 (платформа 8.3.20–8.3.24), 2.18 (8.3.25), 2.19 (8.3.26), 2.20 (8.3.27+). Структура идентична; отличается атрибут `version`, а с 2.19 — ещё и набор выгружаемых прав (см. «Версии формата»).
+Полное описание XML-формата ролей в выгрузке конфигурации. Проверенный диапазон версий формата: 2.17 (платформа 8.3.24) … 2.21 (8.5); полная лестница — [1c-configuration-spec.md §7.1](1c-configuration-spec.md#71-лестница-версий). Структура идентична; отличается атрибут `version`, а с 2.19 — ещё и набор выгружаемых прав (см. «Версии формата»).
 
 ## Файловая структура
 
@@ -169,8 +169,50 @@ Roles/
 | `object/name` | да | Полное имя объекта метаданных (dot-нотация) |
 | `right/name` | да | Имя права (см. таблицы ниже) |
 | `right/value` | да | `true` или `false` |
-| `right/restrictionByCondition` | нет | Ограничение на уровне записей (RLS) |
-| `restrictionByCondition/condition` | да | Текст условия на языке шаблонов ограничений |
+| `right/restrictionByCondition` | нет | Ограничение на уровне записей (RLS). Их может быть несколько на одно право |
+| `restrictionByCondition/field` | нет | Поле, на которое действует ограничение. Может повторяться; порядок — ordinal |
+| `restrictionByCondition/condition` | да | Текст условия на языке шаблонов ограничений. Пустой (`<condition/>`) = доступ без ограничения |
+
+Ограничения права — это список строк, как таблица «Ограничения доступа к данным» в редакторе
+ролей. Строка **без** `<field>` действует на все прочие поля, строка с `<field>` — только на
+перечисленные. Строка без полей идёт первой. Типовой приём — закрыть таблицу целиком, оставив
+ссылочные поля доступными, чтобы ссылки на объект не рвались:
+
+```xml
+<right>
+    <name>Read</name>
+    <value>true</value>
+    <restrictionByCondition>
+        <condition>ГДЕ ЛОЖЬ</condition>
+    </restrictionByCondition>
+    <restrictionByCondition>
+        <field>Ref</field>
+        <field>Date</field>
+        <field>Number</field>
+        <condition/>
+    </restrictionByCondition>
+</right>
+```
+
+Стандартные реквизиты в `<field>` платформа пишет по-английски: `Ref`, `Code`, `Description`,
+`Parent`, `Owner`, `Date`, `Number`, `DeletionMark`, `IsFolder`, `DataVersion`, `Posted`,
+`Predefined`. Прикладные реквизиты — своими именами.
+
+### Зависимые права
+
+Платформа при загрузке доводит набор прав до замыкания: `Edit` тянет `Read`, `Update`, `View`;
+интерактивные права — свой базовый набор; `View` у обработки и отчёта — `Use`. Запрет работает в
+обратную сторону: `View=false` у реквизита тянет `Edit=false`. Файл, записанный без замыкания,
+после первой же загрузки разойдётся с базой.
+
+Права `Configuration` версионные: до формата 2.19 (платформа 8.3.26) любое из них взводило весь
+блок `MainWindowMode*` и `AnalyticsSystemClient`, начиная с 2.19 — нет.
+
+### Порядок узлов
+
+Порядок `<right>` внутри `<object>` фиксирован для типа объекта, порядок самих `<object>` —
+по uuid объекта метаданных (у вложенного — по uuid самого реквизита или команды). Платформа
+нормализует и то, и другое при выгрузке; порядок дерева конфигурации тут ни при чём.
 
 ### Именование объектов (dot-нотация)
 
@@ -385,7 +427,9 @@ Subsystem.Администрирование.Subsystem.Пользователи
 | Право | Описание |
 |-------|----------|
 | `Read` | Чтение |
+| `Update` | Изменение |
 | `View` | Просмотр |
+| `Edit` | Редактирование |
 
 #### Constant
 
@@ -428,6 +472,10 @@ Subsystem.Администрирование.Subsystem.Пользователи
 | `UpdateDataHistoryOfMissingData` | Обновление истории отсутствующих данных |
 | `UpdateDataHistorySettings` | Настройки истории данных |
 | `UpdateDataHistoryVersionComment` | Обновление комментария версии |
+| `InteractiveDeleteMarked` | Интерактивное удаление помеченных |
+| `ViewDataHistory` | Просмотр истории данных |
+| `EditDataHistoryVersionComment` | Редактирование комментария версии |
+| `SwitchToDataHistoryVersion` | Переход к версии |
 
 #### ChartOfCharacteristicTypes
 
@@ -459,6 +507,16 @@ Subsystem.Администрирование.Subsystem.Пользователи
 | `InteractiveSetDeletionMarkPredefinedData` | Пометка удаления предопределённых |
 | `InteractiveClearDeletionMarkPredefinedData` | Снятие пометки предопределённых |
 | `InteractiveDeleteMarkedPredefinedData` | Удаление помеченных предопределённых |
+| `InteractiveDeleteMarked` | Интерактивное удаление помеченных |
+| `ReadDataHistory` | Чтение истории данных |
+| `ReadDataHistoryOfMissingData` | Чтение истории отсутствующих данных |
+| `UpdateDataHistory` | Обновление истории данных |
+| `UpdateDataHistoryOfMissingData` | Обновление истории отсутствующих данных |
+| `UpdateDataHistorySettings` | Настройки истории данных |
+| `UpdateDataHistoryVersionComment` | Обновление комментария версии |
+| `ViewDataHistory` | Просмотр истории данных |
+| `EditDataHistoryVersionComment` | Редактирование комментария версии |
+| `SwitchToDataHistoryVersion` | Переход к версии |
 
 #### ExchangePlan
 
@@ -542,18 +600,44 @@ Subsystem.Администрирование.Subsystem.Пользователи
 | `SessionParameter` | Get, Set |
 | `CommonAttribute` | View, Edit |
 
+#### ExternalDataSource
+
+Источник ошибки в прежних редакциях спецификации: внешние источники данных права **имеют** —
+узел «Внешние источники данных» есть в дереве редактора ролей. Значения ниже сняты с выгрузки
+роли со всеми проставленными правами (8.3.25).
+
+| Объект | Права |
+|--------|-------|
+| `ExternalDataSource.И` | Use, Administration, StandardAuthenticationChange, SessionStandardAuthenticationChange, SessionOSAuthenticationChange |
+| `ExternalDataSource.И.Table.Т` | Read, Insert, Update, Delete, View, Edit, InputByString, InteractiveInsert, InteractiveDelete |
+| `ExternalDataSource.И.Table.Т.Field.П` | View, Edit |
+| `ExternalDataSource.И.Cube.К` | Read, View |
+| `ExternalDataSource.И.Cube.К.Dimension.И` | View |
+| `ExternalDataSource.И.Cube.К.Resource.Р` | View |
+| `ExternalDataSource.И.Cube.К.DimensionTable.Т` | Read, View |
+| `ExternalDataSource.И.Cube.К.DimensionTable.Т.Field.П` | View, Edit |
+| `ExternalDataSource.И.Function.Ф` | Use, View |
+| `…Table.Т.Command.К`, `…Cube.К.Command.К`, `…DimensionTable.Т.Command.К` | View |
+
 #### Типы объектов БЕЗ прав в ролях
 
-Следующие типы не фигурируют в Rights.xml (права не применимы или управляются иначе):
+Следующие типы не фигурируют в Rights.xml — в дереве редактора ролей их нет:
 
-- `Enum` (перечисления)
-- `FunctionalOption`
-- `DefinedType`
+- `Enum` (перечисления) — блок прав на перечисление приводит к зависанию загрузки
+  конфигурации в информационную базу: конфигуратор не завершается и не выдаёт сообщений
 - `CommonModule`
+- `DefinedType`
 - `CommonPicture`
 - `CommonTemplate`
+- `Language`
+- `FunctionalOption`, `FunctionalOptionsParameter`
+- `EventSubscription`
+- `ScheduledJob`
+- `StyleItem`, `Style`
 - `SettingsStorage`
-- `ExternalDataSource`
+- `XDTOPackage`
+- `WSReference`
+- `DocumentNumerator`
 
 ---
 
@@ -646,8 +730,21 @@ Subsystem.Администрирование.Subsystem.Пользователи
 | `TabularSection.*.Attribute` | (все с TabularSection) | View, Edit |
 | `Dimension` | InformationRegister, AccumulationRegister, AccountingRegister | View, Edit |
 | `Resource` | InformationRegister, AccumulationRegister, AccountingRegister | View, Edit |
-| `Command` | Catalog, Document, DataProcessor, Report, *Register, DocumentJournal, ExchangePlan, BusinessProcess, Task | View |
-| `AddressingAttribute` | Task | View, Edit |
+| `Command` | Catalog, Document, DataProcessor, Report, *Register, DocumentJournal, ExchangePlan, BusinessProcess, Task, ExternalDataSource (Table/Cube/DimensionTable) | View |
+| `AddressingAttribute` | Task, BusinessProcess | View, Edit |
+| `StandardTabularSection` | Catalog, Document, ChartOf* | View, Edit |
+| `AccountingFlag`, `ExtDimensionAccountingFlag` | ChartOfAccounts | View, Edit |
+| `Subsystem` | Subsystem (вложенная) | View |
+| `Operation` | WebService | Use |
+| `URLTemplate.*.Method` | HTTPService | Use |
+| `IntegrationServiceChannel` | IntegrationService | Use |
+| `Recalculation` | CalculationRegister | Read, Update |
+| `Column` (графа журнала) | — | прав не имеет |
+| `Table`, `Cube`, `Function`, `Field`, `DimensionTable` | только ExternalDataSource | см. раздел ExternalDataSource |
+
+Виды, встречающиеся в выгрузках типовых конфигураций, сверены с корпусом
+(`acc`, `erp`, `ut`, `unf` — ~2750 ролей); внешние источники данных — с выгрузкой роли,
+где права проставлены по всему дереву.
 
 ---
 
@@ -838,11 +935,13 @@ RLS применяется к правам `Read`, `Update`, `Insert`, `Delete` 
 
 | Платформа | version (метаданные) | version (Rights.xml) | Изменения |
 |-----------|:--------------------:|:--------------------:|-----------|
-| 8.3.20 | 2.17 | 2.17 | Базовая |
-| 8.3.24 | 2.17 | 2.17 | Без изменений |
+| 8.3.24 | 2.17 | 2.17 | Базовая (нижняя граница проверенного диапазона) |
 | 8.3.25 | 2.18 | 2.18 | Только номер версии |
 | 8.3.26 | 2.19 | 2.19 | Право, совпадающее с `setForNewObjects`, больше не пишется (см. ниже) |
 | 8.3.27 | 2.20 | 2.20 | Только номер версии |
+| 8.5.1 | 2.21 | 2.21 | Только номер версии |
+
+Полная лестница платформа → версия формата, включая ступени ниже проверенного диапазона, — [1c-configuration-spec.md §7.1](1c-configuration-spec.md#71-лестница-версий).
 
 Начиная с `2.19` платформа **опускает право, значение которого совпадает с `<setForNewObjects>`** в шапке `Rights.xml`: роль с `setForNewObjects=true` теряет из выгрузки права со значением `true`, роль с `false` — со значением `false`. Возможности не удалялись: право отсутствует в выгрузке, но действует по умолчанию роли. Структура файла при этом не менялась.
 

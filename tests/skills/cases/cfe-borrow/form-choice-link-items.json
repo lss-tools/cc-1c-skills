@@ -1,0 +1,65 @@
+{
+  "name": "Связь параметров выбора на Items.*.CurrentData вырезается: её кодировка невоспроизводима",
+  "preRun": [
+    {
+      "script": "meta-compile/scripts/meta-compile",
+      "input": { "type": "Catalog", "name": "Склады" },
+      "args": { "-JsonPath": "{inputFile}", "-OutputDir": "{workDir}" }
+    },
+    {
+      "script": "meta-compile/scripts/meta-compile",
+      "input": { "type": "Catalog", "name": "Ячейки" },
+      "args": { "-JsonPath": "{inputFile}", "-OutputDir": "{workDir}" }
+    },
+    {
+      "script": "meta-compile/scripts/meta-compile",
+      "input": {
+        "type": "Document", "name": "Размещение",
+        "tabularSections": {
+          "Строки": [
+            "Склад: CatalogRef.Склады",
+            "Ячейка: CatalogRef.Ячейки"
+          ]
+        }
+      },
+      "args": { "-JsonPath": "{inputFile}", "-OutputDir": "{workDir}" }
+    },
+    {
+      "script": "form-add/scripts/form-add",
+      "args": { "-ObjectPath": "{workDir}/Documents/Размещение.xml", "-FormName": "ФормаДокумента" }
+    },
+    {
+      "script": "form-compile/scripts/form-compile",
+      "input": {
+        "title": "Размещение",
+        "elements": [
+          {
+            "table": "Строки", "path": "Объект.Строки",
+            "columns": [
+              { "input": "Склад", "path": "Объект.Строки.Склад" },
+              {
+                "input": "Ячейка", "path": "Объект.Строки.Ячейка",
+                "choiceParameterLinks": [
+                  { "name": "Отбор.Владелец", "dataPath": "Items.Строки.CurrentData.Склад" }
+                ]
+              }
+            ]
+          }
+        ],
+        "attributes": [ { "name": "Объект", "type": "DocumentObject.Размещение", "main": true } ]
+      },
+      "args": { "-JsonPath": "{inputFile}", "-OutputPath": "{workDir}/Documents/Размещение/Forms/ФормаДокумента/Ext/Form.xml" }
+    },
+    {
+      "script": "cfe-init/scripts/cfe-init",
+      "args": { "-Name": "Тест", "-OutputDir": "{workDir}/cfe", "-ConfigPath": "{workDir}" }
+    }
+  ],
+  "params": { "extensionPath": "cfe", "object": "Document.Размещение.Form.ФормаДокумента" },
+  "expect": {
+    "fileNotContains": {
+      "file": "cfe/Documents/Размещение/Forms/ФормаДокумента/Ext/Form.xml",
+      "text": ["<xr:Link>", "Items.Строки.CurrentData.Склад"]
+    }
+  }
+}

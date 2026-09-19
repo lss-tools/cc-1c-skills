@@ -1,10 +1,12 @@
-﻿# cfe-borrow v1.16 — Borrow objects from configuration into extension (CFE)
+﻿# cfe-borrow v1.37 — Borrow objects from configuration into extension (CFE)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
+[CmdletBinding(PositionalBinding=$false)]
 param(
 	[Parameter(Mandatory)][string]$ExtensionPath,
 	[Parameter(Mandatory)][string]$ConfigPath,
 	[Parameter(Mandatory)][string]$Object,
-	[string]$BorrowMainAttribute
+	[string]$BorrowMainAttribute,
+	[string]$Module
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,18 +18,38 @@ function Warn([string]$msg) { Write-Host "[WARN] $msg" }
 # Form data-binding tags (value = attribute path). A binding survives only if its root
 # attribute is borrowed into the form's <Attributes>; otherwise it must be stripped or the
 # platform rejects the form with "Неверный путь к данным" on load.
-$script:formBindingDataTags = @('DataPath','TitleDataPath','FooterDataPath','HeaderDataPath','MultipleValueDataPath','MultipleValuePresentDataPath')
+# RowPictureDataPath тоже путь к данным («Объект.Товары.РасхождениеЗаказ», «Список.DefaultPicture»),
+# а не индекс картинки: эталон Конфигуратора сохраняет его с заимствованным основным реквизитом
+# и выбрасывает без него — то же правило, что у остальных путей.
+$script:formBindingDataTags = @('DataPath','TitleDataPath','FooterDataPath','HeaderDataPath','MultipleValueDataPath','MultipleValuePresentDataPath','RowPictureDataPath')
 # Picture-path binding tags (value = picture index path, never a data attribute) — always stripped in the skeleton.
-$script:formBindingPictureTags = @('RowPictureDataPath','MultipleValuePictureDataPath')
+$script:formBindingPictureTags = @('MultipleValuePictureDataPath')
+
+# Пути ссылок параметров выбора, которые пришлось вырезать (для предупреждения в конце)
+$script:droppedLinks = @()
+
+# id основного реквизита в заимствованной форме — как у Конфигуратора
+$script:mainAttrId = "1000001"
+
+# Виды дочерних объектов, которые заимствуются в оболочку поимённо (табличные части — отдельно)
+$script:childObjectKinds = @('Attribute','Dimension','Resource','AddressingAttribute')
+
+# Прямые дети <Form>, которые в заимствованную форму не переносятся.
+# Структурные секции: AutoCommandBar и ChildItems забираются отдельно, остальные выбрасываются целиком.
+$script:formStructuralSections = @('Events','Attributes','Commands','Parameters','CommandInterface')
+# Свойства формы, значение которых — имя реквизита формы (реквизиты не заимствуются, ссылка повиснет).
+$script:formAttributeRefProps = @('ReportResult','DetailsData','VariantAppearance','GroupList')
 
 # Strip data-binding tags whose root attribute isn't borrowed.
-# $keepObjekt=$true (BorrowMainAttribute): keep Объект.* data bindings, strip the rest.
-# $keepObjekt=$false (default skeleton): strip all bindings. Picture-path tags are always stripped.
+# $mainAttrName задан (BorrowMainAttribute): оставить привязки от его имени, остальные снять.
+# Пусто (скелет без основного реквизита): снять все. Картиночные пути снимаются всегда.
 function Strip-FormBindings {
-	param([string]$xml, [bool]$keepObjekt)
+	param([string]$xml, [string]$mainAttrName)
 	foreach ($tag in $script:formBindingDataTags) {
-		if ($keepObjekt) {
-			$xml = [regex]::Replace($xml, "\s*<$tag>(?!Объект\.)[^<]*</$tag>", '')
+		if ($mainAttrName) {
+			# Оставить и «Список.Поле», и путь ровно на сам реквизит («Список» у таблицы формы)
+			$root = [regex]::Escape($mainAttrName)
+			$xml = [regex]::Replace($xml, "\s*<$tag>(?!$root(\.|<))[^<]*</$tag>", '')
 		} else {
 			$xml = [regex]::Replace($xml, "\s*<$tag>[^<]*</$tag>", '')
 		}
@@ -36,6 +58,119 @@ function Strip-FormBindings {
 		$xml = [regex]::Replace($xml, "\s*<$tag>[^<]*</$tag>", '')
 	}
 	return $xml
+}
+
+# Ссылки параметров выбора (<ChoiceParameterLinks>/<xr:Link>) — привязка особого рода: путь лежит
+# в <xr:DataPath> и обычным стриппингом не снимается. Текстовое имя в расширении разрешается только
+# если его корень объявлен в <Attributes> самой заимствованной формы; иначе платформа отвергает
+# загрузку — «Неверный путь к полю - X». Реквизиты формы не заимствуются никогда, поэтому ссылка на
+# них разрешима только через id: Конфигуратор подставляет id реквизита ИСХОДНОЙ формы (эталоны
+# Issue66Example4/5/6, JR2433, JR2976, JR49904 — совпадение на шести расширениях). Именно id
+# исходной, а не заимствованной: при заимствовании реквизиты перенумеровываются в 1000000+, а
+# ссылка продолжает указывать в нумерацию базовой формы.
+# Путь на основной реквизит («Объект.X») при заимствованном основном реквизите разрешается текстом
+# и остаётся читаемым; без заимствования переводится в «<id>/0:<uuid реквизита объекта>».
+# Реквизит, которого в источнике нет, недоступен и по uuid: такую связь вырезаем целиком.
+# Пути вида «Items.<Элемент>.CurrentData.<Поле>» не трогаем — их кодировка отдельная.
+function Rewrite-ChoiceParameterLinks {
+	param([string]$xml, $attrUuids, $formAttrIds, [string]$mainAttrName, [bool]$mainAttrBorrowed)
+
+	if ($xml -notmatch '<ChoiceParameterLinks>') { return $xml }
+
+	$mainPat = if ($mainAttrName) { [regex]::Escape($mainAttrName) } else { $null }
+	$mainId = if ($mainAttrName -and $formAttrIds.ContainsKey($mainAttrName)) { $formAttrIds[$mainAttrName] } else { "1" }
+
+	$xml = [regex]::Replace($xml, '(?s)\s*<xr:Link>.*?</xr:Link>', {
+		param($m)
+		$link = $m.Value
+		$dp = [regex]::Match($link, '<xr:DataPath[^>]*>([^<]+)</xr:DataPath>')
+		if (-not $dp.Success) { return $link }
+		$path = $dp.Groups[1].Value
+
+		# Путь на основной реквизит формы
+		if ($mainPat -and $path -match "^${mainPat}\.(.+)$") {
+			$attrName = $Matches[1]
+			if ($mainAttrBorrowed) {
+				# Реквизит объекта разрешается текстом и остаётся читаемым. Стандартное поле
+				# («Объект.Owner», «Объект.Date») — нет: платформа отвергает «Неверный путь к данным».
+				# Конфигуратор в этом случае оставляет ссылку на сам реквизит (эталон Issue66Example7_1).
+				if ($attrUuids.ContainsKey($attrName)) { return $link }
+				return [regex]::Replace($link, '(<xr:DataPath[^>]*>)[^<]+(</xr:DataPath>)', "`${1}${mainId}`${2}")
+			}
+			if ($attrUuids.ContainsKey($attrName)) {
+				return [regex]::Replace($link, '(<xr:DataPath[^>]*>)[^<]+(</xr:DataPath>)', "`${1}${mainId}/0:$($attrUuids[$attrName])`${2}")
+			}
+			return ''
+		}
+
+		# Односегментный путь на реквизит формы — только по id исходной формы
+		if ($path -notmatch '\.' -and $formAttrIds.ContainsKey($path)) {
+			return [regex]::Replace($link, '(<xr:DataPath[^>]*>)[^<]+(</xr:DataPath>)', "`${1}$($formAttrIds[$path])`${2}")
+		}
+
+		# Уже непрозрачный путь (форма-источник сама из расширения) — не трогаем
+		if ($path -match '^\d') { return $link }
+
+		# С заимствованным основным реквизитом текстовый путь разрешается: элементы формы на месте,
+		# а их данные доступны через основной реквизит. Конфигуратор такие пути и оставляет текстом
+		# (эталон Issue66Example7_1: «Items.Товары.CurrentData.Характеристика» перенесён как есть).
+		if ($mainAttrBorrowed) { return $link }
+
+		# Прочее текстом не разрешается: платформа отвергает загрузку «Неверный путь к полю».
+		# Сюда попадают «Items.<Элемент>.CurrentData.<Поле>» — их кодировка непрозрачна и по
+		# имеющимся эталонам не воспроизводима. Связь параметров выбора — удобство подбора, а не
+		# данные: без неё форма заимствуется и работает, с ней — не грузится вовсе.
+		$script:droppedLinks += $path
+		return ''
+	})
+
+	# Опустевший контейнер платформе не нужен
+	$xml = [regex]::Replace($xml, '(?s)\s*<ChoiceParameterLinks>\s*</ChoiceParameterLinks>', '')
+	return $xml
+}
+
+# Имена ПРЯМЫХ детей собственного <ChildObjects> объекта — для дедупа при повторном
+# заимствовании. Текстом это не снять: regex «первый <ChildObjects> до первого </ChildObjects>»
+# у объекта с табличными частями обрывается на закрытии первой ТЧ, забирает имена её колонок и
+# теряет то, что идёт после неё.
+function Get-OwnChildObjectNames {
+	param([string]$objFile)
+
+	$names = @{}
+	if (-not (Test-Path -LiteralPath $objFile)) { return $names }
+	$doc = New-Object System.Xml.XmlDocument
+	$doc.PreserveWhitespace = $false
+	try { $doc.Load($objFile) } catch { return $names }
+	$objEl = $null
+	foreach ($c in $doc.DocumentElement.ChildNodes) {
+		if ($c.NodeType -eq 'Element') { $objEl = $c; break }
+	}
+	if (-not $objEl) { return $names }
+	$childObjs = $objEl.SelectSingleNode("*[local-name()='ChildObjects']")
+	if (-not $childObjs) { return $names }
+	foreach ($child in $childObjs.ChildNodes) {
+		if ($child.NodeType -ne 'Element') { continue }
+		$nameNode = $child.SelectSingleNode("*[local-name()='Properties']/*[local-name()='Name']")
+		if ($nameNode) { $names[$nameNode.InnerText.Trim()] = $true }
+	}
+	return $names
+}
+
+# Вставка в СОБСТВЕННЫЙ <ChildObjects> объекта. Свой контейнер закрывается в файле последним:
+# объект в файле один, а вложенные <ChildObjects> табличных частей закрываются раньше. Замена по
+# всем вхождениям раскидывала реквизиты по каждой ТЧ — ps1 рвал XML, py прятал ТЧ внутрь ТЧ.
+function Insert-IntoOwnChildObjects {
+	param([string]$text, [string]$content)
+
+	$closeIdx = $text.LastIndexOf('</ChildObjects>')
+	if ($closeIdx -ge 0) {
+		return $text.Substring(0, $closeIdx) + "${content}`r`n`t`t" + $text.Substring($closeIdx)
+	}
+	# Своего закрывающего тега нет — значит контейнер самозакрытый (детей у него нет, вложенных тоже)
+	$selfMatches = [regex]::Matches($text, '<ChildObjects\s*/>')
+	if ($selfMatches.Count -eq 0) { return $text }
+	$m = $selfMatches[$selfMatches.Count - 1]
+	return $text.Substring(0, $m.Index) + "<ChildObjects>${content}`r`n`t`t</ChildObjects>" + $text.Substring($m.Index + $m.Length)
 }
 
 # --- 1. Resolve paths ---
@@ -122,11 +257,37 @@ $childTypeDirMap = @{
 	"EventSubscription"="EventSubscriptions"; "ScheduledJob"="ScheduledJobs"
 	"SettingsStorage"="SettingsStorages"; "FilterCriterion"="FilterCriteria"
 	"CommandGroup"="CommandGroups"; "DocumentNumerator"="DocumentNumerators"
-	"Sequence"="Sequences"; "IntegrationService"="IntegrationServices"
+	"Sequence"="Sequences"; "ExternalDataSource"="ExternalDataSources"; "IntegrationService"="IntegrationServices"
 	"XDTOPackage"="XDTOPackages"; "WebService"="WebServices"
 	"HTTPService"="HTTPServices"; "WSReference"="WSReferences"
-	"CommonAttribute"="CommonAttributes"; "Style"="Styles"
+	"CommonAttribute"="CommonAttributes"; "Style"="Styles"; "Bot"="Bots"; "PaletteColor"="PaletteColors"; "Language"="Languages"
 }
+
+# --- 4a. Модули заимствованных объектов ---
+# Порядок внутри значения — порядок выгрузки Конфигуратора: сначала «объектный» модуль
+# (ObjectModule / RecordSetModule / ValueManagerModule), затем ManagerModule.
+$script:moduleKindsByType = @{
+	"CommonModule"=@("Module"); "HTTPService"=@("Module"); "WebService"=@("Module")
+	"Catalog"=@("ObjectModule","ManagerModule"); "Document"=@("ObjectModule","ManagerModule")
+	"Report"=@("ObjectModule","ManagerModule"); "DataProcessor"=@("ObjectModule","ManagerModule")
+	"ExchangePlan"=@("ObjectModule","ManagerModule")
+	"ChartOfCharacteristicTypes"=@("ObjectModule","ManagerModule")
+	"ChartOfAccounts"=@("ObjectModule","ManagerModule")
+	"ChartOfCalculationTypes"=@("ObjectModule","ManagerModule")
+	"BusinessProcess"=@("ObjectModule","ManagerModule"); "Task"=@("ObjectModule","ManagerModule")
+	"InformationRegister"=@("RecordSetModule","ManagerModule")
+	"AccumulationRegister"=@("RecordSetModule","ManagerModule")
+	"AccountingRegister"=@("RecordSetModule","ManagerModule")
+	"CalculationRegister"=@("RecordSetModule","ManagerModule")
+	"Sequence"=@("RecordSetModule","ManagerModule")
+	"Constant"=@("ValueManagerModule","ManagerModule")
+	"Enum"=@("ManagerModule"); "DocumentJournal"=@("ManagerModule")
+	"FilterCriterion"=@("ManagerModule")
+}
+# Типы с ЕДИНСТВЕННЫМ модулем: ради него объект и заимствуют, поэтому файл создаётся молча.
+# Отказ — `-Module None`.
+$script:autoModuleTypes = @("CommonModule", "HTTPService", "WebService")
+$script:moduleKindNames = @("Module", "ObjectModule", "ManagerModule", "RecordSetModule", "ValueManagerModule")
 
 # --- 4b. Russian synonym → English type ---
 $synonymMap = @{
@@ -149,20 +310,20 @@ $synonymMap = @{
 	"HTTPСервис"="HTTPService"; "СервисИнтеграции"="IntegrationService"
 }
 
-# --- 5. Canonical type order (44 types) ---
+# --- 5. Canonical type order (46 types) ---
 $script:typeOrder = @(
 	"Language","Subsystem","StyleItem","Style",
 	"CommonPicture","SessionParameter","Role","CommonTemplate",
 	"FilterCriterion","CommonModule","CommonAttribute","ExchangePlan",
 	"XDTOPackage","WebService","HTTPService","WSReference",
 	"EventSubscription","ScheduledJob","SettingsStorage","FunctionalOption",
-	"FunctionalOptionsParameter","DefinedType","CommonCommand","CommandGroup",
+	"FunctionalOptionsParameter","DefinedType","Bot","PaletteColor","CommonCommand","CommandGroup",
 	"Constant","CommonForm","Catalog","Document",
 	"DocumentNumerator","Sequence","DocumentJournal","Enum",
 	"Report","DataProcessor","InformationRegister","AccumulationRegister",
 	"ChartOfCharacteristicTypes","ChartOfAccounts","AccountingRegister",
 	"ChartOfCalculationTypes","CalculationRegister",
-	"BusinessProcess","Task","IntegrationService"
+	"BusinessProcess","Task","ExternalDataSource","IntegrationService"
 )
 
 # --- 6. GeneratedType patterns per type ---
@@ -209,7 +370,8 @@ $script:generatedTypes = @{
 		@{ prefix = "AccumulationRegisterRecordKey"; category = "RecordKey" }
 	)
 	"AccountingRegister" = @(
-		@{ prefix = "AccountingRegisterRecord";    category = "Record" }
+		@{ prefix = "AccountingRegisterRecord";        category = "Record" }
+		@{ prefix = "AccountingRegisterExtDimensions"; category = "ExtDimensions" }
 		@{ prefix = "AccountingRegisterManager";   category = "Manager" }
 		@{ prefix = "AccountingRegisterSelection"; category = "Selection" }
 		@{ prefix = "AccountingRegisterList";      category = "List" }
@@ -223,6 +385,7 @@ $script:generatedTypes = @{
 		@{ prefix = "CalculationRegisterList";      category = "List" }
 		@{ prefix = "CalculationRegisterRecordSet"; category = "RecordSet" }
 		@{ prefix = "CalculationRegisterRecordKey"; category = "RecordKey" }
+		@{ prefix = "RecalculationsManager";        category = "Recalcs" }
 	)
 	"ChartOfAccounts" = @(
 		@{ prefix = "ChartOfAccountsObject";    category = "Object" }
@@ -230,12 +393,15 @@ $script:generatedTypes = @{
 		@{ prefix = "ChartOfAccountsSelection"; category = "Selection" }
 		@{ prefix = "ChartOfAccountsList";      category = "List" }
 		@{ prefix = "ChartOfAccountsManager";   category = "Manager" }
+		@{ prefix = "ChartOfAccountsExtDimensionTypes";    category = "ExtDimensionTypes" }
+		@{ prefix = "ChartOfAccountsExtDimensionTypesRow"; category = "ExtDimensionTypesRow" }
 	)
 	"ChartOfCharacteristicTypes" = @(
 		@{ prefix = "ChartOfCharacteristicTypesObject";    category = "Object" }
 		@{ prefix = "ChartOfCharacteristicTypesRef";       category = "Ref" }
 		@{ prefix = "ChartOfCharacteristicTypesSelection"; category = "Selection" }
 		@{ prefix = "ChartOfCharacteristicTypesList";      category = "List" }
+		@{ prefix = "Characteristic";                      category = "Characteristic" }
 		@{ prefix = "ChartOfCharacteristicTypesManager";   category = "Manager" }
 	)
 	"ChartOfCalculationTypes" = @(
@@ -245,8 +411,11 @@ $script:generatedTypes = @{
 		@{ prefix = "ChartOfCalculationTypesList";      category = "List" }
 		@{ prefix = "ChartOfCalculationTypesManager";   category = "Manager" }
 		@{ prefix = "DisplacingCalculationTypes";       category = "DisplacingCalculationTypes" }
+		@{ prefix = "DisplacingCalculationTypesRow";    category = "DisplacingCalculationTypesRow" }
 		@{ prefix = "BaseCalculationTypes";             category = "BaseCalculationTypes" }
+		@{ prefix = "BaseCalculationTypesRow";          category = "BaseCalculationTypesRow" }
 		@{ prefix = "LeadingCalculationTypes";          category = "LeadingCalculationTypes" }
+		@{ prefix = "LeadingCalculationTypesRow";       category = "LeadingCalculationTypesRow" }
 	)
 	"BusinessProcess" = @(
 		@{ prefix = "BusinessProcessObject";    category = "Object" }
@@ -254,6 +423,7 @@ $script:generatedTypes = @{
 		@{ prefix = "BusinessProcessSelection"; category = "Selection" }
 		@{ prefix = "BusinessProcessList";      category = "List" }
 		@{ prefix = "BusinessProcessManager";   category = "Manager" }
+		@{ prefix = "BusinessProcessRoutePointRef"; category = "RoutePointRef" }
 	)
 	"Task" = @(
 		@{ prefix = "TaskObject";    category = "Object" }
@@ -284,6 +454,11 @@ $script:generatedTypes = @{
 	)
 	"DefinedType" = @(
 		@{ prefix = "DefinedType"; category = "DefinedType" }
+	)
+	"ExternalDataSource" = @(
+		@{ prefix = "ExternalDataSourceManager";       category = "Manager" }
+		@{ prefix = "ExternalDataSourceTablesManager"; category = "TablesManager" }
+		@{ prefix = "ExternalDataSourceCubesManager";  category = "CubesManager" }
 	)
 	"Sequence" = @(
 		@{ prefix = "SequenceRecord";    category = "Record" }
@@ -319,6 +494,16 @@ $typesWithChildObjects = @(
 
 # CommonModule properties to copy from source
 $commonModuleProps = @("Global","ClientManagedApplication","Server","ExternalConnection","ClientOrdinaryApplication","ServerCall")
+
+# Свойства объекта, от которых зависит существование стандартного поля: без них платформа
+# отвергает загрузку — «Неверный путь к данным». Конфигуратор переносит ровно их (эталоны
+# Issue66Example7_1 и Issue66Example2). Проверено сплошным прогоном по типам: у регистра сведений
+# без InformationRegisterPeriodicity не разрешается «Запись.Period».
+$script:typeGateProps = @{
+	"InformationRegister" = @("InformationRegisterPeriodicity","WriteMode")
+}
+# Владельцы справочника — список <xr:Item>, а не скаляр: переносится фрагментом, как __TypeXml
+$script:typesWithOwners = @("Catalog","ChartOfCharacteristicTypes")
 
 # Standard system fields to skip when collecting DataPath references
 $script:standardFields = @("Code","Description","Ref","Parent","DeletionMark","Predefined","IsFolder","LineNumber","RowsCount","PredefinedDataName")
@@ -368,6 +553,14 @@ function Expand-SelfClosingElement($container, $parentIndent) {
 function Detect-FormatVersion([string]$dir) {
 	$d = $dir
 	while ($d) {
+		# Автономная внешняя обработка/отчёт: своего Configuration.xml у неё нет, версию несёт
+		# корень самой обработки. Без этого форма и макет внутри обработки 2.21 писались бы 2.17.
+		$extPath = "$d.xml"
+		if (Test-Path $extPath) {
+			$extText = [System.IO.File]::ReadAllText($extPath, [System.Text.Encoding]::UTF8)
+			$extHead = $extText.Substring(0, [Math]::Min(2000, $extText.Length))
+			if ($extHead -match '<(ExternalDataProcessor|ExternalReport)[ >]' -and $extHead -match '<MetaDataObject[^>]+version="(\d+\.\d+)"') { return $Matches[1] }
+		}
 		$cfgPath = Join-Path $d "Configuration.xml"
 		if (Test-Path $cfgPath) {
 			$cfgText = [System.IO.File]::ReadAllText($cfgPath, [System.Text.Encoding]::UTF8)
@@ -431,7 +624,82 @@ if ($BorrowMainAttribute) {
 	}
 }
 
+# --- 9c. Validate -Module ---
+$script:requestedModules = @()
+$script:noModule = $false
+if ($Module) {
+	foreach ($raw in ($Module -split '[,;]')) {
+		$kind = $raw.Trim()
+		if (-not $kind) { continue }
+		# Сравнение РЕГИСТРОНЕЗАВИСИМОЕ явно (-ieq): в py-порте это отдельная ветка, и молчаливое
+		# расхождение портов на «none» ловится только глазами.
+		if ($kind -ieq "None") { $script:noModule = $true; continue }
+		$canon = @($script:moduleKindNames | Where-Object { $_ -ieq $kind })
+		if ($canon.Count -eq 0) {
+			Write-Error "Неизвестный вид модуля '$kind'. Допустимо: $($script:moduleKindNames -join ', '), None"
+			exit 1
+		}
+		$script:requestedModules += $canon[0]
+	}
+	if ($script:noModule -and $script:requestedModules.Count -gt 0) {
+		Write-Error "-Module None нельзя сочетать с видами модулей"
+		exit 1
+	}
+}
+
+# Какие модули создать для объекта. Тип с единственным модулем получает его всегда — уточнять
+# там нечего; -Module разбирает только неоднозначные типы. Иначе батч смешанных типов
+# (`CommonModule.X ;; Catalog.Y`) не выражался бы одним вызовом.
+function Resolve-ModuleKinds {
+	param([string]$typeName)
+
+	if ($script:noModule) { return @() }
+	$allowed = @($script:moduleKindsByType[$typeName])
+	if ($allowed.Count -eq 0) { return @() }
+
+	if ($script:autoModuleTypes -contains $typeName) { return @($allowed[0]) }
+	if ($script:requestedModules.Count -eq 0) { return @() }
+
+	# Порядок берём из таблицы типа, а не из порядка ключей в -Module.
+	$selected = @($allowed | Where-Object { $script:requestedModules -contains $_ })
+	if ($selected.Count -eq 0) {
+		Warn "  Тип $typeName не имеет запрошенных модулей — пропущено. Допустимо: $($allowed -join ', ')"
+	}
+	return $selected
+}
+
 # --- 10. Helper: read source object XML ---
+# Имена реквизитов исходного объекта → uuid. Нужны для непрозрачной формы пути в ссылках
+# параметров выбора (см. Rewrite-ChoiceParameterLinks).
+function Get-SourceAttributeUuids {
+	param([string]$typeName, [string]$objName)
+
+	$result = @{}
+	$dirName = $childTypeDirMap[$typeName]
+	if (-not $dirName) { return $result }
+	$srcFile = Join-Path (Join-Path $cfgDir $dirName) "${objName}.xml"
+	if (-not (Test-Path $srcFile)) { return $result }
+
+	$doc = New-Object System.Xml.XmlDocument
+	$doc.PreserveWhitespace = $false
+	$doc.Load($srcFile)
+	$objEl = $null
+	foreach ($c in $doc.DocumentElement.ChildNodes) {
+		if ($c.NodeType -eq 'Element') { $objEl = $c; break }
+	}
+	if (-not $objEl) { return $result }
+	$childObjects = $objEl.SelectSingleNode("*[local-name()='ChildObjects']")
+	if (-not $childObjects) { return $result }
+	foreach ($child in $childObjects.ChildNodes) {
+		if ($child.NodeType -ne 'Element') { continue }
+		if ($child.LocalName -notin @('Attribute','TabularSection')) { continue }
+		$uuid = $child.GetAttribute("uuid")
+		$nameNode = $child.SelectSingleNode("*[local-name()='Properties']/*[local-name()='Name']")
+		if ($uuid -and $nameNode) { $result[$nameNode.InnerText.Trim()] = $uuid }
+	}
+	return $result
+}
+
 function Read-SourceObject {
 	param([string]$typeName, [string]$objName)
 
@@ -490,6 +758,19 @@ function Read-SourceObject {
 			if ($typeNode) {
 				$srcProps["__TypeXml"] = [regex]::Replace($typeNode.OuterXml, '\s+xmlns(?::\w+)?="[^"]*"', '')
 			}
+		}
+		# Владельцы: стандартное поле «Owner» появляется у справочника, только если задан Owners
+		if ($script:typesWithOwners -ccontains $typeName) {
+			$ownersNode = $propsNode.SelectSingleNode("md:Owners", $srcNs)
+			if ($ownersNode -and $ownersNode.HasChildNodes) {
+				$srcProps["__OwnersXml"] = [regex]::Replace($ownersNode.OuterXml, '\s+xmlns(?::\w+)?="[^"]*"', '')
+			}
+		}
+		# Скалярные свойства, включающие стандартные поля своего типа
+		foreach ($gp in @($script:typeGateProps[$typeName])) {
+			if (-not $gp) { continue }
+			$gpNode = $propsNode.SelectSingleNode("md:${gp}", $srcNs)
+			if ($gpNode) { $srcProps[$gp] = $gpNode.InnerText.Trim() }
 		}
 	}
 
@@ -611,29 +892,55 @@ function Borrow-Form {
 	# (e.g. a 2.13 form inside a 2.17 extension). The platform itself upgrades the form to the root version.
 	$formVersion = $script:formatVersion
 
-	# Find direct children: form properties, AutoCommandBar, ChildItems
+	# Find direct children: form properties, AutoCommandBar, ChildItems.
+	# Секции формы отбираются по имени, а не по позиции: свойства лежат и до, и после <CommandSet>
+	# (корпусная проверка: у всех 794 форм документов ERP с CommandSet он стоит раньше AutoCommandBar,
+	# а AutoTime/UsePostingMode/RepostOnWrite — после него). Позиционная отсечка теряла весь хвост,
+	# и платформа молча подставляла дефолты вместо потерянных свойств.
 	$srcAutoCmd = $null
 	$srcChildItems = $null
 	$formProps = @()
-	$reachedVisual = $false
 	foreach ($fc in $srcFormEl.ChildNodes) {
 		if ($fc.NodeType -ne 'Element') { continue }
 		if ($fc.LocalName -eq 'AutoCommandBar' -and -not $srcAutoCmd) {
-			$reachedVisual = $true; $srcAutoCmd = $fc; continue
+			$srcAutoCmd = $fc; continue
 		}
 		if ($fc.LocalName -eq 'ChildItems' -and -not $srcChildItems) {
-			$reachedVisual = $true; $srcChildItems = $fc; continue
+			$srcChildItems = $fc; continue
 		}
-		if ($fc.LocalName -eq 'Events' -or $fc.LocalName -eq 'Attributes' -or $fc.LocalName -eq 'Commands' -or $fc.LocalName -eq 'Parameters' -or $fc.LocalName -eq 'CommandSet') {
-			$reachedVisual = $true; continue
-		}
-		if (-not $reachedVisual) {
-			$formProps += $fc.OuterXml
-		}
+		# Структурные секции: в расширении их содержимое недействительно (обработчики, команды и
+		# параметры базовой формы, ссылки командного интерфейса на команды базовой конфигурации).
+		if ($script:formStructuralSections -ccontains $fc.LocalName) { continue }
+		# Свойства, значение которых — имя реквизита формы. Реквизиты в заимствованную форму не
+		# переносятся, поэтому Конфигуратор такие свойства выбрасывает (проверено на форме отчёта:
+		# ReportResult и DetailsData выброшены, CustomSettingsFolder — имя элемента — сохранён).
+		if ($script:formAttributeRefProps -ccontains $fc.LocalName) { continue }
+		$formProps += $fc.OuterXml
 	}
 
 	# Get OuterXml and strip redundant namespace redeclarations (they're on root <Form>)
 	$nsStripPattern = '\s+xmlns(?::\w+)?="[^"]*"'
+
+	# Основной реквизит исходной формы: его имя — корень путей к данным, которые нужно сохранить
+	# («Объект.» у формы объекта, «Список.» у формы списка, «Запись.» у формы записи регистра)
+	# Имя основного реквизита источника нужно в обоих режимах: по нему опознаётся корень путей
+	# в ссылках параметров выбора. А $mainAttrName управляет вырезанием привязок и потому остаётся
+	# пустым в скелетном режиме — там привязки снимаются все.
+	$srcMainInfo = Get-MainAttributeInfo $srcFormEl $nsStripPattern
+	$srcMainAttrName = if ($srcMainInfo) { $srcMainInfo.Name } else { "" }
+	$formAttrIds = Get-FormAttributeIds $srcFormEl
+	$mainAttrInfo = if ($BorrowMainAttr) { $srcMainInfo } else { $null }
+	$mainAttrName = if ($mainAttrInfo) { $mainAttrInfo.Name } else { "" }
+	if ($BorrowMainAttr -and -not $mainAttrInfo) {
+		Warn "  У формы нет основного реквизита — -BorrowMainAttribute проигнорирован"
+	}
+
+	# uuid реквизитов объекта нужны ровно там, где основной реквизит НЕ попал в форму:
+	# только тогда путь «<основной>.X» переводится в непрозрачный вид
+	# Имена реквизитов объекта нужны в обоих режимах: без заимствования — чтобы построить
+	# непрозрачный путь, с заимствованием — чтобы отличить реквизит (разрешается текстом) от
+	# стандартного поля (не разрешается)
+	$srcAttrUuids = Get-SourceAttributeUuids $typeName $objName
 
 	# AutoCommandBar: keep ChildItems (buttons with CommandName→0), Autofill→false
 	$autoCmdXml = ""
@@ -642,10 +949,13 @@ function Borrow-Form {
 		$autoCmdXml = [regex]::Replace($autoCmdXml, $nsStripPattern, '')
 		$autoCmdXml = [regex]::Replace($autoCmdXml, '<CommandName>[^<]*</CommandName>', '<CommandName>0</CommandName>')
 		$autoCmdXml = $autoCmdXml -replace '<Autofill>true</Autofill>', '<Autofill>false</Autofill>'
-		# Strip ExcludedCommand (references to standard commands invalid in extension)
-		$autoCmdXml = [regex]::Replace($autoCmdXml, '\s*<ExcludedCommand>[^<]*</ExcludedCommand>', '')
+		# Вложенный CommandSet выбрасывается целиком, а не опустошается: Конфигуратор в заимствованной
+		# форме оставляет только корневой (тот идёт свойством формы, здесь его нет).
+		$autoCmdXml = [regex]::Replace($autoCmdXml, '(?s)\s*<CommandSet>.*?</CommandSet>', '')
+		$autoCmdXml = [regex]::Replace($autoCmdXml, '\s*<CommandSet/>', '')
 		# Strip data-binding tags whose root attribute isn't borrowed
-		$autoCmdXml = Strip-FormBindings $autoCmdXml ([bool]$BorrowMainAttr)
+		$autoCmdXml = Strip-FormBindings $autoCmdXml $mainAttrName
+		$autoCmdXml = Rewrite-ChoiceParameterLinks $autoCmdXml $srcAttrUuids $formAttrIds $srcMainAttrName ([bool]$mainAttrInfo)
 	}
 
 	# ChildItems: copy full tree, clean up base-config references
@@ -657,9 +967,11 @@ function Borrow-Form {
 		$childItemsXml = [regex]::Replace($childItemsXml, '<CommandName>[^<]*</CommandName>', '<CommandName>0</CommandName>')
 		# Strip data-binding tags whose root attribute isn't borrowed
 		# (DataPath/TitleDataPath/FooterDataPath/HeaderDataPath/MultipleValue*/RowPicture*)
-		$childItemsXml = Strip-FormBindings $childItemsXml ([bool]$BorrowMainAttr)
-		# Strip ExcludedCommand in nested AutoCommandBars (references to standard commands invalid in extension)
-		$childItemsXml = [regex]::Replace($childItemsXml, '\s*<ExcludedCommand>[^<]*</ExcludedCommand>', '')
+		$childItemsXml = Strip-FormBindings $childItemsXml $mainAttrName
+		$childItemsXml = Rewrite-ChoiceParameterLinks $childItemsXml $srcAttrUuids $formAttrIds $srcMainAttrName ([bool]$mainAttrInfo)
+		# Вложенные CommandSet (у таблиц, полей табличного документа и т.п.) — целиком, см. выше
+		$childItemsXml = [regex]::Replace($childItemsXml, '(?s)\s*<CommandSet>.*?</CommandSet>', '')
+		$childItemsXml = [regex]::Replace($childItemsXml, '\s*<CommandSet/>', '')
 		# Strip TypeLink blocks with human-readable DataPath (Items.XXX — can't convert to UUID)
 		$childItemsXml = [regex]::Replace($childItemsXml, '(?s)\s*<TypeLink>\s*<xr:DataPath>Items\.[^<]*</xr:DataPath>.*?</TypeLink>', '')
 		# Strip element-level Events (base form handlers not in extension)
@@ -876,17 +1188,9 @@ function Borrow-Form {
 		$formXmlSb.Append("`r`n") | Out-Null
 	}
 	# Attributes: empty or with MainAttribute when BorrowMainAttr
-	if ($BorrowMainAttr) {
-		$objTypePrefix = ""
-		$gtList = $script:generatedTypes[$typeName]
-		if ($gtList) { foreach ($g in $gtList) { if ($g.category -eq "Object") { $objTypePrefix = $g.prefix; break } } }
-		$mainAttrType = "cfg:${objTypePrefix}.${objName}"
+	if ($BorrowMainAttr -and $mainAttrInfo) {
 		$formXmlSb.Append("`t<Attributes>`r`n") | Out-Null
-		$formXmlSb.Append("`t`t<Attribute name=`"Объект`" id=`"1000001`">`r`n") | Out-Null
-		$formXmlSb.Append("`t`t`t<Type><v8:Type>${mainAttrType}</v8:Type></Type>`r`n") | Out-Null
-		$formXmlSb.Append("`t`t`t<MainAttribute>true</MainAttribute>`r`n") | Out-Null
-		$formXmlSb.Append("`t`t`t<SavedData>true</SavedData>`r`n") | Out-Null
-		$formXmlSb.Append("`t`t</Attribute>`r`n") | Out-Null
+		$formXmlSb.Append("`t`t$($mainAttrInfo.Xml)`r`n") | Out-Null
 		$formXmlSb.Append("`t</Attributes>") | Out-Null
 	} else {
 		$formXmlSb.Append("`t<Attributes/>") | Out-Null
@@ -920,13 +1224,15 @@ function Borrow-Form {
 	}
 
 	# BaseForm Attributes: same as main section
-	if ($BorrowMainAttr) {
+	if ($BorrowMainAttr -and $mainAttrInfo) {
 		$formXmlSb.Append("`t`t<Attributes>`r`n") | Out-Null
-		$formXmlSb.Append("`t`t`t<Attribute name=`"Объект`" id=`"1000001`">`r`n") | Out-Null
-		$formXmlSb.Append("`t`t`t`t<Type><v8:Type>${mainAttrType}</v8:Type></Type>`r`n") | Out-Null
-		$formXmlSb.Append("`t`t`t`t<MainAttribute>true</MainAttribute>`r`n") | Out-Null
-		$formXmlSb.Append("`t`t`t`t<SavedData>true</SavedData>`r`n") | Out-Null
-		$formXmlSb.Append("`t`t`t</Attribute>`r`n") | Out-Null
+		# В BaseForm та же секция на уровень глубже — приём переиндентации тот же, что у ChildItems
+		$maLines = $mainAttrInfo.Xml -split "`r?`n"
+		for ($li = 0; $li -lt $maLines.Count; $li++) {
+			if ($li -eq 0) { $formXmlSb.Append("`t`t`t$($maLines[$li])") | Out-Null }
+			else { $formXmlSb.Append("`t$($maLines[$li])") | Out-Null }
+			$formXmlSb.Append("`r`n") | Out-Null
+		}
 		$formXmlSb.Append("`t`t</Attributes>") | Out-Null
 	} else {
 		$formXmlSb.Append("`t`t<Attributes/>") | Out-Null
@@ -952,6 +1258,11 @@ function Borrow-Form {
 	$formXmlText = ($formXmlText -replace "`r`n", "`n") -replace "`n", "`r`n"
 	[System.IO.File]::WriteAllText($formXmlFile, $formXmlText, $enc)
 	Info "  Created: $formXmlFile"
+	if ($script:droppedLinks.Count -gt 0) {
+		$uniq = @($script:droppedLinks | Sort-Object -Unique)
+		Warn "  Вырезано связей параметров выбора: $($uniq.Count) — путь не разрешается в расширении: $($uniq -join ', ')"
+		$script:droppedLinks = @()
+	}
 
 	# 6. Create empty Module.bsl — but NEVER overwrite an existing one (re-borrow must
 	# not clobber user code added to the form module).
@@ -1041,32 +1352,22 @@ function Register-FormInObject {
 	}
 
 	# Save object XML
+	# Стиль исходника снимаем ДО записи: правка чужого файла наследует его BOM/EOL/заголовок
+	# (#44/#46/#47), новый файл получает канон выгрузки. Зеркало _detect_xml_style в py-порту.
+	$style2 = Detect-XmlStyle $objFile
 	$settings2 = New-Object System.Xml.XmlWriterSettings
 	$settings2.Encoding = New-Object System.Text.UTF8Encoding($true)
 	$settings2.Indent = $false
 	$settings2.NewLineHandling = [System.Xml.NewLineHandling]::None
-
 	$memStream2 = New-Object System.IO.MemoryStream
 	$writer2 = [System.Xml.XmlWriter]::Create($memStream2, $settings2)
 	$objDoc.Save($writer2)
 	$writer2.Flush(); $writer2.Close()
-
-	$bytes2 = $memStream2.ToArray()
+	$text2 = [System.Text.Encoding]::UTF8.GetString($memStream2.ToArray())
 	$memStream2.Close()
-	$text2 = [System.Text.Encoding]::UTF8.GetString($bytes2)
-	if ($text2.Length -gt 0 -and $text2[0] -eq [char]0xFEFF) { $text2 = $text2.Substring(1) }
-	$text2 = $text2.Replace('encoding="utf-8"', 'encoding="UTF-8"')
-	# Пустой элемент: XmlWriter отдаёт `<a />`, Конфигуратор пишет `<a/>`. Внутри
-	# CDATA/комментария ` />` может быть содержимым (там `>` не экранируется),
-	# поэтому они идут первыми ветками альтернации и возвращаются как есть.
-	$text2 = [regex]::Replace($text2, '(?s)<!\[CDATA\[.*?\]\]>|<!--.*?-->|(?<=\S) />', { param($m) if ($m.Value -eq ' />') { '/>' } else { $m.Value } })
-
-	$utf8Bom2 = New-Object System.Text.UTF8Encoding($true)
-	# Целевой перевод строки: стиль файла-назначения — правка наследует его (#44/#46/#47),
-	# новый файл получает канон выгрузки CRLF. Зеркало _detect_xml_style в py-порту.
-	$targetEol = if ((Test-Path -LiteralPath $objFile) -and ([System.IO.File]::ReadAllText($objFile) -notmatch "`r`n")) { "`n" } else { "`r`n" }
-	$text2 = ($text2 -replace "`r`n", "`n") -replace "`n", $targetEol
-	[System.IO.File]::WriteAllText($objFile, $text2, $utf8Bom2)
+	$text2 = Finalize-XmlText $text2 $style2
+	$writeBom2 = ($null -eq $style2) -or $style2.bom
+	[System.IO.File]::WriteAllText($objFile, $text2, (New-Object System.Text.UTF8Encoding($writeBom2)))
 	Info "  Registered form in: $objFile"
 }
 
@@ -1077,6 +1378,81 @@ function Test-ObjectBorrowed {
 	$dirName = $childTypeDirMap[$typeName]
 	$objFile = Join-Path (Join-Path $extDir $dirName) "${objName}.xml"
 	return (Test-Path $objFile)
+}
+
+# --- 10f. Helper: пометка расширенного свойства (<xr:PropertyState>) ---
+# Свойство появилось в формате 2.19 (8.3.26): на 2.18 и ниже платформа молча выбрасывает элемент
+# при загрузке. С 2.19 Конфигуратор ставит его сам при выгрузке — эмитим, чтобы исходники навыка
+# совпадали с эталоном. Имя свойства = базовое имя файла модуля (Module / ObjectModule / …),
+# у заимствованной формы — Form. Ставит тот, кто создал файл модуля (или форму).
+function Build-PropertyStateXml {
+	param([string]$propertyName, [string]$indent)
+
+	$sb = New-Object System.Text.StringBuilder
+	$sb.AppendLine("${indent}<xr:PropertyState>") | Out-Null
+	$sb.AppendLine("${indent}`t<xr:Property>${propertyName}</xr:Property>") | Out-Null
+	$sb.AppendLine("${indent}`t<xr:State>Extended</xr:State>") | Out-Null
+	$sb.Append("${indent}</xr:PropertyState>") | Out-Null
+	return $sb.ToString()
+}
+
+function Set-PropertyStateFlag {
+	param([string]$objFile, [string]$propertyName, [string]$formatVersion)
+
+	if ((Get-FormatRank $formatVersion) -lt 219) { return }
+	if (-not (Test-Path $objFile)) { return }
+
+	$enc = New-Object System.Text.UTF8Encoding($true)
+	$text = [System.IO.File]::ReadAllText($objFile, $enc)
+	$nl = if ($text -match "`r`n") { "`r`n" } else { "`n" }
+
+	# ПЕРВЫЙ <InternalInfo> в файле — собственный у объекта: у реквизитов и подобъектов свои,
+	# но они лежат ниже, внутри <ChildObjects>.
+	$empty = [regex]::Match($text, '([ \t]*)<InternalInfo\s*/>')
+	$open = [regex]::Match($text, '(?s)([ \t]*)<InternalInfo>(.*?)</InternalInfo>')
+
+	if ($empty.Success -and (-not $open.Success -or $empty.Index -lt $open.Index)) {
+		$ind = $empty.Groups[1].Value
+		$block = Build-PropertyStateXml $propertyName ($ind + "`t")
+		$replacement = "${ind}<InternalInfo>${nl}${block}${nl}${ind}</InternalInfo>"
+		$text = $text.Remove($empty.Index, $empty.Length).Insert($empty.Index, $replacement)
+	} elseif ($open.Success) {
+		if ($open.Groups[2].Value -match "<xr:Property>$([regex]::Escape($propertyName))</xr:Property>") { return }
+		$ind = $open.Groups[1].Value
+		$block = Build-PropertyStateXml $propertyName ($ind + "`t")
+		# Дописываем в КОНЕЦ InternalInfo: у Конфигуратора PropertyState идёт после GeneratedType.
+		$closeAt = $open.Index + $open.Length - "</InternalInfo>".Length - $ind.Length
+		$text = $text.Insert($closeAt, "${block}${nl}")
+	} else {
+		return
+	}
+
+	[System.IO.File]::WriteAllText($objFile, $text, $enc)
+}
+
+# --- 10g. Helper: пустой модуль заимствованного объекта ---
+function New-BorrowedModuleFile {
+	param([string]$typeName, [string]$objName, [string]$moduleKind)
+
+	$dirName = $childTypeDirMap[$typeName]
+	$objDir = Join-Path (Join-Path $extDir $dirName) $objName
+	$moduleDir = Join-Path $objDir "Ext"
+	if (-not (Test-Path $moduleDir)) { New-Item -ItemType Directory -Path $moduleDir -Force | Out-Null }
+
+	# NEVER overwrite an existing one: повторное заимствование не должно затирать дописанный код
+	# (то же правило, что у модуля формы).
+	$moduleFile = Join-Path $moduleDir "${moduleKind}.bsl"
+	if (Test-Path $moduleFile) {
+		Info "  Preserved existing ${moduleKind}.bsl"
+	} else {
+		$enc = New-Object System.Text.UTF8Encoding($true)
+		[System.IO.File]::WriteAllText($moduleFile, "", $enc)
+		Info "  Created: $moduleFile"
+	}
+
+	# Флаг ставим и для уже существовавшего файла: состояние объекта должно отражать факт модуля.
+	Set-PropertyStateFlag (Join-Path (Join-Path $extDir $dirName) "${objName}.xml") $moduleKind $script:formatVersion
+	return $moduleFile
 }
 
 # --- 11. Helper: generate InternalInfo XML ---
@@ -1112,8 +1488,46 @@ function Build-InternalInfoXml {
 }
 
 # --- 11b. Collect DataPath references from source Form.xml ---
+# --- 11b1. Основной реквизит исходной формы ---
+# Переносится ЦЕЛИКОМ, а не собирается из констант: имя, тип и состав детей зависят от вида формы.
+# У формы объекта это «Объект»/<Тип>Object + SavedData/UseAlways/Columns, у формы списка —
+# «Список»/DynamicList + Settings, у формы записи регистра — «Запись»/RecordManager + SavedData.
+# Синтез фиксированного набора давал для необъектных форм «Исключение XDTO» при загрузке.
+# Конфигуратор меняет у скопированного реквизита только id (эталоны Issue64UtB, Issue66Example2).
+# Имена реквизитов ИСХОДНОЙ формы → их id. Ссылки параметров выбора адресуют реквизит формы
+# именно по id базовой формы (см. Rewrite-ChoiceParameterLinks).
+function Get-FormAttributeIds {
+	param($formEl)
+
+	$result = @{}
+	$attrs = $formEl.SelectSingleNode("*[local-name()='Attributes']")
+	if (-not $attrs) { return $result }
+	foreach ($a in $attrs.ChildNodes) {
+		if ($a.NodeType -ne 'Element' -or $a.LocalName -ne 'Attribute') { continue }
+		$nm = $a.GetAttribute("name"); $id = $a.GetAttribute("id")
+		if ($nm -and $id) { $result[$nm] = $id }
+	}
+	return $result
+}
+
+function Get-MainAttributeInfo {
+	param($formEl, [string]$nsStripPattern)
+
+	$mainAttr = $formEl.SelectSingleNode("*[local-name()='Attributes']/*[local-name()='Attribute'][*[local-name()='MainAttribute']='true']")
+	if (-not $mainAttr) { return $null }
+	$xml = [regex]::Replace($mainAttr.OuterXml, $nsStripPattern, '')
+	# id заменяется только в открывающем теге самого реквизита — у вложенных элементов свои
+	$xml = [regex]::Replace($xml, '^(<Attribute\s[^>]*?)id="[^"]*"', "`${1}id=`"$script:mainAttrId`"")
+	return @{ Name = $mainAttr.GetAttribute("name"); Xml = $xml }
+}
+
 function Collect-FormDataPaths {
-	param([string]$formXmlPath)
+	param([string]$formXmlPath, [string]$mainAttrName)
+
+	# Корень путей — имя основного реквизита формы: «Объект» у формы объекта, «Список» у формы
+	# списка, «Запись» у формы записи регистра. Зашитый «Объект» не находил ничего у необъектных
+	# форм, и в оболочку не заимствовалось ни одного дочернего объекта.
+	$root = [regex]::Escape($mainAttrName)
 
 	$enc = New-Object System.Text.UTF8Encoding($true)
 	$content = [System.IO.File]::ReadAllText($formXmlPath, $enc)
@@ -1124,7 +1538,7 @@ function Collect-FormDataPaths {
 	# Scan every data-binding tag (DataPath/TitleDataPath/FooterDataPath/HeaderDataPath/MultipleValue*)
 	# for Объект.* references — picture-path tags carry picture indices, not data attributes.
 	foreach ($tag in $script:formBindingDataTags) {
-		$bms = [regex]::Matches($content, "<$tag>[^<]*\bОбъект\.(\w+(?:\.\w+)*)</$tag>")
+		$bms = [regex]::Matches($content, "<$tag>[^<]*\b$root\.(\w+(?:\.\w+)*)</$tag>")
 		foreach ($m in $bms) {
 			$path = $m.Groups[1].Value
 			$segments = $path.Split(".")
@@ -1142,7 +1556,7 @@ function Collect-FormDataPaths {
 
 	# Also scan <Field>Объект.X</Field> — object attributes referenced by filter/conditional-appearance
 	# fields (and dynamic lists), not via a *DataPath binding (e.g. УдалитьЮрФизЛицо). Designer borrows these too.
-	$fieldMatches = [regex]::Matches($content, "<Field>[^<]*\bОбъект\.(\w+(?:\.\w+)*)</Field>")
+	$fieldMatches = [regex]::Matches($content, "<Field>[^<]*\b$root\.(\w+(?:\.\w+)*)</Field>")
 	foreach ($m in $fieldMatches) {
 		$path = $m.Groups[1].Value
 		$segments = $path.Split(".")
@@ -1153,6 +1567,30 @@ function Collect-FormDataPaths {
 			$seg1 = $segments[1]
 			if ($script:standardFields -contains $seg1) { continue }
 			$deepPaths += @{ ObjectAttr = $seg0; SubAttr = $seg1 }
+		}
+	}
+
+	# Also scan <AdditionalColumns table="Объект.X"> — доп. колонки табличной части, объявленные в
+	# самой форме (напр. Объект.Товары.Артикул). Такая ТЧ может больше нигде на форме не встречаться,
+	# и без её заимствования платформа отвергает форму: «Неверный путь к данным».
+	$acMatches = [regex]::Matches($content, "<AdditionalColumns table=`"$root\.(\w+)`"")
+	foreach ($m in $acMatches) {
+		$seg0 = $m.Groups[1].Value
+		if ($script:standardFields -contains $seg0) { continue }
+		$firstLevel[$seg0] = $true
+	}
+
+	# Текст запроса динамического списка — такое же место ссылки на реквизиты объекта, как DataPath.
+	# Конфигуратор заимствует всё, что упомянуто в запросе: на эталоне Issue66Example2 это 21 из 27
+	# дочерних объектов, совпадение с ним точное в обе стороны. У списка без ручного запроса
+	# (<QueryText> нет) заимствуется только видимое на форме — эталон Issue66Example3.
+	# Разбирать язык запросов не нужно: имена-кандидаты отфильтрует Resolve-SourceAttributes по
+	# реальному составу объекта, поэтому лишние слова из запроса безвредны.
+	foreach ($qm in [regex]::Matches($content, '(?s)<QueryText>(.*?)</QueryText>')) {
+		foreach ($w in [regex]::Matches($qm.Groups[1].Value, '[\w]+')) {
+			$word = $w.Value
+			if ($script:standardFields -contains $word) { continue }
+			$firstLevel[$word] = $true
 		}
 	}
 
@@ -1206,7 +1644,11 @@ function Resolve-SourceAttributes {
 	foreach ($child in $childObjs.ChildNodes) {
 		if ($child.NodeType -ne 'Element') { continue }
 
-		if ($child.LocalName -eq 'Attribute') {
+		# Реквизит объекта, измерение и ресурс регистра — один и тот же вид дочернего объекта с
+		# точки зрения заимствования, различается только имя элемента. Конфигуратор переносит их
+		# своим видом (эталон Issue66Example2: у регистра <Dimension> x3 и <Resource>), поэтому вид
+		# запоминается и выпускается как есть — иначе измерение уехало бы в файл как <Attribute>.
+		if ($script:childObjectKinds -ccontains $child.LocalName) {
 			$nameNode = $child.SelectSingleNode("md:Properties/md:Name", $srcNs)
 			if (-not $nameNode) { continue }
 			$attrName = $nameNode.InnerText
@@ -1218,7 +1660,7 @@ function Resolve-SourceAttributes {
 			# Strip namespace declarations from Type
 			$typeXml = [regex]::Replace($typeXml, '\s+xmlns(?::\w+)?="[^"]*"', '')
 
-			$attrs += @{ Name = $attrName; Uuid = $uuid; TypeXml = $typeXml }
+			$attrs += @{ Name = $attrName; Uuid = $uuid; TypeXml = $typeXml; Kind = $child.LocalName }
 		}
 		elseif ($child.LocalName -eq 'TabularSection') {
 			$nameNode = $child.SelectSingleNode("md:Properties/md:Name", $srcNs)
@@ -1268,8 +1710,16 @@ function Resolve-SourceAttributes {
 	$extraProps = [ordered]@{}
 	$propsNode = $srcEl.SelectSingleNode("md:Properties", $srcNs)
 	if ($propsNode) {
-		$propsToExtract = @("Hierarchical","FoldersOnTop","CodeLength","DescriptionLength","CodeType","CodeAllowedLength",
-			"NumberType","NumberLength","NumberAllowedLength","NumberPeriodicity")
+		# NumberPeriodicity сюда НЕ входит: платформа считает его модификацией настроек нумерации и
+		# тогда требует объявить ещё и <Numerator/>, иначе /UpdateDBCfg падает — «отключать
+		# контролируемость свойства "Нумератор" недопустимо». Конфигуратор его не переносит
+		# (эталон заимствования документа: NumberType/NumberLength/NumberAllowedLength и всё).
+		# Загрузку это не ломает, ошибка вылезает только на обновлении конфигурации БД.
+		# FoldersOnTop сюда НЕ входит: платформа его у заимствованной оболочки не хранит — при
+		# загрузке молча выбрасывает (проверено раундтрипом: записали, выгрузили обратно, свойства
+		# нет). Конфигуратор его тоже не переносит. Остальные из списка сохраняются.
+		$propsToExtract = @("Hierarchical","CodeLength","DescriptionLength","CodeType","CodeAllowedLength",
+			"NumberType","NumberLength","NumberAllowedLength")
 		foreach ($pName in $propsToExtract) {
 			$pNode = $propsNode.SelectSingleNode("md:${pName}", $srcNs)
 			if ($pNode) { $extraProps[$pName] = $pNode.InnerText }
@@ -1281,11 +1731,11 @@ function Resolve-SourceAttributes {
 
 # --- 11d. Build adopted attribute XML ---
 function Build-AdoptedAttributeXml {
-	param([string]$name, [string]$sourceUuid, [string]$typeXml, [string]$indent)
+	param([string]$name, [string]$sourceUuid, [string]$typeXml, [string]$indent, [string]$kind = "Attribute")
 
 	$newUuid = [guid]::NewGuid().ToString()
 	$sb = New-Object System.Text.StringBuilder
-	$sb.AppendLine("${indent}<Attribute uuid=`"${newUuid}`">") | Out-Null
+	$sb.AppendLine("${indent}<${kind} uuid=`"${newUuid}`">") | Out-Null
 	$sb.AppendLine("${indent}`t<InternalInfo/>") | Out-Null
 	$sb.AppendLine("${indent}`t<Properties>") | Out-Null
 	$sb.AppendLine("${indent}`t`t<ObjectBelonging>Adopted</ObjectBelonging>") | Out-Null
@@ -1294,7 +1744,7 @@ function Build-AdoptedAttributeXml {
 	$sb.AppendLine("${indent}`t`t<ExtendedConfigurationObject>${sourceUuid}</ExtendedConfigurationObject>") | Out-Null
 	$sb.AppendLine("${indent}`t`t${typeXml}") | Out-Null
 	$sb.AppendLine("${indent}`t</Properties>") | Out-Null
-	$sb.Append("${indent}</Attribute>") | Out-Null
+	$sb.Append("${indent}</${kind}>") | Out-Null
 	return $sb.ToString()
 }
 
@@ -1417,14 +1867,6 @@ function Merge-AttributesIntoObject {
 	$added = 0
 	foreach ($attr in $attrsToAdd) {
 		if ($existingNames.ContainsKey($attr.Name)) { continue }
-		$attrXml = Build-AdoptedAttributeXml $attr.Name $attr.Uuid $attr.TypeXml "`t`t`t"
-
-		# Expand self-closing ChildObjects if needed
-		if (-not $childObjs.HasChildNodes -or $childObjs.IsEmpty) {
-			$closeWs = $objDoc.CreateWhitespace("`r`n`t`t")
-			$childObjs.AppendChild($closeWs) | Out-Null
-		}
-
 		$added++
 	}
 
@@ -1433,10 +1875,14 @@ function Merge-AttributesIntoObject {
 		$allAttrXml = ""
 		foreach ($attr in $attrsToAdd) {
 			if ($existingNames.ContainsKey($attr.Name)) { continue }
-			$allAttrXml += "`r`n" + (Build-AdoptedAttributeXml $attr.Name $attr.Uuid $attr.TypeXml "`t`t`t")
+			$kind = if ($attr.Kind) { $attr.Kind } else { "Attribute" }
+			$allAttrXml += "`r`n" + (Build-AdoptedAttributeXml $attr.Name $attr.Uuid $attr.TypeXml "`t`t`t" $kind)
 		}
 
 		# Save via text manipulation to avoid namespace issues with InnerXml
+		# Стиль исходника снимаем ДО записи: правка чужого файла наследует его BOM/EOL/заголовок
+		# (#44/#46/#47), новый файл получает канон выгрузки. Зеркало _detect_xml_style в py-порту.
+		$style3 = Detect-XmlStyle $objFile
 		$settings3 = New-Object System.Xml.XmlWriterSettings
 		$settings3.Encoding = New-Object System.Text.UTF8Encoding($true)
 		$settings3.Indent = $false
@@ -1445,27 +1891,15 @@ function Merge-AttributesIntoObject {
 		$writer3 = [System.Xml.XmlWriter]::Create($memStream3, $settings3)
 		$objDoc.Save($writer3)
 		$writer3.Flush(); $writer3.Close()
-		$bytes3 = $memStream3.ToArray()
+		$text3 = [System.Text.Encoding]::UTF8.GetString($memStream3.ToArray())
 		$memStream3.Close()
-		$text3 = [System.Text.Encoding]::UTF8.GetString($bytes3)
-		if ($text3.Length -gt 0 -and $text3[0] -eq [char]0xFEFF) { $text3 = $text3.Substring(1) }
-		$text3 = $text3.Replace('encoding="utf-8"', 'encoding="UTF-8"')
-
-		# Insert attributes before </ChildObjects>
-		$text3 = $text3 -replace '</ChildObjects>', "${allAttrXml}`r`n`t`t</ChildObjects>"
-
-		# Пустой элемент: XmlWriter отдаёт `<a />`, Конфигуратор пишет `<a/>`. Внутри
-		# CDATA/комментария ` />` может быть содержимым (там `>` не экранируется),
-		# поэтому они идут первыми ветками альтернации и возвращаются как есть.
-		# Стоит ПОСЛЕ вставки реквизитов, чтобы накрыть и их.
-		$text3 = [regex]::Replace($text3, '(?s)<!\[CDATA\[.*?\]\]>|<!--.*?-->|(?<=\S) />', { param($m) if ($m.Value -eq ' />') { '/>' } else { $m.Value } })
-
-		$utf8Bom3 = New-Object System.Text.UTF8Encoding($true)
-		# Целевой перевод строки: стиль файла-назначения — правка наследует его (#44/#46/#47),
-		# новый файл получает канон выгрузки CRLF. Зеркало _detect_xml_style в py-порту.
-		$targetEol = if ((Test-Path -LiteralPath $objFile) -and ([System.IO.File]::ReadAllText($objFile) -notmatch "`r`n")) { "`n" } else { "`r`n" }
-		$text3 = ($text3 -replace "`r`n", "`n") -replace "`n", $targetEol
-		[System.IO.File]::WriteAllText($objFile, $text3, $utf8Bom3)
+		# Самозакрытый элемент раскрывается текстом, а не пробельным узлом в DOM: тот давал
+		# лишнюю строку с табуляцией перед первым <Attribute> (у Конфигуратора пустых строк нет).
+		# Стоит ДО Finalize-XmlText, чтобы схлопывание пустых тегов накрыло и вставленные реквизиты.
+		$text3 = Insert-IntoOwnChildObjects $text3 $allAttrXml
+		$text3 = Finalize-XmlText $text3 $style3
+		$writeBom3 = ($null -eq $style3) -or $style3.bom
+		[System.IO.File]::WriteAllText($objFile, $text3, (New-Object System.Text.UTF8Encoding($writeBom3)))
 		Info "  Merged $added attribute(s) into: $objFile"
 	}
 }
@@ -1486,7 +1920,16 @@ function Borrow-MainAttribute {
 			Write-Error "Source Form.xml not found: $srcFormXmlPath"
 			exit 1
 		}
-		$dp = Collect-FormDataPaths $srcFormXmlPath
+		# Имя основного реквизита исходной формы — корень путей, которые надо собрать
+		$dpDoc = New-Object System.Xml.XmlDocument
+		$dpDoc.PreserveWhitespace = $true
+		$dpDoc.Load($srcFormXmlPath)
+		$dpInfo = Get-MainAttributeInfo $dpDoc.DocumentElement '\s+xmlns(?::\w+)?="[^"]*"'
+		if (-not $dpInfo) {
+			Warn "  У формы нет основного реквизита — заимствовать нечего"
+			return
+		}
+		$dp = Collect-FormDataPaths $srcFormXmlPath $dpInfo.Name
 		$firstLevelNames = $dp.FirstLevel
 		$deepPaths = $dp.DeepPaths
 		Info "  Collected $($firstLevelNames.Count) first-level DataPath references, $($deepPaths.Count) deep paths"
@@ -1512,19 +1955,15 @@ function Borrow-MainAttribute {
 	$objContent = [System.IO.File]::ReadAllText($objFile, (New-Object System.Text.UTF8Encoding($true)))
 
 	# Dedup: skip attributes/TS already present in object's ChildObjects (idempotent re-borrow)
-	$existingChildNames = @{}
-	if ($objContent -match '(?s)<ChildObjects>(.*?)</ChildObjects>') {
-		foreach ($nm in [regex]::Matches($Matches[1], '<Name>(\w+)</Name>')) {
-			$existingChildNames[$nm.Groups[1].Value] = $true
-		}
-	}
+	$existingChildNames = Get-OwnChildObjectNames $objFile
 	$insertAttrs = @($srcAttrs | Where-Object { -not $existingChildNames.ContainsKey($_.Name) })
 	$insertTS = @($srcTS | Where-Object { -not $existingChildNames.ContainsKey($_.Name) })
 
 	# Generate full object XML with attributes and TS
 	$contentSb = New-Object System.Text.StringBuilder
 	foreach ($attr in $insertAttrs) {
-		$attrXml = Build-AdoptedAttributeXml $attr.Name $attr.Uuid $attr.TypeXml "`t`t`t"
+		$attrKind = if ($attr.Kind) { $attr.Kind } else { "Attribute" }
+		$attrXml = Build-AdoptedAttributeXml $attr.Name $attr.Uuid $attr.TypeXml "`t`t`t" $attrKind
 		$contentSb.AppendLine($attrXml) | Out-Null
 	}
 	foreach ($ts in $insertTS) {
@@ -1549,17 +1988,9 @@ function Borrow-MainAttribute {
 		}
 	}
 
-	# Replace empty ChildObjects with adopted content
+	# Добавить заимствованное содержимое в ChildObjects объекта (там уже может лежать <Form>)
 	if ($adoptedContent) {
-		# Handle <ChildObjects/> (self-closing)
-		if ($objContent -match '<ChildObjects\s*/>') {
-			$objContent = $objContent -replace '<ChildObjects\s*/>', "<ChildObjects>`r`n${adoptedContent}`r`n`t`t</ChildObjects>"
-		}
-		# Handle <ChildObjects>...</ChildObjects> (may already have Form entry)
-		elseif ($objContent -match '(?s)<ChildObjects>(.*?)</ChildObjects>') {
-			$existingInner = $Matches[1]
-			$objContent = $objContent -replace '(?s)<ChildObjects>(.*?)</ChildObjects>', "<ChildObjects>${existingInner}`r`n${adoptedContent}`r`n`t`t</ChildObjects>"
-		}
+		$objContent = Insert-IntoOwnChildObjects $objContent "`r`n${adoptedContent}"
 	}
 
 	$encBom = New-Object System.Text.UTF8Encoding($true)
@@ -1572,6 +2003,21 @@ function Borrow-MainAttribute {
 	foreach ($ts in $srcTS) {
 		foreach ($tsa in $ts.Attributes) { $allTypeXmls += $tsa.TypeXml }
 	}
+	# Типы из <Columns> основного реквизита формы: колонку мы переносим (Borrow-Form), значит и её
+	# тип должен быть заимствован — иначе колонка ссылается на DefinedType/справочник, которого в
+	# расширении нет. Конфигуратор поступает так же (эталон: DefinedTypes/Артикул при заимствовании
+	# формы заказа поставщику).
+	$srcFormForCols = Join-Path (Join-Path (Join-Path (Join-Path (Join-Path $cfgDir $dirName) $objName) "Forms") $formName) "Ext/Form.xml"
+	if (Test-Path $srcFormForCols) {
+		$colsDoc = New-Object System.Xml.XmlDocument
+		$colsDoc.PreserveWhitespace = $true
+		$colsDoc.Load($srcFormForCols)
+		$colsInfo = Get-MainAttributeInfo $colsDoc.DocumentElement '\s+xmlns(?::\w+)?="[^"]*"'
+		if ($colsInfo) {
+			foreach ($m in [regex]::Matches($colsInfo.Xml, '(?s)<Columns>.*?</Columns>')) { $allTypeXmls += $m.Value }
+		}
+	}
+
 	$refTypes = Collect-ReferenceTypes $allTypeXmls
 	Info "  Reference types to borrow: $($refTypes.Count)"
 
@@ -1745,6 +2191,16 @@ function Build-BorrowedObjectXml {
 		$sb.AppendLine("`t`t`t$($sourceProps['__TypeXml'])") | Out-Null
 	}
 
+	# Свойства, от которых зависят стандартные поля (см. $script:typeGateProps / $script:typesWithOwners)
+	foreach ($gp in @($script:typeGateProps[$typeName])) {
+		if ($gp -and $sourceProps.ContainsKey($gp)) {
+			$sb.AppendLine("`t`t`t<${gp}>$($sourceProps[$gp])</${gp}>") | Out-Null
+		}
+	}
+	if ($sourceProps.ContainsKey("__OwnersXml")) {
+		$sb.AppendLine("`t`t`t$($sourceProps['__OwnersXml'])") | Out-Null
+	}
+
 	$sb.AppendLine("`t`t</Properties>") | Out-Null
 
 	# ChildObjects (for types that need it)
@@ -1759,6 +2215,127 @@ function Build-BorrowedObjectXml {
 }
 
 # --- 13. Helper: add object to extension ChildObjects ---
+# Стиль существующего файла для round-trip-сохранения: BOM / EOL / регистр encoding /
+# финальный перенос. $null → файл новый (сохранить текущее поведение).
+# Реестр семьи: tests/skills/check-inline-drift.mjs.
+function Detect-XmlStyle([string]$path) {
+	if (-not (Test-Path -LiteralPath $path)) { return $null }
+	$raw = [System.IO.File]::ReadAllBytes($path)
+	$bom = ($raw.Length -ge 3 -and $raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF)
+	$body = if ($bom) { [System.Text.Encoding]::UTF8.GetString($raw, 3, $raw.Length - 3) } else { [System.Text.Encoding]::UTF8.GetString($raw) }
+	$head = if ($body.Length -gt 200) { $body.Substring(0, 200) } else { $body }
+	$m = [regex]::Match($head, 'encoding="([^"]+)"')
+	return @{
+		bom = $bom
+		crlf = $body.Contains("`r`n")
+		enc = $(if ($m.Success) { $m.Groups[1].Value } else { "utf-8" })
+		finalNl = $body.EndsWith("`n")
+	}
+}
+
+# Привести текст XmlWriter к стилю оригинала; для НОВОГО файла ($null) — к канону выгрузки
+# Конфигуратора: encoding="UTF-8", CRLF, без перевода строки в конце.
+# Реестр семьи: tests/skills/check-inline-drift.mjs.
+function Finalize-XmlText([string]$text, $style) {
+	if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+	$encDecl = $(if ($style) { $style.enc } else { "UTF-8" })
+	$text = $text.Replace('encoding="utf-8"', 'encoding="' + $encDecl + '"')
+	# Пустой элемент: XmlWriter отдаёт `<a />`, Конфигуратор пишет `<a/>`. Внутри
+	# CDATA/комментария ` />` может быть содержимым (там `>` не экранируется),
+	# поэтому они идут первыми ветками альтернации и возвращаются как есть.
+	$text = [regex]::Replace($text, '(?s)<!\[CDATA\[.*?\]\]>|<!--.*?-->|(?<=\S) />', { param($m) if ($m.Value -eq ' />') { '/>' } else { $m.Value } })
+	$text = ($text -replace "`r`n", "`n").TrimEnd("`n")
+	if ($style -and $style.finalNl) { $text += "`n" }
+	if (-not $style -or $style.crlf) { $text = $text -replace "`n", "`r`n" }
+	return $text
+}
+
+function Find-V8Project([string]$startDir) {
+	$d = $startDir
+	for ($i = 0; $i -lt 20 -and $d; $i++) {
+		$pj = Join-Path $d ".v8-project.json"
+		if (Test-Path $pj) { return $pj }
+		$parent = [System.IO.Path]::GetDirectoryName($d)
+		if ($parent -eq $d) { break }
+		$d = $parent
+	}
+	return $null
+}
+
+# Куда навык ставит новую запись в <ChildObjects> — настройка newObjectPosition.
+# databases[].newObjectPosition базы, чей configSrc охватывает каталог родительского XML,
+# иначе корневое поле, иначе end. Значения: end — после последнего объекта того же вида
+# (так дописывает Конфигуратор); byName — по имени среди объектов того же вида.
+# Файл ищем от рабочего каталога вверх, каталог конфигурации — запасной путь: так же
+# его ищут support-guard и группа db-*, а скрипт навыка зовут по абсолютному пути, и cwd
+# остаётся рабочим каталогом проекта.
+# configSrc считается от каталога .v8-project.json, как задокументировано в
+# docs/v8-project-guide.md. Реестр семьи: tests/skills/check-inline-drift.mjs.
+function Get-NewObjectPosition([string]$cfgDir) {
+	try {
+		if (-not $cfgDir) { $cfgDir = "." }
+		$pj = Find-V8Project (Get-Location).Path
+		if (-not $pj) { $pj = Find-V8Project ([System.IO.Path]::GetFullPath($cfgDir)) }
+		if (-not $pj) { return "end" }
+		$proj = Get-Content -Raw $pj | ConvertFrom-Json
+		$projDir = [System.IO.Path]::GetDirectoryName($pj)
+		$cfgFull = [System.IO.Path]::GetFullPath($cfgDir).TrimEnd('\', '/')
+		if ($proj.databases) {
+			foreach ($db in $proj.databases) {
+				if ($db.configSrc -and $db.newObjectPosition) {
+					$src = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($projDir, $db.configSrc)).TrimEnd('\', '/')
+					if ($cfgFull -eq $src -or $cfgFull.StartsWith($src + [System.IO.Path]::DirectorySeparatorChar)) {
+						if ("$($db.newObjectPosition)" -eq "byName") { return "byName" }
+						return "end"
+					}
+				}
+			}
+		}
+		if ("$($proj.newObjectPosition)" -eq "byName") { return "byName" }
+		return "end"
+	} catch { return "end" }
+}
+
+# Виды, у которых порядок в дереве несёт смысл: автоматически их не упорядочиваем.
+# CommonAttribute — исключение самого стандарта (#std467): у общих реквизитов-разделителей
+# порядок в дереве задаёт порядок установки параметров сеанса. Subsystem и CommandGroup:
+# пока они не перечислены в <SubsystemsOrder> / <GroupsOrder> файла Ext/CommandInterface.xml,
+# порядок дерева задаёт порядок в интерфейсе, а платформа эти списки сама не заводит
+# (в выгрузке ACC вне GroupsOrder 15 живых групп из 39). Language исключён из осторожности,
+# без замера: языков обычно один-два, и в типовых их порядок не алфавитный.
+# Явно названный вид сортируется в любом случае.
+# Реестр семьи: tests/skills/check-inline-drift.mjs.
+function Test-OrderSensitiveType([string]$typeName) {
+	return @("CommonAttribute", "Subsystem", "CommandGroup", "Language") -ccontains $typeName
+}
+
+# Порядок имён объектов метаданных, как в дереве Конфигуратора.
+# Ключ — пары «ранг+символ»: регистр не учитывается, подчёркивание раньше цифр, цифры раньше
+# букв, буквы по кодам (латиница раньше кириллицы), ё на месте е. Культурные таблицы не
+# используются — они разные на разных ОС и в разных рантаймах, а так оба порта сравнивают
+# одинаково везде. Равные ключи разводит ordinal-сравнение исходных строк.
+# Возвращает -1 | 0 | 1. Реестр семьи: tests/skills/check-inline-drift.mjs.
+function Compare-MetadataNames([string]$a, [string]$b) {
+	$keys = @("", "")
+	$names = @($a, $b)
+	for ($i = 0; $i -lt 2; $i++) {
+		$sb = New-Object System.Text.StringBuilder
+		foreach ($ch in $names[$i].ToLowerInvariant().ToCharArray()) {
+			if ($ch -eq [char]0x0451) { $ch = [char]0x0435 }
+			if ([char]::IsDigit($ch)) { [void]$sb.Append('1') }
+			elseif ([char]::IsLetter($ch)) { [void]$sb.Append('2') }
+			else { [void]$sb.Append('0') }
+			[void]$sb.Append($ch)
+		}
+		$keys[$i] = $sb.ToString()
+	}
+	$r = [string]::CompareOrdinal($keys[0], $keys[1])
+	if ($r -eq 0) { $r = [string]::CompareOrdinal($a, $b) }
+	if ($r -lt 0) { return -1 }
+	if ($r -gt 0) { return 1 }
+	return 0
+}
+
 function Add-ToChildObjects {
 	param([string]$typeName, [string]$objName)
 
@@ -1784,7 +2361,12 @@ function Add-ToChildObjects {
 		}
 	}
 
-	# Find insertion point: after last element of same type, or before first element of later type
+	# Место вставки. Вид — по $script:typeOrder; внутри вида — по newObjectPosition: end
+	# (по умолчанию) кладёт после последнего объекта того же вида, byName — по имени. Так же
+	# заимствует Конфигуратор: в боевых выгрузках расширений ChildObjects не отсортирован.
+	# Subsystem по имени не упорядочиваем никогда: порядок подсистем в дереве задаёт порядок
+	# разделов в панели.
+	$byName = (-not (Test-OrderSensitiveType $typeName) -and (Get-NewObjectPosition $extDir) -eq "byName")
 	$insertBefore = $null
 	$lastSameType = $null
 
@@ -1794,8 +2376,7 @@ function Add-ToChildObjects {
 		if ($childTypeIdx -lt 0) { continue }
 
 		if ($child.LocalName -eq $typeName) {
-			# Same type -- check alphabetical order
-			if ($child.InnerText -gt $objName -and -not $insertBefore) {
+			if ($byName -and -not $insertBefore -and (Compare-MetadataNames $child.InnerText $objName) -gt 0) {
 				$insertBefore = $child
 			}
 			$lastSameType = $child
@@ -1880,6 +2461,9 @@ foreach ($item in $items) {
 		$hasBMA = [bool]$BorrowMainAttribute
 		$formFiles = Borrow-Form $typeName $objName $formName -BorrowMainAttr:$hasBMA
 		$script:borrowedFiles += $formFiles
+		# Замер на 8.3.26: платформа помечает форму расширенной сразу при заимствовании,
+		# даже если элементы не менялись. Флаг живёт в метаданных формы, не у владельца.
+		Set-PropertyStateFlag $formFiles[0] "Form" $script:formatVersion
 		$borrowedCount++
 
 		# Borrow main attribute if requested
@@ -1888,57 +2472,99 @@ foreach ($item in $items) {
 		}
 	} else {
 		# --- Object borrowing (existing logic) ---
-		Info "Borrowing ${typeName}.${objName}..."
-
-		$src = Read-SourceObject $typeName $objName
-		Info "  Source UUID: $($src.Uuid)"
-
-		$borrowedXml = Build-BorrowedObjectXml $typeName $objName $src.Uuid $src.Properties
-
 		$targetDir = Join-Path $extDir $dirName
-		if (-not (Test-Path $targetDir)) {
-			New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
-		}
-
 		$targetFile = Join-Path $targetDir "${objName}.xml"
-		$enc = New-Object System.Text.UTF8Encoding($true)
-		[System.IO.File]::WriteAllText($targetFile, $borrowedXml, $enc)
-		Info "  Created: $targetFile"
+
+		# Уже заимствованный объект НЕ переписываем: в его XML лежат собственные реквизиты
+		# расширения, заимствованные подобъекты и состояния, которые из источника не выводятся.
+		# Повторный вызов — законный способ доделать модуль (-Module), а не переиздать заготовку.
+		if (Test-ObjectBorrowed $typeName $objName) {
+			Info "Already borrowed: ${typeName}.${objName} — XML сохранён без изменений"
+		} else {
+			Info "Borrowing ${typeName}.${objName}..."
+
+			$src = Read-SourceObject $typeName $objName
+			Info "  Source UUID: $($src.Uuid)"
+
+			$borrowedXml = Build-BorrowedObjectXml $typeName $objName $src.Uuid $src.Properties
+
+			if (-not (Test-Path $targetDir)) {
+				New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+			}
+
+			$enc = New-Object System.Text.UTF8Encoding($true)
+			[System.IO.File]::WriteAllText($targetFile, $borrowedXml, $enc)
+			Info "  Created: $targetFile"
+		}
 
 		Add-ToChildObjects $typeName $objName
 
 		$script:borrowedFiles += $targetFile
+		foreach ($kind in (Resolve-ModuleKinds $typeName)) {
+			$script:borrowedFiles += (New-BorrowedModuleFile $typeName $objName $kind)
+		}
 		$borrowedCount++
 	}
 }
 
+# --- 14b. Владельцы заимствованных справочников ---
+# Ссылка в <Owners> должна вести на объект, который в расширении есть: иначе платформа падает при
+# загрузке (проверено — access violation, не сообщение об ошибке). Конфигуратор владельца
+# заимствует (эталон Issue66Example7_1: вместе со справочником перенесён и его ПВХ-владелец).
+# Проход общий и повторяется, пока находятся новые: у владельца может быть свой владелец.
+$ownerPass = 0
+while ($true) {
+	$ownerPass++
+	if ($ownerPass -gt 10) { break }
+	$newOwners = @()
+	foreach ($shell in (Get-ChildItem -Path $extDir -Filter "*.xml" -Recurse -File)) {
+		$shellText = [System.IO.File]::ReadAllText($shell.FullName)
+		if ($shellText -notmatch '<Owners>') { continue }
+		foreach ($om in [regex]::Matches($shellText, '<xr:Item[^>]*>(\w+)\.(\w+)</xr:Item>')) {
+			$oType = $om.Groups[1].Value; $oName = $om.Groups[2].Value
+			if (-not $childTypeDirMap.ContainsKey($oType)) { continue }
+			if (Test-ObjectBorrowed $oType $oName) { continue }
+			if ($newOwners | Where-Object { $_.T -eq $oType -and $_.N -eq $oName }) { continue }
+			$newOwners += @{ T = $oType; N = $oName }
+		}
+	}
+	if ($newOwners.Count -eq 0) { break }
+	foreach ($ow in $newOwners) {
+		$owSrcFile = Join-Path (Join-Path $cfgDir $childTypeDirMap[$ow.T]) "$($ow.N).xml"
+		if (-not (Test-Path $owSrcFile)) {
+			Warn "  Владелец $($ow.T).$($ow.N) не найден в источнике — ссылка останется висячей"
+			continue
+		}
+		$owSrc = Read-SourceObject $ow.T $ow.N
+		$owXml = Build-BorrowedObjectXml $ow.T $ow.N $owSrc.Uuid $owSrc.Properties
+		$owDir = Join-Path $extDir $childTypeDirMap[$ow.T]
+		if (-not (Test-Path $owDir)) { New-Item -ItemType Directory -Path $owDir -Force | Out-Null }
+		$owFile = Join-Path $owDir "$($ow.N).xml"
+		$owEnc = New-Object System.Text.UTF8Encoding($true)
+		[System.IO.File]::WriteAllText($owFile, $owXml, $owEnc)
+		Add-ToChildObjects $ow.T $ow.N
+		$script:borrowedFiles += $owFile
+		Info "  Auto-borrowed owner: $($ow.T).$($ow.N)"
+	}
+}
+
 # --- 15. Save modified Configuration.xml ---
+# Стиль исходника снимаем ДО записи: правка чужого файла наследует его BOM/EOL/заголовок
+# (#44/#46/#47), новый файл получает канон выгрузки. Зеркало _detect_xml_style в py-порту.
+$style = Detect-XmlStyle $extResolvedPath
 $settings = New-Object System.Xml.XmlWriterSettings
 $settings.Encoding = New-Object System.Text.UTF8Encoding($true)
 $settings.Indent = $false
 $settings.NewLineHandling = [System.Xml.NewLineHandling]::None
-
 $memStream = New-Object System.IO.MemoryStream
 $writer = [System.Xml.XmlWriter]::Create($memStream, $settings)
 $script:xmlDoc.Save($writer)
 $writer.Flush(); $writer.Close()
-
-$bytes = $memStream.ToArray()
+$text = [System.Text.Encoding]::UTF8.GetString($memStream.ToArray())
 $memStream.Close()
-$text = [System.Text.Encoding]::UTF8.GetString($bytes)
-if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
-$text = $text.Replace('encoding="utf-8"', 'encoding="UTF-8"')
-# Пустой элемент: XmlWriter отдаёт `<a />`, Конфигуратор пишет `<a/>`. Внутри
-# CDATA/комментария ` />` может быть содержимым (там `>` не экранируется),
-# поэтому они идут первыми ветками альтернации и возвращаются как есть.
-$text = [regex]::Replace($text, '(?s)<!\[CDATA\[.*?\]\]>|<!--.*?-->|(?<=\S) />', { param($m) if ($m.Value -eq ' />') { '/>' } else { $m.Value } })
-
-$utf8Bom = New-Object System.Text.UTF8Encoding($true)
-# Целевой перевод строки: стиль файла-назначения — правка наследует его (#44/#46/#47),
-# новый файл получает канон выгрузки CRLF. Зеркало _detect_xml_style в py-порту.
-$targetEol = if ((Test-Path -LiteralPath $extResolvedPath) -and ([System.IO.File]::ReadAllText($extResolvedPath) -notmatch "`r`n")) { "`n" } else { "`r`n" }
-$text = ($text -replace "`r`n", "`n") -replace "`n", $targetEol
-[System.IO.File]::WriteAllText($extResolvedPath, $text, $utf8Bom)
+$text = Finalize-XmlText $text $style
+$writeBom = ($null -eq $style) -or $style.bom
+[System.IO.File]::WriteAllText($extResolvedPath, $text, (New-Object System.Text.UTF8Encoding($writeBom)))
 Info "Saved: $extResolvedPath"
 
 # --- 16. Summary ---

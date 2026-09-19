@@ -1,0 +1,21 @@
+{
+  "name": "Ошибка: хранилище не объявлено в реестре и не задано явно",
+  "fakePlatform": {
+    "log": ""
+  },
+  "args_extra": [
+    "-V8Path",
+    "{fakePlatform}",
+    "-InfoBasePath",
+    "{workDir}/ib",
+    "-Command",
+    "lock",
+    "-Objects",
+    "Справочник.Номенклатура"
+  ],
+  "expectError": true,
+  "expect": {
+    "stdoutContains": "repository path is unknown"
+  },
+  "noSnapshot": "разбор аргументов, платформа не запускается"
+}

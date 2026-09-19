@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# form-validate v1.9 — Validate 1C managed form
+# form-validate v1.19 — Validate 1C managed form
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 import argparse
@@ -7,6 +7,28 @@ import os
 import re
 import sys
 from lxml import etree
+
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
 
 F_NS = "http://v8.1c.ru/8.3/xcf/logform"
 V8_NS = "http://v8.1c.ru/8.1/data/core"
@@ -44,9 +66,69 @@ VALID_CFG_PREFIXES = {
     'ConstantsSet', 'DataProcessorObject', 'DocumentObject', 'DocumentRef',
     'DynamicList', 'EnumRef', 'ExchangePlanObject', 'ExchangePlanRef',
     'ExternalDataProcessorObject', 'ExternalReportObject',
+    'ExternalDataSourceTableObject', 'ExternalDataSourceTableRecordManager',
+    'ExternalDataSourceTableRef',
     'InformationRegisterRecordManager', 'InformationRegisterRecordSet',
     'ReportObject', 'TaskObject', 'TaskRef',
 }
+
+
+# Корень автономной внешней обработки/отчёта. Копия общего эталона (семья
+# support-guard: is_external_root, авторитет — cf-edit).
+def _sg_is_external_root(xml_path):
+    if not os.path.isfile(xml_path):
+        return False
+    try:
+        mx = etree.parse(xml_path).getroot()
+        for child in mx:
+            if isinstance(child.tag, str):
+                return child.tag.split("}")[-1] in ("ExternalDataProcessor", "ExternalReport")
+    except Exception:
+        return False
+    return False
+
+
+# Версия формата выгрузки. Копия общего эталона (семья detect_format_version, авторитет —
+# form-compile): та же ветка для автономной EPF/ERF, где версию несёт корень обработки.
+def detect_format_version(d):
+    while d:
+        # Автономная внешняя обработка/отчёт: своего Configuration.xml у неё нет, версию несёт
+        # корень самой обработки. Без этого форма и макет внутри обработки 2.21 писались бы 2.17.
+        ext_path = d + ".xml"
+        if os.path.isfile(ext_path):
+            with open(ext_path, "r", encoding="utf-8-sig") as f:
+                ext_head = f.read(2000)
+            if re.search(r'<(ExternalDataProcessor|ExternalReport)[ >]', ext_head):
+                m = re.search(r'<MetaDataObject[^>]+version="(\d+\.\d+)"', ext_head)
+                if m:
+                    return m.group(1)
+        cfg_path = os.path.join(d, "Configuration.xml")
+        if os.path.isfile(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8-sig") as f:
+                head = f.read(2000)
+            m = re.search(r'<MetaDataObject[^>]+version="(\d+\.\d+)"', head)
+            if m:
+                return m.group(1)
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return "2.17"
+
+
+# ── Format version ───────────────────────────────────────────
+# Проверенный диапазон версий формата выгрузки: 2.17 (8.3.24) … 2.21 (8.5). Полная лестница —
+# docs/1c-configuration-spec.md, «Лестница версий». Версию задаёт платформа ВЫГРУЗКИ, а не режим
+# совместимости конфигурации. Версии ниже 2.17 (платформы 8.3.23 и старше) существуют, но навыки
+# на них не проверялись — это предупреждение о непокрытии, а не о некорректности файла.
+FORMAT_VERIFIED_MIN = "2.17"
+FORMAT_VERIFIED_MAX = "2.21"
+
+
+def format_rank(ver):
+    """"2.20" → 220, "2.9" → 209. Строковое сравнение неверно ("2.9" > "2.17")."""
+    m = re.match(r'^(\d+)\.(\d+)$', ver or '')
+    return int(m.group(1)) * 100 + int(m.group(2)) if m else 0
 
 
 def localname(el):
@@ -60,7 +142,7 @@ def main():
     parser.add_argument("-FormPath", "-Path", required=True)
     parser.add_argument("-Detailed", action="store_true")
     parser.add_argument("-MaxErrors", type=int, default=30)
-    args = parser.parse_args()
+    args = ci_parse_args(parser)
 
     form_path = args.FormPath
     detailed = args.Detailed
@@ -106,13 +188,29 @@ def main():
 
     # Detect context: config vs EPF/ERF
     is_config_context = False
+    config_xml_path = ''
+    version_anchor = ''
     walk_dir = os.path.dirname(os.path.abspath(form_path))
     for _ in range(15):
         parent = os.path.dirname(walk_dir)
         if parent == walk_dir:
             break
+        # Порядок проверок тот же, что у detect_format_version: сначала корень автономной обработки,
+        # потом Configuration.xml — иначе форма внутри EPF, лежащей в дереве конфигурации, взяла бы
+        # версию конфигурации.
+        ext_root = walk_dir + '.xml'
+        if not version_anchor:
+            if _sg_is_external_root(ext_root):
+                # Ближайший якорь побеждает: автономная обработка остаётся автономной, даже если её
+                # исходники лежат внутри дерева с Configuration.xml (типовая раскладка проекта:
+                # src/cf рядом с src/epf). Иначе её собственные External*-типы считались бы ошибкой.
+                version_anchor = ext_root
+                break
         if os.path.isfile(os.path.join(walk_dir, 'Configuration.xml')):
             is_config_context = True
+            config_xml_path = os.path.join(walk_dir, 'Configuration.xml')
+            if not version_anchor:
+                version_anchor = config_xml_path
             break
         walk_dir = parent
 
@@ -161,13 +259,19 @@ def main():
         report_error(f"Root element is '{localname(root)}', expected 'Form'")
     else:
         version = root.get("version", "")
-        # Лестница версий формата: 2.17 (8.3.20-8.3.24), 2.18 (8.3.25), 2.19 (8.3.26), 2.20 (8.3.27).
-        if version in ("2.17", "2.18", "2.19", "2.20"):
-            report_ok(f"Root element: Form version={version}")
-        elif version:
-            report_warn(f"Form version='{version}' (expected 2.17-2.20)")
-        else:
+        version_rank = format_rank(version)
+        if not version:
             report_warn("Form version attribute missing")
+        elif version_rank == 0:
+            report_error(f"Malformed version '{version}' (expected N.N)")
+        elif version_rank < format_rank(FORMAT_VERIFIED_MIN):
+            report_warn(f"Format version '{version}' is below the tested range "
+                        f"{FORMAT_VERIFIED_MIN}-{FORMAT_VERIFIED_MAX} — skills were not verified on it")
+        elif version_rank > format_rank(FORMAT_VERIFIED_MAX):
+            report_warn(f"Format version '{version}' is above the tested range "
+                        f"{FORMAT_VERIFIED_MIN}-{FORMAT_VERIFIED_MAX} — skills were not verified on it")
+        else:
+            report_ok(f"Root element: Form version={version}")
 
     # --- Check 2: AutoCommandBar ---
     if not stopped:
@@ -175,10 +279,15 @@ def main():
         if acb is not None:
             acb_name = acb.get("name", "")
             acb_id = acb.get("id", "")
+            # id=-1 — соглашение, а не требование: в корпусе УТ/БП/ERP так у 21 094 форм из 21 097,
+            # но три формы платформа выгружает с обычным id и грузит их без нареканий. Поэтому
+            # предупреждение; ошибка — только если id вовсе не число.
             if acb_id == "-1":
                 report_ok(f"AutoCommandBar: name='{acb_name}', id={acb_id}")
+            elif re.match(r'^-?\d+$', acb_id):
+                report_warn(f"AutoCommandBar id='{acb_id}', usually '-1'")
             else:
-                report_error(f"AutoCommandBar id='{acb_id}', expected '-1'")
+                report_error(f"AutoCommandBar id='{acb_id}' is not a number")
         else:
             report_error("AutoCommandBar element missing")
 
@@ -430,11 +539,21 @@ def main():
                 segments = clean_path.split(".")
                 root_attr = segments[0]
 
-                # Resolve Items.<TableName>.CurrentData.<Field>... — table element, not attribute
-                if root_attr == 'Items':
+                # Resolve Items.<TableName>.CurrentData.<Field>... — table element, not attribute.
+                # Разрешаем ЦЕПОЧКОЙ: таблица во вложенной таблице сама привязана через Items.*, и один
+                # шаг оставлял корнем литерал «Items» — форма платформы объявлялась битой (типовые
+                # НастройкаПравилОбработкиЗаявокСотрудников в БП и ERP).
+                items_hops = 0
+                items_broken = False
+                while root_attr == 'Items':
+                    items_hops += 1
+                    if items_hops > 10:          # страховка от кольца ссылок
+                        items_broken = True
+                        break
                     if len(segments) < 3 or segments[2] != 'CurrentData':
                         report_warn(f"[{tag}] '{el_name}': {b_tag}='{data_path}' — unknown Items.* shape, expected Items.<Table>.CurrentData.*")
-                        continue
+                        items_broken = True
+                        break
                     table_name = segments[1]
                     table_el = None
                     for candidate in all_elements:
@@ -444,14 +563,19 @@ def main():
                     if table_el is None:
                         report_error(f"[{tag}] '{el_name}': {b_tag}='{data_path}' — table element '{table_name}' not found")
                         path_errors += 1
-                        continue
+                        items_broken = True
+                        break
                     table_dp_node = table_el["Node"].find(f"{{{F_NS}}}DataPath")
                     if table_dp_node is None or not (table_dp_node.text or "").strip():
-                        continue
+                        items_broken = True
+                        break
                     table_dp = re.sub(r'\[\d+\]', '', (table_dp_node.text or "").strip())
                     if table_dp.startswith('~'):
                         table_dp = table_dp[1:]
-                    root_attr = table_dp.split(".")[0]
+                    segments = table_dp.split(".")
+                    root_attr = segments[0]
+                if items_broken:
+                    continue
 
                 if root_attr not in attr_map:
                     report_error(f"[{tag}] '{el_name}': {b_tag}='{data_path}' — attribute '{root_attr}' not found")
@@ -465,6 +589,8 @@ def main():
             path_msg = f"{path_msg}, {skip_note}" if path_msg else skip_note
         if path_errors == 0 and path_msg:
             report_ok(f"Data bindings: {path_msg}")
+        elif path_errors == 0:
+            report_ok("Data bindings: none")
 
     # --- Check 6: Button command references ---
     if not stopped:
@@ -499,6 +625,8 @@ def main():
 
         if cmd_errors == 0 and cmd_checked > 0:
             report_ok(f"Command references: {cmd_checked} buttons checked")
+        elif cmd_checked == 0:
+            report_ok("Command references: none")
 
     # --- Check 7: Events have handler names ---
     if not stopped:
@@ -538,12 +666,19 @@ def main():
 
         if event_errors == 0 and event_checked > 0:
             report_ok(f"Event handlers: {event_checked} events checked")
+        elif event_checked == 0:
+            report_ok("Event handlers: none")
 
     # --- Check 8: Command actions ---
     if not stopped:
         action_errors = 0
         action_checked = 0
 
+        # Предупреждение, а не ошибка: <Action> может назначаться в рантайме
+        # (`Команда.Действие = "Подключаемый_…"` в ПриСозданииНаСервере) — приём типовых конфигураций
+        # там, где обработчик существует не во всякой сборке. Назначать может и чужой модуль
+        # (переопределяемый слой, подключаемые команды), так что по одному Form.xml не решить.
+        # Корпус УТ/БП/ERP: 406 таких команд на 275 формах, произведённых платформой.
         for cmd in cmd_nodes:
             if stopped:
                 break
@@ -551,11 +686,13 @@ def main():
             action_node = cmd.find(f"{{{F_NS}}}Action")
             action_checked += 1
             if action_node is None or not (action_node.text or "").strip():
-                report_error(f"Command '{cmd_name}': missing or empty Action")
+                report_warn(f"Command '{cmd_name}': no Action — handler must be assigned at runtime, otherwise the command does nothing")
                 action_errors += 1
 
         if action_errors == 0 and action_checked > 0:
             report_ok(f"Command actions: {action_checked} commands checked")
+        elif action_checked == 0:
+            report_ok("Command actions: none")
 
     # --- Check 9: MainAttribute count ---
     if not stopped:
@@ -686,6 +823,39 @@ def main():
             if (ext_attr_count + ext_cmd_count) > 0:
                 report_ok(f"Extension ID ranges: {ext_attr_count} attr(s), {ext_cmd_count} cmd(s) \u2014 all >= 1000000")
 
+        # 11d. \u041f\u0443\u0442\u0438 \u043d\u0430 \u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u0440\u0435\u043a\u0432\u0438\u0437\u0438\u0442, \u043a\u043e\u0442\u043e\u0440\u043e\u0433\u043e \u0444\u043e\u0440\u043c\u0430 \u043d\u0435 \u043e\u0431\u044a\u044f\u0432\u043b\u044f\u0435\u0442.
+        # Check 5 \u0442\u0430\u043a\u043e\u0435 \u043f\u0440\u043e\u043f\u0443\u0441\u043a\u0430\u0435\u0442: \u0443 \u0437\u0430\u0438\u043c\u0441\u0442\u0432\u043e\u0432\u0430\u043d\u043d\u043e\u0439 \u0444\u043e\u0440\u043c\u044b \u043e\u043d \u043d\u0435 \u043f\u0440\u043e\u0432\u0435\u0440\u044f\u0435\u0442 \u0431\u0430\u0437\u043e\u0432\u044b\u0435 \u044d\u043b\u0435\u043c\u0435\u043d\u0442\u044b (id < 1000000),
+        # \u0430 \u043f\u0440\u0438\u0432\u044f\u0437\u043a\u0438 \u0432 <xr:Link> \u0432\u043e\u043e\u0431\u0449\u0435 \u0432\u043d\u0435 \u0435\u0433\u043e \u0441\u043f\u0438\u0441\u043a\u0430 \u0442\u0435\u0433\u043e\u0432. \u041c\u0435\u0436\u0434\u0443 \u0442\u0435\u043c \u044d\u0442\u043e \u0440\u043e\u0432\u043d\u043e \u0442\u043e\u0442 \u0441\u043b\u0443\u0447\u0430\u0439, \u043d\u0430 \u043a\u043e\u0442\u043e\u0440\u043e\u043c
+        # \u043f\u043b\u0430\u0442\u0444\u043e\u0440\u043c\u0430 \u043e\u0442\u0432\u0435\u0440\u0433\u0430\u0435\u0442 \u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0443: \u00ab\u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0439 \u043f\u0443\u0442\u044c \u043a \u043f\u043e\u043b\u044e - \u041e\u0431\u044a\u0435\u043a\u0442.X\u00bb. \u041f\u0440\u0430\u0432\u0438\u043b\u043e: \u0435\u0441\u043b\u0438 \u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u0440\u0435\u043a\u0432\u0438\u0437\u0438\u0442
+        # \u043d\u0435 \u043e\u0431\u044a\u044f\u0432\u043b\u0435\u043d \u0432 <Attributes> \u0444\u043e\u0440\u043c\u044b, \u043b\u044e\u0431\u043e\u0439 \u043f\u0443\u0442\u044c \u0441 \u0435\u0433\u043e \u043a\u043e\u0440\u043d\u0435\u043c \u043d\u0435 \u0440\u0430\u0437\u0440\u0435\u0448\u0438\u0442\u0441\u044f.
+        # \u041a\u043e\u0440\u0435\u043d\u044c \u0431\u0435\u0440\u0451\u0442\u0441\u044f \u0438\u0437 \u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0433\u043e \u0440\u0435\u043a\u0432\u0438\u0437\u0438\u0442\u0430 BaseForm: \u00ab\u041e\u0431\u044a\u0435\u043a\u0442\u00bb \u043e\u043d \u0442\u043e\u043b\u044c\u043a\u043e \u0443 \u0444\u043e\u0440\u043c\u044b \u043e\u0431\u044a\u0435\u043a\u0442\u0430, \u0443 \u0444\u043e\u0440\u043c\u044b
+        # \u0441\u043f\u0438\u0441\u043a\u0430 \u044d\u0442\u043e \u00ab\u0421\u043f\u0438\u0441\u043e\u043a\u00bb, \u0443 \u0444\u043e\u0440\u043c\u044b \u0437\u0430\u043f\u0438\u0441\u0438 \u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0430 \u00ab\u0417\u0430\u043f\u0438\u0441\u044c\u00bb. \u0421 \u0437\u0430\u0448\u0438\u0442\u044b\u043c \u00ab\u041e\u0431\u044a\u0435\u043a\u0442\u00bb \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u043d\u0430 \u0442\u0430\u043a\u0438\u0445
+        # \u0444\u043e\u0440\u043c\u0430\u0445 \u043c\u043e\u043b\u0447\u0430 \u043d\u0435 \u0441\u0440\u0430\u0431\u0430\u0442\u044b\u0432\u0430\u043b\u0430.
+        main_attr_declared = False
+        for attr in attr_nodes:
+            ma_node = attr.find(f"{{{F_NS}}}MainAttribute")
+            if ma_node is not None and (ma_node.text or "").strip() == "true":
+                main_attr_declared = True
+                break
+
+        if not main_attr_declared:
+            # \u0417\u043d\u0430\u0447\u0435\u043d\u0438\u044f \u043f\u0440\u0438\u0432\u044f\u0437\u043e\u043a \u0438\u0449\u0435\u043c \u0442\u0435\u043a\u0441\u0442\u043e\u043c: \u0438\u043d\u0442\u0435\u0440\u0435\u0441\u0443\u044e\u0442 \u0438 \u043e\u0431\u044b\u0447\u043d\u044b\u0435 \u0442\u0435\u0433\u0438, \u0438 <xr:DataPath> \u0432\u043d\u0443\u0442\u0440\u0438
+            # <ChoiceParameterLinks>, \u0430 \u0442\u0435 \u0436\u0438\u0432\u0443\u0442 \u0432 \u0447\u0443\u0436\u043e\u043c \u043f\u0440\u043e\u0441\u0442\u0440\u0430\u043d\u0441\u0442\u0432\u0435 \u0438\u043c\u0451\u043d.
+            with open(form_path, "r", encoding="utf-8-sig") as fh:
+                raw_form = fh.read()
+            main_base = base_form_node.find(f"{{{F_NS}}}Attributes/{{{F_NS}}}Attribute[{{{F_NS}}}MainAttribute='true']")
+            root_name = main_base.get("name") if main_base is not None and main_base.get("name") else "\u041e\u0431\u044a\u0435\u043a\u0442"
+            root_pat = re.escape(root_name)
+            dangling_paths = set(re.findall(
+                r'<(?:\w+:)?\w*DataPath[^>]*>(' + root_pat + r'\.[^<]+)</(?:\w+:)?\w*DataPath>', raw_form))
+            if dangling_paths:
+                shown = sorted(dangling_paths)
+                sample = ", ".join(shown[:3])
+                suffix = f" (\u0438 \u0435\u0449\u0451 {len(shown) - 3})" if len(shown) > 3 else ""
+                report_error(f"Path(s) rooted at '{root_name}' but the form declares no MainAttribute: {sample}{suffix}")
+            elif main_base is not None:
+                report_ok("Object paths: none dangling (MainAttribute not declared)")
+
     # Check callType without BaseForm
     if not stopped and not is_extension:
         call_type_without_base = False
@@ -747,6 +917,62 @@ def main():
                 report_ok(f'12. Types: {type_count} values, all valid')
             else:
                 report_ok('12. Types: no type values to check')
+
+    # --- Check 13: префиксы в значениях объявлены в самом файле ---
+    # `cfg:DataProcessorObject.X` в <v8:Type> при незадекларированном xmlns:cfg — валидный XML, который
+    # платформа не читает вовсе: «Исключение XDTO произошло при чтении файла». Ошибка типична для
+    # рукописного XML: префикс скопирован из чужой формы, а объявление в корне забыто. Область видимости
+    # считаем по узлу (nsmap элемента), а не по корню: локальная xmlns на элементе законна.
+    if not stopped:
+        prefix_errors = 0
+        prefix_checked = 0
+        prefix_re = re.compile(r'^([A-Za-z_][A-Za-z0-9_.-]*):.+$')
+
+        for node in root.iter():
+            if not isinstance(node.tag, str):
+                continue
+            ln = localname(node)
+            values = []
+            if ln in ('Type', 'TypeSet'):
+                values.append((node.text or '').strip())
+            xsi_type = node.get(f'{{{"http://www.w3.org/2001/XMLSchema-instance"}}}type')
+            if xsi_type:
+                values.append(xsi_type.strip())
+            for val in values:
+                if not val:
+                    continue
+                m = prefix_re.match(val)
+                if not m:
+                    continue
+                prefix_checked += 1
+                pfx = m.group(1)
+                if pfx not in node.nsmap:
+                    kind = "xsi:type" if val == xsi_type else "Type"
+                    report_error(f"13. {kind} '{val}': namespace prefix '{pfx}:' is not declared "
+                                 "— the platform cannot read the file (XDTO)")
+                    prefix_errors += 1
+
+        if prefix_checked == 0:
+            report_ok('13. Namespace prefixes: nothing to check')
+        elif prefix_errors == 0:
+            report_ok(f'13. Namespace prefixes: {prefix_checked} values, all declared')
+
+    # --- Check 14: версия формата формы совпадает с версией выгрузки ---
+    # Версию задаёт платформа, которой выгружали, и в пределах одной выгрузки она едина. Форма из
+    # другой версии — «Неизвестная версия формата N загружаемого файла»: платформа не читает файл,
+    # который новее её самой. Источник версии ищем общим helper-ом: он же покрывает автономную
+    # внешнюю обработку/отчёт, где Configuration.xml нет и версию несёт корень самой обработки.
+    if not stopped and version_anchor:
+        form_ver = root.get('version', '')
+        dump_ver = detect_format_version(os.path.dirname(os.path.abspath(form_path)))
+
+        if not form_ver:
+            report_ok('14. Format version: not comparable')
+        elif form_ver != dump_ver:
+            report_error(f'14. Format version {form_ver} differs from the dump ({dump_ver}) '
+                         '— a dump carries one version, the platform refuses a file it cannot read')
+        else:
+            report_ok(f'14. Format version: {form_ver}, matches the dump')
 
     # --- Finalize ---
     checks = ok_count + errors + warnings

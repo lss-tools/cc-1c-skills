@@ -44,12 +44,13 @@ powershell.exe -NoProfile -File "${CLAUDE_SKILL_DIR}/scripts/role-compile.ps1" -
   "Document.Реализация: @edit",
   "DataProcessor.Загрузка: @view",
   "InformationRegister.Цены: Read, Update",
-  { "name": "Document.Продажа", "preset": "view", "rights": {"Delete": false}, "rls": {"Read": "#Шаблон(\"\")"} }
+  { "name": "Document.Продажа", "preset": "view", "rls": {"Read": "#Шаблон(\"\")"} },
+  { "name": "Catalog.Номенклатура.Attribute.Цена", "rights": {"View": false} }
 ]
 ```
 
 - Shorthand: `"Тип.Имя: @пресет"` или `"Тип.Имя: Право1, Право2"`
-- Объектная форма: `preset` + `rights` (переопределения) + `rls` (ограничения)
+- Объектная форма: `preset` + `rights` (точечные значения прав) + `rls` (ограничения)
 
 ### Пресеты
 
@@ -60,11 +61,18 @@ powershell.exe -NoProfile -File "${CLAUDE_SKILL_DIR}/scripts/role-compile.ps1" -
 
 `@` обязателен в shorthand. В объектной форме — `"preset": "view"` без `@`.
 
-Для сервисов (WebService, HTTPService, IntegrationService) пресеты не определены — используй явные права: `"WebService.Имя: Use"`.
 
-### Русские синонимы
+### Сервисы
 
-Поддерживаются русские типы (`Справочник`→Catalog, `Документ`→Document) и права (`Чтение`→Read, `Просмотр`→View). Смешивание допустимо: `"Справочник.Контрагенты: Чтение, View"`.
+Право живёт на **вложенном объекте** сервиса — методе шаблона URL, операции, канале; на сервисе целиком его не бывает. Весь сервис — короткая запись, навык раскроет её по метаданным в `OutputDir`:
+
+```json
+"objects": ["HTTPService.ЭДО: Use"]
+```
+→ `HTTPService.ЭДО.URLTemplate.ЕстьНовыеДокументы.Method.POST: Use`, и так по каждому методу каждого шаблона.
+
+Часть маршрутов — полным путём: `"HTTPService.ЭДО.URLTemplate.ЕстьНовыеДокументы.Method.POST: Use"`.
+
 
 ### Шаблоны RLS
 
@@ -73,6 +81,14 @@ powershell.exe -NoProfile -File "${CLAUDE_SKILL_DIR}/scripts/role-compile.ps1" -
 ```
 
 Ссылка в `rls`: `"#ДляОбъекта(\"\")"`. Символ `&` автоматически экранируется в XML.
+
+Длинное условие держи в файле — в значении пишется `@путь`. Относительный путь ищется рядом
+с JSON-описанием роли, затем в текущем каталоге:
+
+```json
+"objects": [{"name": "Document.Продажа", "preset": "view", "rls": {"Read": "@условие.txt"}}],
+"templates": [{"name": "ДляОбъекта(Мод)", "condition": "@шаблон.txt"}]
+```
 
 ## Примеры
 
@@ -99,11 +115,26 @@ powershell.exe -NoProfile -File "${CLAUDE_SKILL_DIR}/scripts/role-compile.ps1" -
 }
 ```
 
-Подробные таблицы пресетов, русских синонимов и дополнительные примеры — в `dsl-reference.md`.
+## Что можно писать в `objects`
+
+Прав не бывает у `Enum`, `CommonModule`, `DefinedType`, `CommonPicture`, `CommonTemplate`, `Language`, `FunctionalOption`, `EventSubscription`, `ScheduledJob`, `StyleItem`, `SettingsStorage` и подобных — в дереве редактора ролей их нет. Ошибка в описании — отказ до записи: файлы не создаются, `Configuration.xml` не меняется.
+
+Права на части объекта задаются точечным путём: `Catalog.Контрагенты.Attribute.ИНН: View, Edit`, `WebService.Обмен.Operation.Загрузить: Use`, `HTTPService.ЭДО.URLTemplate.ЕстьНовыеДокументы.Method.POST: Use`.
+
+Реквизиты, табличные части, измерения и ресурсы наследуют права своего объекта — им задают
+запрет, чтобы закрыть унаследованное:
+
+```json
+{"name": "Catalog.Товары.Attribute.Цена", "rights": {"View": false}}
+```
+
+Роль расширения, включённая в основные (`DefaultRoles`), прав на заимствованные объекты давать не может — платформа это запрещает. Такие права выноси в отдельную роль вне основных.
+
+Полные таблицы «тип → права», виды вложенности (включая внешние источники данных), список типов без прав, таблицы пресетов и дополнительные примеры — в `dsl-reference.md`.
 
 ## Верификация
 
 ```
-/role-validate <RightsPath> [MetadataPath]  — проверка корректности XML, прав, RLS
-/role-info <RightsPath>                     — визуальная сводка структуры
+/role-validate <RightsPath>  — проверка корректности XML, прав, RLS
+/role-info <RightsPath>      — визуальная сводка структуры
 ```

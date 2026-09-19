@@ -1,7 +1,8 @@
-﻿# role-info v1.2 — Analyze 1C role rights
+﻿# role-info v1.6 — Analyze 1C role rights
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
+[CmdletBinding(PositionalBinding=$false)]
 param(
-	[Parameter(Mandatory=$true)][Alias('Path')][string]$RightsPath,
+	[Parameter(Mandatory=$true, Position=0)][Alias('Path')][string]$RightsPath,
 	[switch]$ShowDenied,
 	[int]$Limit = 150,
 	[int]$Offset = 0,

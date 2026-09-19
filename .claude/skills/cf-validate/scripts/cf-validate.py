@@ -1,9 +1,31 @@
 #!/usr/bin/env python3
-# cf-validate v1.5 — Validate 1C configuration XML structure
+# cf-validate v1.10 — Validate 1C configuration XML structure
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 """Validates Configuration.xml: root structure, InternalInfo, properties, ChildObjects, languages."""
 import sys, os, argparse, re
 from lxml import etree
+
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
 
 NS = {
     'md':  'http://v8.1c.ru/8.3/MDClasses',
@@ -37,16 +59,16 @@ VALID_CLASS_IDS = [
 CHILD_OBJECT_TYPES = [
     'Language', 'Subsystem', 'StyleItem', 'Style',
     'CommonPicture', 'SessionParameter', 'Role', 'CommonTemplate',
-    'FilterCriterion', 'CommonModule', 'Bot', 'CommonAttribute', 'ExchangePlan',
+    'FilterCriterion', 'CommonModule', 'CommonAttribute', 'ExchangePlan',
     'XDTOPackage', 'WebService', 'HTTPService', 'WSReference',
     'EventSubscription', 'ScheduledJob', 'SettingsStorage', 'FunctionalOption',
-    'FunctionalOptionsParameter', 'DefinedType', 'CommonCommand', 'CommandGroup',
+    'FunctionalOptionsParameter', 'DefinedType', 'Bot', 'PaletteColor', 'CommonCommand', 'CommandGroup',
     'Constant', 'CommonForm', 'Catalog', 'Document',
     'DocumentNumerator', 'Sequence', 'DocumentJournal', 'Enum',
     'Report', 'DataProcessor', 'InformationRegister', 'AccumulationRegister',
     'ChartOfCharacteristicTypes', 'ChartOfAccounts', 'AccountingRegister',
     'ChartOfCalculationTypes', 'CalculationRegister',
-    'BusinessProcess', 'Task', 'IntegrationService',
+    'BusinessProcess', 'Task', 'ExternalDataSource', 'IntegrationService',
 ]
 
 # Type -> directory mapping
@@ -54,7 +76,7 @@ CHILD_TYPE_DIR_MAP = {
     'Language': 'Languages', 'Subsystem': 'Subsystems', 'StyleItem': 'StyleItems', 'Style': 'Styles',
     'CommonPicture': 'CommonPictures', 'SessionParameter': 'SessionParameters', 'Role': 'Roles',
     'CommonTemplate': 'CommonTemplates', 'FilterCriterion': 'FilterCriteria', 'CommonModule': 'CommonModules',
-    'Bot': 'Bots',
+    'Bot': 'Bots', 'PaletteColor': 'PaletteColors',
     'CommonAttribute': 'CommonAttributes', 'ExchangePlan': 'ExchangePlans', 'XDTOPackage': 'XDTOPackages',
     'WebService': 'WebServices', 'HTTPService': 'HTTPServices', 'WSReference': 'WSReferences',
     'EventSubscription': 'EventSubscriptions', 'ScheduledJob': 'ScheduledJobs',
@@ -71,6 +93,7 @@ CHILD_TYPE_DIR_MAP = {
     'ChartOfCalculationTypes': 'ChartsOfCalculationTypes',
     'CalculationRegister': 'CalculationRegisters',
     'BusinessProcess': 'BusinessProcesses', 'Task': 'Tasks',
+    'ExternalDataSource': 'ExternalDataSources',
     'IntegrationService': 'IntegrationServices',
 }
 
@@ -109,6 +132,20 @@ VALID_ENUM_VALUES = {
 }
 
 EXPECTED_NS = 'http://v8.1c.ru/8.3/MDClasses'
+
+# ── Format version ───────────────────────────────────────────
+# Проверенный диапазон версий формата выгрузки: 2.17 (8.3.24) … 2.21 (8.5). Полная лестница —
+# docs/1c-configuration-spec.md, «Лестница версий». Версию задаёт платформа ВЫГРУЗКИ, а не режим
+# совместимости конфигурации. Версии ниже 2.17 (платформы 8.3.23 и старше) существуют, но навыки
+# на них не проверялись — это предупреждение о непокрытии, а не о некорректности файла.
+FORMAT_VERIFIED_MIN = "2.17"
+FORMAT_VERIFIED_MAX = "2.21"
+
+
+def format_rank(ver):
+    """"2.20" → 220, "2.9" → 209. Строковое сравнение неверно ("2.9" > "2.17")."""
+    m = re.match(r'^(\d+)\.(\d+)$', ver or '')
+    return int(m.group(1)) * 100 + int(m.group(2)) if m else 0
 
 
 class Reporter:
@@ -170,7 +207,7 @@ def main():
     parser.add_argument('-Detailed', action='store_true')
     parser.add_argument('-MaxErrors', dest='MaxErrors', type=int, default=30)
     parser.add_argument('-OutFile', dest='OutFile', default='')
-    args = parser.parse_args()
+    args = ci_parse_args(parser)
 
     config_path = args.ConfigPath
     max_errors = args.MaxErrors
@@ -230,11 +267,17 @@ def main():
         check1_ok = False
 
     version = root.get('version', '')
+    version_rank = format_rank(version)
     if not version:
         r.warn('1. Missing version attribute on MetaDataObject')
-    elif version not in ('2.17', '2.18', '2.19', '2.20', '2.21'):
-        # Лестница версий формата: 2.17 (8.3.20-8.3.24), 2.18 (8.3.25), 2.19 (8.3.26), 2.20 (8.3.27).
-        r.warn(f"1. Unusual version '{version}' (expected 2.17-2.20 or 2.21)")
+    elif version_rank == 0:
+        r.error(f"1. Malformed version '{version}' (expected N.N)")
+    elif version_rank < format_rank(FORMAT_VERIFIED_MIN):
+        r.warn(f"1. Format version '{version}' is below the tested range "
+               f"{FORMAT_VERIFIED_MIN}-{FORMAT_VERIFIED_MAX} — skills were not verified on it")
+    elif version_rank > format_rank(FORMAT_VERIFIED_MAX):
+        r.warn(f"1. Format version '{version}' is above the tested range "
+               f"{FORMAT_VERIFIED_MIN}-{FORMAT_VERIFIED_MAX} — skills were not verified on it")
 
     # Must have Configuration child
     cfg_node = None

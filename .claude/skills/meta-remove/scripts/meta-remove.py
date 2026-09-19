@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# meta-remove v1.8 — Remove metadata object from 1C configuration dump
+# meta-remove v1.13 — Remove metadata object from 1C configuration dump
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 import argparse
@@ -9,6 +9,28 @@ import re
 import sys
 import shutil
 from lxml import etree
+
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
 
 
 # ============================================================
@@ -228,6 +250,7 @@ TYPE_PLURAL_MAP = {
     "WSReference": "WSReferences",
     "StyleItem": "StyleItems",
     "Language": "Languages",
+    "ExternalDataSource": "ExternalDataSources",
 }
 
 # Type -> reference type names (used in XML <v8:Type> elements)
@@ -269,6 +292,25 @@ MD_NS = "http://v8.1c.ru/8.3/MDClasses"
 V8_NS = "http://v8.1c.ru/8.1/data/core"
 
 NSMAP = {"md": MD_NS, "v8": V8_NS}
+
+
+def remove_node_with_indent(node):
+    """Удалить элемент вместе с предшествующим whitespace; опустевший контейнер сделать
+    самозакрывающимся. Копия из form-remove: одна задача — одна реализация."""
+    parent = node.getparent()
+    if parent is None:
+        return
+    # В DOM (PS) whitespace — отдельные узлы: удаляются предшествующий и сам элемент, а
+    # whitespace ПОСЛЕ элемента остаётся. В lxml он лежит в node.tail и ушёл бы вместе с
+    # узлом, поэтому его надо передать предшественнику.
+    prev = node.getprevious()
+    if prev is not None:
+        prev.tail = node.tail
+    else:
+        parent.text = node.tail
+    parent.remove(node)
+    if len(parent) == 0 and not (parent.text or "").strip():
+        parent.text = None
 
 
 def localname(el):
@@ -331,7 +373,7 @@ def main():
     parser.add_argument("-DryRun", action="store_true")
     parser.add_argument("-KeepFiles", action="store_true")
     parser.add_argument("-Force", action="store_true")
-    args = parser.parse_args()
+    args = ci_parse_args(parser)
 
     config_dir = args.ConfigDir
     if not os.path.isabs(config_dir):
@@ -347,19 +389,42 @@ def main():
         sys.exit(1)
 
     # --- Parse object spec ---
-    parts = args.Object.split(".", 1)
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        print(f"[ERROR] Invalid object format '{args.Object}'. Expected: Type.Name (e.g. Catalog.\u0422\u043e\u0432\u0430\u0440\u044b)")
-        sys.exit(1)
+    # Таблица внешнего источника — единственный объект с четырёхчастным именем: она лежит не в
+    # каталоге вида, а внутри источника, и числится в ChildObjects файла источника, не конфигурации.
+    eds_source = ""
+    m_eds = re.match(r'^ExternalDataSource\.([^.]+)\.Table\.(.+)$', args.Object)
+    if m_eds:
+        eds_source = m_eds.group(1)
+        obj_type = "Table"
+        obj_name = m_eds.group(2)
+    else:
+        parts = args.Object.split(".", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            print(f"[ERROR] Invalid object format '{args.Object}'. Expected: Type.Name (e.g. Catalog.\u0422\u043e\u0432\u0430\u0440\u044b) or ExternalDataSource.\u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a.Table.\u0422\u0430\u0431\u043b\u0438\u0446\u0430")
+            sys.exit(1)
+        obj_type = parts[0]
+        obj_name = parts[1]
 
-    obj_type = parts[0]
-    obj_name = parts[1]
+    if eds_source:
+        type_plural = os.path.join("ExternalDataSources", eds_source, "Tables")
+    else:
+        if obj_type not in TYPE_PLURAL_MAP:
+            print(f"[ERROR] Unknown type '{obj_type}'. Supported: {', '.join(TYPE_PLURAL_MAP.keys())}")
+            sys.exit(1)
+        type_plural = TYPE_PLURAL_MAP[obj_type]
 
-    if obj_type not in TYPE_PLURAL_MAP:
-        print(f"[ERROR] Unknown type '{obj_type}'. Supported: {', '.join(TYPE_PLURAL_MAP.keys())}")
-        sys.exit(1)
-
-    type_plural = TYPE_PLURAL_MAP[obj_type]
+    # Реестр, где объект числится: обычно ChildObjects конфигурации, а для таблицы — файл источника.
+    if eds_source:
+        registry_xml = os.path.join(config_dir, "ExternalDataSources", f"{eds_source}.xml")
+        registry_root = "ExternalDataSource"
+        registry_label = f"ExternalDataSources/{eds_source}.xml"
+        if not os.path.isfile(registry_xml):
+            print(f"[ERROR] \u0412\u043d\u0435\u0448\u043d\u0438\u0439 \u0438\u0441\u0442\u043e\u0447\u043d\u0438\u043a '{eds_source}' \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d: {registry_label}")
+            sys.exit(1)
+    else:
+        registry_xml = config_xml
+        registry_root = "Configuration"
+        registry_label = "Configuration.xml"
 
     print(f"=== meta-remove: {obj_type}.{obj_name} ===")
     print()
@@ -384,9 +449,9 @@ def main():
 
     if not has_xml and not has_dir:
         # Check if registered in Configuration.xml before proceeding
-        cfg_check_tree = etree.parse(config_xml, etree.XMLParser(remove_blank_text=False))
+        cfg_check_tree = etree.parse(registry_xml, etree.XMLParser(remove_blank_text=False))
         cfg_check_root = cfg_check_tree.getroot()
-        child_objects = cfg_check_root.find(f"{{{MD_NS}}}Configuration/{{{MD_NS}}}ChildObjects")
+        child_objects = cfg_check_root.find(f"{{{MD_NS}}}{registry_root}/{{{MD_NS}}}ChildObjects")
         registered_in_cfg = False
         if child_objects is not None:
             for child in child_objects:
@@ -394,7 +459,7 @@ def main():
                     registered_in_cfg = True
                     break
         if not registered_in_cfg:
-            print(f"[ERROR] Object not found: {type_plural}/{obj_name}.xml and not registered in Configuration.xml")
+            print(f"[ERROR] Object not found: {type_plural}/{obj_name}.xml and not registered in {registry_label}")
             sys.exit(1)
         print(f"[WARN]  Object files not found: {type_plural}/{obj_name}.xml")
         print("        Proceeding with deregistration only...")
@@ -422,6 +487,16 @@ def main():
         search_patterns.append(f"{ru_mgr}.{obj_name}")
     search_patterns.append(f"{type_plural}.{obj_name}")
 
+    # 2а) Внешний источник данных: ссылки на сам источник и на его таблицы
+    if obj_type == "ExternalDataSource":
+        search_patterns.append(f"ExternalDataSource.{obj_name}.")
+        search_patterns.append(f"\u0412\u043d\u0435\u0448\u043d\u0438\u0435\u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0438\u0414\u0430\u043d\u043d\u044b\u0445.{obj_name}")
+        search_patterns.append(f"ExternalDataSources.{obj_name}")
+    if eds_source:
+        search_patterns.append(f"ExternalDataSource.{eds_source}.Table.{obj_name}")
+        search_patterns.append(f"ExternalDataSourceTableRef.{eds_source}.{obj_name}")
+        search_patterns.append(f"\u0412\u043d\u0435\u0448\u043d\u0438\u0435\u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0438\u0414\u0430\u043d\u043d\u044b\u0445.{eds_source}.\u0422\u0430\u0431\u043b\u0438\u0446\u044b.{obj_name}")
+
     # 3) CommonModule: method calls
     if obj_type == "CommonModule":
         search_patterns.append(f"{obj_name}.")
@@ -437,10 +512,21 @@ def main():
         exclude_dirs.append(obj_dir)
     exclude_file = obj_xml if has_xml else ""
 
+    # Ссылки на формы удаляемого объекта: слоты вида <DefaultListForm>, <ChoiceForm>,
+    # <SettingsStorage>, элемент начальной страницы. Их, в отличие от типов и вызовов в .bsl,
+    # можно починить однозначно — пустой слот легален, — поэтому -Force их чистит.
+    form_slot_re = re.compile(
+        r"<([A-Za-z0-9_.]+)>(" + re.escape(f"{obj_type}.{obj_name}") + r"\.Form\.[^<]+|"
+        + re.escape(f"CommonForm.{obj_name}") + r")</")
+    form_slot_files = {}
+
     # Search all XML and BSL files
     references = []
     search_extensions = (".xml", ".bsl")
 
+    # Один проход вместо двух: раньше конфигурация обходилась дважды и каждый файл читался
+    # по два раза. Зеркало EnumerateFiles-прохода в PS.
+    type_name_ref = f"{obj_type}.{obj_name}"
     for root_path, dirs, files in os.walk(config_dir):
         for fname in files:
             ext = os.path.splitext(fname)[1].lower()
@@ -463,9 +549,11 @@ def main():
             rel_path = os.path.relpath(full_path, config_dir)
             rel_path_fwd = rel_path.replace("\\", "/")
 
-            # Skip auto-cleaned files
-            if rel_path_fwd == "Configuration.xml" or rel_path_fwd == "ConfigDumpInfo.xml" or rel_path_fwd.startswith("Subsystems"):
-                continue
+            # Auto-cleaned: ChildObjects в Configuration.xml и состав подсистем. Сам
+            # Configuration.xml при этом НЕ слепая зона — его form-слоты (DefaultReportForm
+            # и соседи) не чистятся автоматически и раньше терялись молча.
+            is_auto_cleaned = (rel_path_fwd in ("Configuration.xml", "ConfigDumpInfo.xml")
+                               or rel_path_fwd.startswith("Subsystems"))
 
             try:
                 with open(full_path, "r", encoding="utf-8-sig") as fh:
@@ -473,47 +561,30 @@ def main():
             except Exception:
                 continue
 
+            if ext == ".xml":
+                slot_matches = list(form_slot_re.finditer(content))
+                if slot_matches:
+                    form_slot_files[full_path] = rel_path
+                    for m in slot_matches:
+                        references.append({"File": rel_path,
+                                           "Pattern": f"<{m.group(1)}>{m.group(2)}"})
+
+            if is_auto_cleaned:
+                continue
+
+            # Общие паттерны ищем в тексте БЕЗ form-слотов: «Catalog.Товары» есть внутри
+            # «Catalog.Товары.Form.X», и файл со слотом попадал бы в список дважды. Вырезаем
+            # слоты, а не пропускаем файл целиком — иначе настоящая ссылка рядом со слотом
+            # осталась бы незамеченной, а её, в отличие от слота, автоматически не починить.
+            content_no_slots = form_slot_re.sub("", content) if full_path in form_slot_files else content
+
+            matched = False
             for pat in search_patterns:
-                if pat in content:
+                if pat in content_no_slots:
                     references.append({"File": rel_path, "Pattern": pat})
+                    matched = True
                     break
-
-    # Also check Type.Name references
-    type_name_ref = f"{obj_type}.{obj_name}"
-    already_found_files = {r["File"] for r in references}
-
-    for root_path, dirs, files in os.walk(config_dir):
-        for fname in files:
-            if not fname.lower().endswith(".xml"):
-                continue
-            full_path = os.path.join(root_path, fname)
-
-            if exclude_file and os.path.normcase(full_path) == os.path.normcase(exclude_file):
-                continue
-            skip = False
-            for ed in exclude_dirs:
-                if os.path.normcase(full_path).startswith(os.path.normcase(ed + os.sep)) or os.path.normcase(full_path) == os.path.normcase(ed):
-                    skip = True
-                    break
-            if skip:
-                continue
-
-            rel_path = os.path.relpath(full_path, config_dir)
-            rel_path_fwd = rel_path.replace("\\", "/")
-
-            if rel_path_fwd == "Configuration.xml" or rel_path_fwd == "ConfigDumpInfo.xml" or rel_path_fwd.startswith("Subsystems"):
-                continue
-
-            if rel_path in already_found_files:
-                continue
-
-            try:
-                with open(full_path, "r", encoding="utf-8-sig") as fh:
-                    content = fh.read()
-            except Exception:
-                continue
-
-            if type_name_ref in content:
+            if ext == ".xml" and not matched and type_name_ref in content_no_slots:
                 references.append({"File": rel_path, "Pattern": type_name_ref})
 
     if references:
@@ -533,24 +604,25 @@ def main():
 
         if not args.Force:
             print(f"[ERROR] Cannot remove: object has {len(references)} reference(s).")
-            print("        Use -Force to remove anyway, or fix references first.")
+            print("        The user decides: fix the references, keep the object, or")
+            print("        re-run with -Force — form references are cleared.")
             sys.exit(1)
         else:
             print("[WARN]  -Force specified, proceeding despite references")
     else:
         print("[OK]    No references found")
 
-    # --- 3. Remove from Configuration.xml ChildObjects ---
+    # --- 3. Remove from registry ChildObjects (Configuration.xml или файл внешнего источника) ---
     print()
-    print("--- Configuration.xml ---")
+    print(f"--- {registry_label} ---")
 
     xml_parser = etree.XMLParser(remove_blank_text=False)
-    tree = etree.parse(config_xml, xml_parser)
+    tree = etree.parse(registry_xml, xml_parser)
     xml_root = tree.getroot()
 
-    cfg_node = xml_root.find(f"{{{MD_NS}}}Configuration")
+    cfg_node = xml_root.find(f"{{{MD_NS}}}{registry_root}")
     if cfg_node is None:
-        print("[ERROR] Configuration element not found in Configuration.xml")
+        print(f"[ERROR] {registry_root} element not found in {registry_label}")
         errors += 1
     else:
         child_objects = cfg_node.find(f"{{{MD_NS}}}ChildObjects")
@@ -562,15 +634,9 @@ def main():
                 if localname(child) == obj_type and (child.text or "").strip() == obj_name:
                     found = True
                     if not args.DryRun:
-                        # Remove preceding whitespace (tail of previous sibling or text of parent)
-                        prev = child.getprevious()
-                        if prev is not None:
-                            if prev.tail and prev.tail.strip() == "":
-                                prev.tail = prev.tail.rsplit("\n", 1)[0] + "\n" if "\n" in prev.tail else ""
-                                if not prev.tail.strip():
-                                    # Keep just the last newline+indent before the next element
-                                    pass
-                        child_objects.remove(child)
+                        # Общий помощник — зеркало DOM-поведения PS. Прежняя ветка теряла
+                        # отступ следующего элемента, если удалялся ПЕРВЫЙ ребёнок.
+                        remove_node_with_indent(child)
                     print(f"[OK]    Removed <{obj_type}>{obj_name}</{obj_type}> from ChildObjects")
                     actions += 1
                     break
@@ -579,8 +645,8 @@ def main():
 
         # Save Configuration.xml
         if actions > 0 and not args.DryRun:
-            save_xml_bom(tree, config_xml)
-            print("[OK]    Configuration.xml saved")
+            save_xml_bom(tree, registry_xml)
+            print(f"[OK]    {registry_label} saved")
 
     # --- 4. Remove from subsystem Content ---
     print()
@@ -659,6 +725,53 @@ def main():
             print("[OK]    Not referenced in any subsystem")
     else:
         print("[OK]    No Subsystems directory")
+
+    # --- 4b. Clear form slots pointing at this object's forms ---
+
+    # Только слоты форм: пустой слот легален (164 508 пустых на корпус), поэтому замена
+    # однозначна. Ссылки на типы и вызовы в .bsl не трогаем — чем их заменить, неизвестно.
+    if form_slot_files:
+        print()
+        print("--- Form slots ---")
+        slot_prefix = f"{obj_type}.{obj_name}.Form."
+        common_form_ref = f"CommonForm.{obj_name}"
+        for slot_path in sorted(form_slot_files):
+            if args.DryRun:
+                print(f"[DRY-RUN] Would clear form slot(s) in {form_slot_files[slot_path]}")
+                continue
+            slot_parser = etree.XMLParser(remove_blank_text=False)
+            slot_tree = etree.parse(slot_path, slot_parser)
+            slot_root = slot_tree.getroot()
+            is_form_file = localname(slot_root) == "Form"
+            touched = []
+            for el in list(slot_root.iter()):
+                if not isinstance(el.tag, str) or len(el) > 0:
+                    continue
+                val = (el.text or "").strip()
+                if not val:
+                    continue
+                # Сравнение регистронезависимое — как у платформы (в PS -eq регистр не различает).
+                if val.lower() != common_form_ref.lower() and not val.lower().startswith(slot_prefix.lower()):
+                    continue
+
+                parent = el.getparent()
+                ln = localname(el)
+                if ln == "Form" and parent is not None and localname(parent) == "Item":
+                    touched.append(f"{localname(parent)}/{ln}")
+                    remove_node_with_indent(parent)
+                elif is_form_file:
+                    # Внутри Ext/Form.xml пустых <ChoiceForm/> и <SettingsStorage/> нет ни
+                    # одного — каноничное «не задано» там это отсутствие тега.
+                    touched.append(ln)
+                    remove_node_with_indent(el)
+                else:
+                    # text=None, а не "": Конфигуратор пустых пар не пишет.
+                    touched.append(ln)
+                    el.text = None
+            if not touched:
+                continue
+            save_xml_bom(slot_tree, slot_path)
+            print(f"[OK]    Cleared in {form_slot_files[slot_path]}: {', '.join(sorted(set(touched)))}")
 
     # --- 5. Delete object files ---
     print()

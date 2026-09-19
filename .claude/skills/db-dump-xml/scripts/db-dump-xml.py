@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# db-dump-xml v1.14 — Dump 1C configuration to XML files
+# db-dump-xml v1.21 — Dump 1C configuration to XML files
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 import argparse
@@ -13,6 +13,28 @@ import shutil
 import subprocess
 import sys
 import tempfile
+
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
 
 
 def _find_project_v8path():
@@ -45,13 +67,109 @@ V8_OWNED_KEYS = [
     "/DumpConfigToFiles", "/LoadConfigFromFiles", "/UpdateDBCfg",
     "/DumpExternalDataProcessorOrReportToFiles", "/LoadExternalDataProcessorOrReportFromFiles",
 ]
+# Пакетные команды платформы. В одной командной строке DESIGNER выполняет ТОЛЬКО ПОСЛЕДНЮЮ,
+# остальные молча отбрасывает (проверено на 8.3.24: /LoadConfigFromFiles вместе с
+# /CheckCanApplyConfigurationExtensions завершились кодом 0 с пустым логом, и загрузка НЕ
+# состоялась). Такая команда в дополнительных аргументах подменяет собой операцию навыка, а навык
+# отчитывается успехом. Дополнительные аргументы — это опции, а не режимы.
+V8_BATCH_KEYS = [
+    "/CheckConfig", "/CheckModules", "/CheckCanApplyConfigurationExtensions",
+    "/DumpDBCfgList", "/DeleteCfg", "/UpdateCfg", "/CompareCfg", "/MergeCfg",
+    "/ManageCfgSupport", "/RollbackCfg", "/ConvertFiles",
+]
+
 IBCMD_OWNED_KEYS = [
     "--db-path", "--data", "--out", "--file", "--load", "--restore",
     "--import", "--export", "--apply", "--force", "--create-database",
     "--user", "--password",
 ]
-V8_SECRET_KEYS = ["/P", "/UC", "/WSP", "/AWSP"]
+V8_SECRET_KEYS = ["/P", "/UC", "/WSP", "/AWSP", "/ConfigurationRepositoryP"]
 IBCMD_SECRET_KEYS = ["--password", "--token", "--db-pwd"]
+
+
+# --- Реквизиты хранилища из .v8-project.json ---
+# Модель их не передаёт: скрипт сопоставляет параметры соединения с записью в databases[]
+# и берёт repository оттуда. Тот же приём, что в cf-edit.py (сопоставление по configSrc).
+def _sg_find_v8project(start_dir):
+    d = start_dir
+    for _ in range(20):
+        if not d:
+            break
+        pj = os.path.join(d, ".v8-project.json")
+        if os.path.isfile(pj):
+            return pj
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+def same_path(a, b):
+    if not a or not b:
+        return False
+    try:
+        return os.path.abspath(a).rstrip("\\/").lower() == os.path.abspath(b).rstrip("\\/").lower()
+    except Exception:
+        return False
+
+
+def find_project_database(args):
+    """Запись базы в реестре, соответствующая переданному соединению. None, если не найдена."""
+    pf = _sg_find_v8project(os.getcwd())
+    if not pf:
+        return None
+    try:
+        with open(pf, encoding="utf-8-sig") as f:
+            proj = json.load(f)
+    except Exception:
+        return None
+    for db in proj.get("databases") or []:
+        if args.InfoBasePath and db.get("path") and same_path(db["path"], args.InfoBasePath):
+            return db
+        if args.InfoBaseServer and args.InfoBaseRef and db.get("server") and db.get("ref"):
+            if (db["server"].lower() == args.InfoBaseServer.lower()
+                    and db["ref"].lower() == args.InfoBaseRef.lower()):
+                return db
+    return None
+
+
+def resolve_repository_settings(args):
+    """Возвращает dict path/user/password/from_registry. Явные -Repository* сильнее реестра."""
+    db_rec = find_project_database(args)
+    rec = None
+    if db_rec:
+        if args.Extension:
+            # У расширения СВОЁ хранилище со своим путём (проверено): выбирается парой
+            # /ConfigurationRepositoryF"<путь расширения>" + -Extension "<Имя>".
+            for ext in db_rec.get("extensions") or []:
+                if (ext.get("name") or "").lower() == args.Extension.lower():
+                    rec = ext.get("repository")
+                    break
+        else:
+            rec = db_rec.get("repository")
+    path = args.RepositoryPath or ((rec or {}).get("path") or None)
+    user = args.RepositoryUser or ((rec or {}).get("user") or None)
+    # Пустой пароль = отсутствующий: 1С требует опускать ключ целиком, а не передавать пустое значение.
+    pwd = args.RepositoryPassword or ((rec or {}).get("password") or None)
+    return {
+        "path": path.strip().strip('"') if path else None,
+        "user": user,
+        "password": pwd,
+        "from_registry": bool(rec and rec.get("path")),
+    }
+
+
+def repository_args(repo):
+    """Ключи доступа к хранилищу. Форма — кавычки ВНУТРИ токена, как у /N и /P."""
+    a = []
+    if not repo or not repo.get("path"):
+        return a
+    a.append('/ConfigurationRepositoryF"%s"' % repo["path"])
+    if repo.get("user"):
+        a.append('/ConfigurationRepositoryN"%s"' % repo["user"])
+    if repo.get("password"):
+        a.append('/ConfigurationRepositoryP"%s"' % repo["password"])
+    return a
 
 
 def arg_key_match(token, key):
@@ -98,15 +216,21 @@ def assert_extra_args(extra, engine, hints):
             print(
                 f"Error: '{tok}' is a positional token — pass values as --key=value "
                 f"({param} cannot extend the ibcmd command)",
-                file=sys.stderr,
             )
             sys.exit(1)
+        if engine != "ibcmd":
+            for b in V8_BATCH_KEYS:
+                if arg_key_match(tok, b):
+                    print(
+                        f"Error: {b} is a batch command; passed via {param} it would replace "
+                        f"the skill's own operation (a command line runs only its last batch command)",
+                    )
+                    sys.exit(1)
         for k in owned:
             if arg_key_match(tok, k):
                 hint = f" (use {hints[k]})" if hints and k in hints else ""
                 print(
                     f"Error: {k} is controlled by the skill and cannot be passed via {param}{hint}",
-                    file=sys.stderr,
                 )
                 sys.exit(1)
 
@@ -174,14 +298,12 @@ def resolve_extra_args(engine, v8_extra, ibcmd_extra, hints):
         print(
             "Error: -AdditionalV8Arguments applies to 1cv8 only; the selected engine is ibcmd "
             "(use -AdditionalIbcmdArguments)",
-            file=sys.stderr,
         )
         sys.exit(1)
     if engine != "ibcmd" and ibcmd_extra:
         print(
             "Error: -AdditionalIbcmdArguments applies to ibcmd only; the selected engine is 1cv8 "
             "(use -AdditionalV8Arguments)",
-            file=sys.stderr,
         )
         sys.exit(1)
     if engine == "ibcmd":
@@ -223,14 +345,14 @@ def resolve_v8path(v8path):
             v8path = max(candidates, key=_version_key)
             print(f"Auto-selected platform {_version_dir(v8path)}: {v8path}")
         else:
-            print("Error: 1C executable not found. Specify -V8Path", file=sys.stderr)
+            print("Error: 1C executable not found. Specify -V8Path")
             sys.exit(1)
     if os.path.isdir(v8path):
         # PY-only: на *nix исполняемый называется "1cv8" (без .exe); ibcmd — только явным путём.
         exe = "1cv8.exe" if os.name == "nt" else "1cv8"
         v8path = os.path.join(v8path, exe)
     if not os.path.isfile(v8path):
-        print(f"Error: 1C executable not found at {v8path}", file=sys.stderr)
+        print(f"Error: 1C executable not found at {v8path}")
         sys.exit(1)
     return v8path
 
@@ -261,7 +383,7 @@ def assert_infobase_exists(path):
     if not path:
         return
     if not os.path.isfile(os.path.join(path, "1Cv8.1CD")):
-        print(f"Error: information base not found at {path} (no 1Cv8.1CD)", file=sys.stderr)
+        print(f"Error: information base not found at {path} (no 1Cv8.1CD)")
         sys.exit(1)
 
 
@@ -278,7 +400,7 @@ def clean_path(value, param=""):
     if len(v) > 3 and v[-1] in "\\/":
         v = v[:-1]
     if '"' in v:
-        print(f"Error: {param or 'path'} contains a quote character: {value}", file=sys.stderr)
+        print(f"Error: {param or 'path'} contains a quote character: {value}")
         sys.exit(1)
     return v
 
@@ -297,11 +419,31 @@ def run_v8(v8path, arguments):
     The arguments carry their own quotes inside the value (File="C:\\a b") — that is where
     1C's parser expects them, on Windows and on *nix alike. Windows list2cmdline would
     escape those quotes, so there the command line is handed over ready-made.
+
+    На POSIX аргументы уходят СПИСКОМ, и кавычки, нужные для склейки на Windows, стали бы
+    частью значения: путь с пробелом платформа не находит («Неопределена информационная
+    база»), многословный -comment теряет молча. Поэтому здесь снимается ОДИН слой
+    обрамляющих кавычек. Склеенные ключи (/N"user", /ConfigurationRepositoryF"путь",
+    File="…") не задеты: у них кавычки внутри токена, а не по краям.
     """
     if os.name == "nt":
         cmd = '"' + v8path + '" ' + " ".join(arguments)
     else:
-        cmd = [v8path] + arguments
+        def strip_framing_quotes(a):
+            # Кавычки, которыми мы обрамляем значения ради склейки на Windows, на POSIX
+            # становятся ЧАСТЬЮ значения. Проверено на darwin: путь с пробелом отдельным
+            # токеном даёт «Неопределена информационная база», а склеенный
+            # /ConfigurationRepositoryF"путь с пробелом" — «завершилось с ошибкой»;
+            # без кавычек обе формы работают.
+            if len(a) > 1 and a[0] == '"' and a[-1] == '"':
+                return a[1:-1]                       # "значение" отдельным токеном
+            if a[0:1] == "/" and a[-1:] == '"' and '"' in a[:-1]:
+                i = a.index('"')
+                return a[:i] + a[i + 1:-1]           # /N"имя" -> /Nимя
+            return a                                 # File="…" не трогаем: там кавычки —
+                                                     # часть синтаксиса строки соединения,
+                                                     # и с ними на POSIX всё работает
+        cmd = [v8path] + [strip_framing_quotes(a) for a in arguments]
     r = subprocess.run(cmd, input=b"", capture_output=True)
     r.stdout = decode_platform_bytes(r.stdout)
     r.stderr = decode_platform_bytes(r.stderr)
@@ -330,7 +472,7 @@ def run_ibcmd(cmd, has_username=False, warn_no_user=True):
     that residual case is flagged via IBCMD_NOUSER_HINT (model-facing).
     """
     if warn_no_user and os.name == "nt" and not has_username:
-        sys.stderr.write(IBCMD_NOUSER_HINT)
+        sys.stdout.write(IBCMD_NOUSER_HINT)
         sys.stderr.flush()
     r = subprocess.run(cmd, input=b"", capture_output=True)
     r.stdout = decode_platform_bytes(r.stdout)
@@ -366,14 +508,18 @@ def main():
     parser.add_argument("-InfoBaseRef", default="", help="Infobase name on server")
     parser.add_argument("-UserName", default="", help="1C user name")
     parser.add_argument("-Password", default="", help="1C user password")
+    parser.add_argument("-RepositoryPath", default="")
+    parser.add_argument("-RepositoryUser", default="")
+    parser.add_argument("-RepositoryPassword", default="")
     parser.add_argument("-ConfigDir", required=True, help="Directory for configuration dump")
     parser.add_argument(
         "-Mode",
-        default="Changes",
-        choices=["Full", "Changes", "Partial", "UpdateInfo"],
+        default="",
+        choices=["", "Full", "Changes", "Partial", "UpdateInfo"],
         help="Dump mode (default: Changes)",
     )
     parser.add_argument("-Objects", default="", help="Comma-separated metadata object names (for Partial mode)")
+    parser.add_argument("-ObjectsFile", default="")
     parser.add_argument("-Extension", default="", help="Extension name to dump")
     parser.add_argument("-AllExtensions", action="store_true", help="Dump all extensions")
     parser.add_argument(
@@ -388,7 +534,7 @@ def main():
                         help="Extra ibcmd arguments in --key=value form")
     known_opts = {s.lower() for a in parser._actions for s in a.option_strings}
     argv, v8_extra, ibcmd_extra = extract_extra_args(sys.argv[1:], known_opts)
-    args = parser.parse_args(argv)
+    args = ci_parse_args(parser, argv)
 
     args.V8Path = clean_path(args.V8Path, "-V8Path")
     args.InfoBasePath = clean_path(args.InfoBasePath, "-InfoBasePath")
@@ -414,15 +560,40 @@ def main():
     # --- Validate connection ---
     if engine == "ibcmd":
         if not args.InfoBasePath:
-            print("Error: ibcmd supports file infobases only (use -InfoBasePath)", file=sys.stderr)
+            print("Error: ibcmd supports file infobases only (use -InfoBasePath)")
             sys.exit(1)
     elif not args.InfoBasePath and (not args.InfoBaseServer or not args.InfoBaseRef):
-        print("Error: specify -InfoBasePath or -InfoBaseServer + -InfoBaseRef", file=sys.stderr)
+        print("Error: specify -InfoBasePath or -InfoBaseServer + -InfoBaseRef")
         sys.exit(1)
 
     # --- Validate Partial mode ---
+    # Список объектов приходит либо строкой, либо файлом: файл нужен, чтобы не перепечатывать
+    # то, что уже напечатал другой навык (например /db-repo update со списком полученных объектов).
+    if args.ObjectsFile:
+        if not os.path.exists(args.ObjectsFile):
+            print("Error: -ObjectsFile not found: %s" % args.ObjectsFile)
+            sys.exit(1)
+        with open(args.ObjectsFile, encoding="utf-8-sig") as f:
+            from_file = [s.strip() for s in f.read().splitlines()
+                         if s.strip() and not s.strip().startswith("#")]
+        inline = [s.strip() for s in args.Objects.split(",") if s.strip()]
+        args.Objects = ",".join(inline + from_file)
+    # Перечислены объекты — операция частичная. Иначе список молча игнорировался бы: умолчание
+    # Changes выгружает «изменённое с прошлой выгрузки», а не то, что просили.
+    if args.Objects:
+        if args.Mode == "UpdateInfo":
+            # Не «шире/уже», а другая операция: обновление ConfigDumpInfo без выгрузки файлов.
+            print("Error: -Mode UpdateInfo does not take an object list — it only refreshes "
+                  "ConfigDumpInfo.xml")
+            sys.exit(1)
+        if args.Mode in ("Full", "Changes"):
+            print("[note] перечислены объекты — выгружаются только они; -Mode %s не применён"
+                  % args.Mode)
+        args.Mode = "Partial"
+    if not args.Mode:
+        args.Mode = "Changes"
     if args.Mode == "Partial" and not args.Objects:
-        print("Error: -Objects required for Partial mode", file=sys.stderr)
+        print("Error: -Objects or -ObjectsFile required for Partial mode")
         sys.exit(1)
 
     # --- Create output dir if needed ---
@@ -433,12 +604,12 @@ def main():
     # --- ibcmd branch (file infobase only; hierarchical Full/Changes) ---
     if engine == "ibcmd":
         if args.Format == "Plain":
-            print("Error: ibcmd config export supports hierarchical format only (use -Format Hierarchical or 1cv8)", file=sys.stderr)
+            print("Error: ibcmd config export supports hierarchical format only (use -Format Hierarchical or 1cv8)")
             sys.exit(1)
         if args.AllExtensions:
             arguments = ["infobase", "config", "export", "all-extensions", args.ConfigDir, f"--db-path={args.InfoBasePath}"]
         elif args.Mode == "UpdateInfo":
-            print("Error: ibcmd config export does not support Mode UpdateInfo; use 1cv8", file=sys.stderr)
+            print("Error: ibcmd config export does not support Mode UpdateInfo; use 1cv8")
             sys.exit(1)
         elif args.Mode == "Partial":
             obj_list = [o.strip() for o in args.Objects.split(",") if o.strip()]
@@ -468,9 +639,9 @@ def main():
         if exit_code == 0:
             print(f"Configuration exported successfully to: {args.ConfigDir}")
         elif out_missing:
-            print(f"Error: exit code 0 but no files under {args.ConfigDir} — configuration was not exported", file=sys.stderr)
+            print(f"Error: exit code 0 but no files under {args.ConfigDir} — configuration was not exported")
         else:
-            print(f"Error exporting configuration (code: {exit_code})", file=sys.stderr)
+            print(f"Error exporting configuration (code: {exit_code})")
         sys.exit(exit_code)
 
     # --- Temp dir ---
@@ -490,6 +661,11 @@ def main():
             arguments.append(f'/N"{args.UserName}"')
         if args.Password:
             arguments.append(f'/P"{args.Password}"')
+
+        # База под хранилищем не примет НИ ОДНОЙ операции конфигуратора без этих реквизитов, а для
+        # базы вне хранилища они безвредны — поэтому подставляем всегда, когда они известны.
+        repo = resolve_repository_settings(args)
+        arguments.extend(repository_args(repo))
 
         arguments += ["/DumpConfigToFiles", f'"{args.ConfigDir}"']
         arguments += ["-Format", args.Format]
@@ -529,7 +705,7 @@ def main():
         arguments.extend(quote_if_needed(a) for a in extra_args)
 
         # --- Execute ---
-        print(f"Running: 1cv8.exe {_redact(' '.join(format_args_for_display(arguments, engine)), args.Password, args.UserName)}")
+        print(f"Running: 1cv8.exe {_redact(' '.join(format_args_for_display(arguments, engine)), args.Password, args.UserName, repo['password'])}")
         result = run_v8(v8path, arguments)
         exit_code = result.returncode
 
@@ -542,9 +718,9 @@ def main():
             print("Dump completed successfully")
             print(f"Configuration dumped to: {args.ConfigDir}")
         elif out_missing:
-            print(f"Error: exit code 0 but no files under {args.ConfigDir} — configuration was not dumped", file=sys.stderr)
+            print(f"Error: exit code 0 but no files under {args.ConfigDir} — configuration was not dumped")
         else:
-            print(f"Error dumping configuration (code: {exit_code})", file=sys.stderr)
+            print(f"Error dumping configuration (code: {exit_code})")
 
         if os.path.isfile(out_file):
             try:

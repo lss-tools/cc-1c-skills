@@ -1,18 +1,44 @@
 #!/usr/bin/env python3
-# epf-init v1.4 — Init 1C external data processor scaffold
+# epf-init v1.8 — Init 1C external data processor scaffold (+write_xml_file/write_utf8_bom: общий эталон записи)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 """Generates minimal XML source files for a 1C external data processor."""
 import sys, os, re, argparse, uuid
 
-def esc_xml(s):
-    return s.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;')
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
+
+def esc_xml_text(s):
+    # Эскейп ТЕКСТА элемента: только & < > — кавычку и апостроф платформа держит сырыми.
+    return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 def new_uuid():
     return str(uuid.uuid4())
 
 def write_utf8_bom(path, content):
+    # newline='' — без трансляции: иначе текстовый режим Python дал бы CRLF на Windows
+    # и LF на macOS, то есть вывод навыка зависел бы от ОС.
     with open(path, 'w', encoding='utf-8-sig', newline='') as f:
         f.write(content)
+
 
 def write_xml_file(path, content):
     """XML в каноне выгрузки Конфигуратора: CRLF в разделителях, без перевода в конце.
@@ -30,6 +56,10 @@ def format_rank(ver):
     return int(m.group(1)) * 100 + int(m.group(2)) if m else 0
 
 
+FORMAT_VERIFIED_MIN = "2.17"
+FORMAT_VERIFIED_MAX = "2.21"
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -40,9 +70,21 @@ def main():
     # Версия формата выгрузки. Своей конфигурации у автономного объекта нет, наследовать
     # версию неоткуда — поэтому её задают явно. Формы, макеты и справку внутри объекта
     # навыки берут уже отсюда: их детектор читает version из корня этого файла.
-    parser.add_argument('-FormatVersion', dest='FormatVersion', default='2.17',
-                        choices=['2.17', '2.18', '2.19', '2.20', '2.21'])
-    args = parser.parse_args()
+    parser.add_argument('-FormatVersion', dest='FormatVersion', default='2.17')
+    args = ci_parse_args(parser)
+
+    # Проверенный диапазон: 2.17 (8.3.24) … 2.21 (8.5). Полная лестница —
+    # docs/1c-configuration-spec.md, «Лестница версий». Версии ниже 2.17 (платформы 8.3.23 и
+    # старше) реальны, поэтому запретом их не закрываем: за пределами диапазона —
+    # ПРЕДУПРЕЖДЕНИЕ, скаффолд всё равно выпускается. Ошибка — только на нечисловое значение.
+    format_rank_value = format_rank(args.FormatVersion)
+    if format_rank_value == 0:
+        print(f"Malformed -FormatVersion '{args.FormatVersion}' (expected N.N, e.g. 2.17)", file=sys.stderr)
+        sys.exit(1)
+    if not (format_rank(FORMAT_VERIFIED_MIN) <= format_rank_value <= format_rank(FORMAT_VERIFIED_MAX)):
+        print(f"WARNING: Format version '{args.FormatVersion}' is outside the tested range "
+              f"{FORMAT_VERIFIED_MIN}-{FORMAT_VERIFIED_MAX} — the scaffold is emitted as requested "
+              f"but was not verified on that platform", file=sys.stderr)
 
     name = args.Name
     synonym = args.Synonym if args.Synonym else name
@@ -95,11 +137,11 @@ def main():
 \t\t\t</xr:GeneratedType>
 \t\t</InternalInfo>
 \t\t<Properties>
-\t\t\t<Name>{esc_xml(name)}</Name>
+\t\t\t<Name>{esc_xml_text(name)}</Name>
 \t\t\t<Synonym>
 \t\t\t\t<v8:item>
 \t\t\t\t\t<v8:lang>ru</v8:lang>
-\t\t\t\t\t<v8:content>{esc_xml(synonym)}</v8:content>
+\t\t\t\t\t<v8:content>{esc_xml_text(synonym)}</v8:content>
 \t\t\t\t</v8:item>
 \t\t\t</Synonym>
 \t\t\t<Comment/>

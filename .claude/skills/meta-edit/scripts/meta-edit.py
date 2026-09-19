@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# meta-edit v1.31 — Edit existing 1C metadata object XML
+# meta-edit v1.52 — Edit existing 1C metadata object XML
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 import argparse
@@ -10,6 +10,127 @@ import subprocess
 import sys
 import uuid
 from lxml import etree
+
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+
+def parse_json_input(text, source, expected=None, inline=False):
+    """Разбор пользовательского JSON: одна строка в stderr вместо traceback (issue #80).
+
+    expected заполняем только для полиморфного входа: у файла подсказка
+    была бы наполнителем — имя файла и текст парсера самодостаточны. inline печатает ещё и то,
+    что доехало: у файла такого вопроса нет, он лежит на диске и его видно целиком.
+
+    Импорты внутри тела: копия функции живёт в навыках с разными именами модулей
+    (skd-decompile импортирует json локально как _json), а тело обязано быть одинаковым.
+    """
+    import json as _pj
+    import sys as _psys
+    try:
+        if not str(text).strip():
+            raise ValueError("input is empty")
+        return _pj.loads(text)
+    except ValueError as exc:
+        what = "%s expects %s" % (source, expected) if expected else "Invalid JSON in %s" % source
+        if inline:
+            got = " ".join(str(text).split())
+            label = "got"
+            if not got:
+                got = "(empty)"
+            elif len(got) > 60:
+                label = "got (first 60 chars)"
+                got = got[:60]
+            what = "%s, %s: %s" % (what, label, got)
+        print("[ERROR] %s (%s)" % (what, exc), file=_psys.stderr)
+        _psys.exit(1)
+
+
+def read_json_file(path):
+    """Чтение входного JSON-файла с кодировкой из BOM (issue #80).
+
+    BOM — объявление самого файла, поэтому ему верим; без BOM ждём строгий UTF-8. Кодовую
+    страницу не подбираем: угаданное имя уехало бы в метаданные молча.
+    """
+    import os as _pos
+    import sys as _psys
+    if not _pos.path.exists(path):
+        print("[ERROR] File not found: %s" % path, file=_psys.stderr)
+        _psys.exit(1)
+    if _pos.path.isdir(path):
+        print("[ERROR] Expected a JSON file, got a directory: %s" % path, file=_psys.stderr)
+        _psys.exit(1)
+    with open(path, "rb") as _fh:
+        data = _fh.read()
+    if data[:3] == b"\xef\xbb\xbf":
+        return data[3:].decode("utf-8")
+    if data[:2] == b"\xff\xfe":
+        return data[2:].decode("utf-16-le")
+    if data[:2] == b"\xfe\xff":
+        return data[2:].decode("utf-16-be")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        print("[ERROR] %s is not valid UTF-8: %s - save the file as UTF-8, or add a BOM if it is UTF-16"
+              % (path, exc), file=_psys.stderr)
+        _psys.exit(1)
+
+
+class CIDict(dict):
+    # Ключи храним КАК ЕСТЬ: часть из них — имена объектов (табличные части, стандартные
+    # реквизиты), они попадают в XML. Регистронезависим только поиск. Порядок вставки
+    # сохраняется — от него зависит порядок эмиссии.
+    def _actual(self, key):
+        if not isinstance(key, str) or dict.__contains__(self, key):
+            return key
+        ci = self.__dict__.get('_ci')
+        if ci is None or len(ci) != len(self):
+            ci = {k.lower(): k for k in self if isinstance(k, str)}
+            self.__dict__['_ci'] = ci
+        return ci.get(key.lower(), key)
+
+    def __getitem__(self, key):
+        return dict.__getitem__(self, self._actual(key))
+
+    def __contains__(self, key):
+        return dict.__contains__(self, self._actual(key))
+
+    def get(self, key, default=None):
+        return dict.get(self, self._actual(key), default)
+
+    def pop(self, key, *default):
+        return dict.pop(self, self._actual(key), *default)
+
+    def __setitem__(self, key, value):
+        # запись по ключу, отличающемуся регистром, обновляет существующий, а не плодит дубль
+        dict.__setitem__(self, self._actual(key), value)
+
+def ci_json(obj):
+    """Рекурсивно оборачивает разобранный JSON: словари → CIDict, списки обходятся."""
+    if isinstance(obj, dict):
+        return CIDict((k, ci_json(v)) for k, v in obj.items())
+    if isinstance(obj, list):
+        return [ci_json(v) for v in obj]
+    return obj
+
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
 
 
 # ============================================================
@@ -201,6 +322,8 @@ CFG_NS = "http://v8.1c.ru/8.1/data/enterprise/current-config"
 # Версия формата правимого файла — из его же корня. Нужна эмиттерам: часть свойств
 # появилась в поздних версиях (напр. <Color> у значения перечисления — в 2.21).
 is_format_221 = False
+# Версия формата файла объекта: ею же помечается файл таблицы внешнего источника.
+format_version = "2.17"
 # Префикс current-config, объявленный в КОРНЕ правимого файла (у платформы — cfg).
 # None = корень его не объявляет → эмиттер ссылочных типов остаётся на локальной форме.
 cfg_prefix = None
@@ -258,7 +381,8 @@ def localname(el):
 
 
 def esc_xml(s):
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    # Эскейп ЗНАЧЕНИЯ АТРИБУТА: & < > и кавычка — внутри "..." литеральная " невалидна.
+    return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
 
 
 # ============================================================
@@ -297,12 +421,16 @@ enum_value_aliases = {
     'ИндексироватьСДопУпорядочиванием': 'IndexWithAdditionalOrder',
 }
 
+# Словарь ищет ПОЛЬЗОВАТЕЛЬСКИЙ ввод — поиск регистронезависим, как хеш-таблица PS1.
+enum_value_aliases = CIDict(enum_value_aliases)
+
 valid_enum_values = {
     'RegisterType': ['Balance', 'Turnovers'],
     'WriteMode': ['Independent', 'RecorderSubordinate'],
     'InformationRegisterPeriodicity': ['Nonperiodical', 'Second', 'Day', 'Month', 'Quarter', 'Year', 'RecorderPosition'],
     'DependenceOnCalculationTypes': ['DontUse', 'OnActionPeriod'],
-    'DataLockControlMode': ['Automatic', 'Managed'],
+    # AutomaticAndManaged — только у внешнего источника данных и его таблиц.
+    'DataLockControlMode': ['Automatic', 'Managed', 'AutomaticAndManaged'],
     'FullTextSearch': ['Use', 'DontUse'],
     'DataHistory': ['Use', 'DontUse'],
     'DefaultPresentation': ['AsDescription', 'AsCode'],
@@ -317,7 +445,7 @@ valid_enum_values = {
     'RegisterRecordsDeletion': ['AutoDelete', 'AutoDeleteOnUnpost', 'AutoDeleteOff'],
     'RegisterRecordsWritingOnPost': ['WriteModified', 'WriteSelected', 'WriteAll'],
     'ReturnValuesReuse': ['DontUse', 'DuringRequest', 'DuringSession'],
-    'ReuseSessions': ['DontUse', 'AutoUse'],
+    'ReuseSessions': ['DontUse', 'Use', 'AutoUse'],
     'FillChecking': ['DontCheck', 'ShowError', 'ShowWarning'],
     'Indexing': ['DontIndex', 'Index', 'IndexWithAdditionalOrder'],
 }
@@ -377,6 +505,9 @@ child_type_synonyms = {
     "templates": "templates", "макеты": "templates",
     "commands": "commands", "команды": "commands",
     "properties": "properties", "свойства": "properties",
+    "fields": "fields", "поля": "fields",
+    "tables": "tables", "таблицы": "tables",
+    "functions": "functions", "функции": "functions",
 }
 
 type_synonyms = {
@@ -409,6 +540,42 @@ type_synonyms = {
     "catalogref": "CatalogRef",
     "documentref": "DocumentRef",
     "enumref": "EnumRef",
+    # Ниже — записи, которых в этом навыке не было: словарь дополнен до набора meta-compile,
+    # который является авторитетом. Расхождение держит tests/skills/check-type-synonyms.mjs.
+    "время": "Time",
+    "time": "Time",
+    "base64binary": "ValueStorage",
+    "binarydata": "BinaryData",
+    "двоичныеданные": "BinaryData",
+    "хранилищезначений": "ValueStorage",
+    "uuid": "UUID",
+    "уникальныйидентификатор": "UUID",
+    "integer": "Number(10,0)",
+    "int": "Number(10,0)",
+    "int4": "Number(10,0)",
+    "bigint": "Number(19,0)",
+    "int8": "Number(19,0)",
+    "smallint": "Number(5,0)",
+    "int2": "Number(5,0)",
+    "varchar": "String",
+    "character varying": "String",
+    "numeric": "Number",
+    "decimal": "Number",
+    "timestamp": "DateTime",
+    "bytea": "BinaryData",
+    "таблицазначений": "ValueTable",
+    "деревозначений": "ValueTree",
+    "списокзначений": "ValueListType",
+    "стандартныйпериод": "StandardPeriod",
+    "внешнийисточникданныхтаблицассылка": "ExternalDataSourceTableRef",
+}
+
+# Платформенные типы, требующие префикса v8: (коллекции/периоды, частые в реквизитах
+# обработок и отчётов, где набор типов шире, чем у хранимых объектов). Копия реестра meta-compile.
+V8_PLATFORM_TYPES = {
+    "ValueTable", "ValueTree", "ValueList", "ValueListType", "StandardPeriod",
+    "StandardBeginningDate", "PointInTime", "TypeDescription", "FixedArray", "FixedMap",
+    "FixedStructure",
 }
 
 # ============================================================
@@ -416,37 +583,48 @@ type_synonyms = {
 # ============================================================
 
 
+# Алиас на локальный словарь: тело resolve_type_str ниже — общая реализация,
+# одинаковая во всех навыках (реестр в tests/skills/check-inline-drift.mjs).
+TYPE_SYNONYMS = type_synonyms
+
+
 def resolve_type_str(type_str):
     if not type_str:
         return type_str
-
-    # Parameterized: Number(15,2), Строка(100)
-    m = re.match(r"^([^(]+)\((.+)\)$", type_str)
+    # Прощающий ввод: ведущий префикс приходит копипастой из выгрузки. Без срезания он ломает
+    # поиск в словаре — русское имя типа остаётся непереведённым, и платформа отвечает
+    # «Неизвестное имя типа». cfg: снимаем всегда — он однозначно означает текущую конфигурацию.
+    # Сгенерированный dNpM: (в корпусе на этом URI встречаются d4p1, d5p1, d6p1 — имя префикса
+    # платформа выдаёт по порядку объявления) снимаем ТОЛЬКО у ссылочных типов, с точкой:
+    # сам по себе префикс многозначен — в формах d5p1:Chart, d5p1:TextDocument,
+    # d5p1:GeographicalSchema адресуют чужие пространства имён, и там он часть значения.
+    if type_str.startswith('cfg:'):
+        type_str = type_str[4:]
+    elif '.' in type_str and re.match(r'^d\d+p\d+:', type_str):
+        type_str = type_str[type_str.index(':') + 1:]
+    # Параметризованные типы: Number(15,2), Строка(100)
+    m = re.match(r'^([^(]+)\((.+)\)$', type_str)
     if m:
         base_name = m.group(1).strip()
         params = m.group(2)
-        resolved = type_synonyms.get(base_name.lower())
+        resolved = TYPE_SYNONYMS.get(base_name.lower())
         if resolved:
-            return f"{resolved}({params})"
+            return f'{resolved}({params})'
         return type_str
-
-    # Reference: СправочникСсылка.Организации
-    if "." in type_str:
-        dot_idx = type_str.index(".")
+    # Ссылочные типы: СправочникСсылка.Организации -> CatalogRef.Организации
+    if '.' in type_str:
+        dot_idx = type_str.index('.')
         prefix = type_str[:dot_idx]
-        suffix = type_str[dot_idx:]
-        resolved = type_synonyms.get(prefix.lower())
+        suffix = type_str[dot_idx:]  # includes the dot
+        resolved = TYPE_SYNONYMS.get(prefix.lower())
         if resolved:
-            return f"{resolved}{suffix}"
+            return f'{resolved}{suffix}'
         return type_str
-
-    # Simple
-    resolved = type_synonyms.get(type_str.lower())
+    # Простое имя
+    resolved = TYPE_SYNONYMS.get(type_str.lower())
     if resolved:
         return resolved
     return type_str
-
-
 def build_type_content_xml(indent, type_str):
     if not type_str:
         return ""
@@ -524,6 +702,54 @@ def build_type_content_xml(indent, type_str):
         lines.append(f"{indent}</v8:DateQualifiers>")
         return "\r\n".join(lines)
 
+    # Time — третья доля даты, наравне с Date/DateTime.
+    if type_str == "Time":
+        lines.append(f"{indent}<v8:Type>xs:dateTime</v8:Type>")
+        lines.append(f"{indent}<v8:DateQualifiers>")
+        lines.append(f"{indent}\t<v8:DateFractions>Time</v8:DateFractions>")
+        lines.append(f"{indent}</v8:DateQualifiers>")
+        return "\r\n".join(lines)
+
+    # UUID
+    if type_str == "UUID":
+        lines.append(f"{indent}<v8:Type>v8:UUID</v8:Type>")
+        return "\r\n".join(lines)
+
+    # BinaryData — xs:base64Binary СО своими квалификаторами (в отличие от ХранилищаЗначения).
+    # Формы и умолчание — как в meta-compile, который здесь авторитет системы типов.
+    if re.match(r"^BinaryData(\(|$)", type_str, re.I):
+        m_bin = re.match(r"^BinaryData(?:\((\d+)(?:,\s*(fixed|variable))?\))?$", type_str, re.I)
+        if not m_bin:
+            print(f"Неверный тип '{type_str}': ждётся BinaryData, BinaryData(Длина) или BinaryData(Длина,fixed|variable).", file=sys.stderr)
+            sys.exit(1)
+        blen = m_bin.group(1) or "4294967292"
+        if m_bin.group(2):
+            ballowed = "Fixed" if m_bin.group(2).lower() == "fixed" else "Variable"
+        else:
+            ballowed = "Variable" if m_bin.group(1) else "Fixed"
+        lines.append(f"{indent}<v8:Type>xs:base64Binary</v8:Type>")
+        lines.append(f"{indent}<v8:BinaryDataQualifiers>")
+        lines.append(f"{indent}\t<v8:Length>{blen}</v8:Length>")
+        lines.append(f"{indent}\t<v8:AllowedLength>{ballowed}</v8:AllowedLength>")
+        lines.append(f"{indent}</v8:BinaryDataQualifiers>")
+        return "\r\n".join(lines)
+
+    # Платформенные типы (коллекции/периоды) — префикс v8:, объявлен в шапке файла.
+    if type_str in V8_PLATFORM_TYPES:
+        lines.append(f"{indent}<v8:Type>v8:{type_str}</v8:Type>")
+        return "\r\n".join(lines)
+
+    # Характеристика ПВХ — множество типов, как и ОпределяемыйТип.
+    if re.match(r"^Characteristic\.(.+)$", type_str):
+        lines.append(f"{indent}<v8:TypeSet>cfg:{type_str}</v8:TypeSet>")
+        return "\r\n".join(lines)
+
+    # Голый метатип-категория без имени объекта — «любой объект категории», это TypeSet.
+    if re.match(r"^(CatalogRef|DocumentRef|EnumRef|ChartOfAccountsRef|ChartOfCharacteristicTypesRef|"
+                r"ChartOfCalculationTypesRef|ExchangePlanRef|BusinessProcessRef|TaskRef|AnyRef|AnyIBRef)$", type_str):
+        lines.append(f"{indent}<v8:TypeSet>cfg:{type_str}</v8:TypeSet>")
+        return "\r\n".join(lines)
+
     # DefinedType
     m = re.match(r"^DefinedType\.(.+)$", type_str)
     if m:
@@ -540,7 +766,8 @@ def build_type_content_xml(indent, type_str):
     # объявление не добавит, так что иначе получился бы неразрешимый префикс.
     m = re.match(
         r"^(CatalogRef|DocumentRef|EnumRef|ChartOfAccountsRef|ChartOfCharacteristicTypesRef|"
-        r"ChartOfCalculationTypesRef|ExchangePlanRef|BusinessProcessRef|TaskRef)\.(.+)$",
+        r"ChartOfCalculationTypesRef|ExchangePlanRef|BusinessProcessRef|BusinessProcessRoutePointRef|"
+        r"TaskRef|ExternalDataSourceTableRef)\.(.+)$",
         type_str,
     )
     if m:
@@ -615,17 +842,23 @@ def import_fragment(xml_string):
 
 def get_child_indent(container):
     """Detect indentation of children inside a container element."""
+    # В контейнере с детьми первый пробельный узел — это отступ ПЕРЕД первым ребёнком.
+    # В пустом (только что раскрытом) единственный пробельный узел — отступ ЗАКРЫВАЮЩЕГО
+    # тега, то есть уровень самого контейнера: ребёнку нужен на табуляцию глубже. Без этой
+    # поправки первый ребёнок вставал вровень с <ChildObjects>.
+    has_elements = len(container) > 0
+    extra = "" if has_elements else "\t"
     # Check container.text (text before first child)
     if container.text and "\n" in container.text:
         after_nl = container.text.rsplit("\n", 1)[-1]
         if after_nl and not after_nl.strip():
-            return after_nl
+            return after_nl + extra
     # Check tail of child elements
     for child in container:
         if child.tail and "\n" in child.tail:
             after_nl = child.tail.rsplit("\n", 1)[-1]
             if after_nl and not after_nl.strip():
-                return after_nl
+                return after_nl + extra
     # Fallback: count depth
     depth = 0
     current = container
@@ -830,6 +1063,10 @@ def parse_attribute_shorthand(val):
         "indexing": normalize_enum_value("Indexing", str(val.get("indexing", ""))) if val.get("indexing") else "",
         "after": str(val.get("after", "")),
         "before": str(val.get("before", "")),
+        # Поле таблицы внешнего источника (контекст eds-field).
+        "nameInDataSource": str(val.get("nameInDataSource", "")),
+        "readOnly": val.get("readOnly") is True,
+        "allowNull": val.get("allowNull") is True,
     }
     # Map flags to properties
     if "req" in result["flags"] and not result["fillChecking"]:
@@ -865,6 +1102,8 @@ def get_attribute_context():
     """Determine attribute context from object type."""
     if obj_type == "Catalog":
         return "catalog"
+    if obj_type == "Table":
+        return "eds-field"
     if obj_type == "Document":
         return "document"
     if obj_type in ("InformationRegister", "AccumulationRegister", "AccountingRegister", "CalculationRegister"):
@@ -920,7 +1159,7 @@ RESERVED_BY_CONTEXT = {
 }
 
 
-def build_attribute_fragment(parsed, context, indent):
+def build_attribute_fragment(parsed, context, indent, elem_tag="Attribute"):
     """Build XML fragment string for an Attribute element."""
     if not context:
         context = get_attribute_context()
@@ -932,13 +1171,13 @@ def build_attribute_fragment(parsed, context, indent):
         if attr_name.lower() in ctx_reserved:
             print(f"meta-edit: имя реквизита '{attr_name}' зарезервировано стандартным реквизитом объекта '{context}'. Выберите другое имя.", file=sys.stderr)
             sys.exit(1)
-    elif context not in ('tabular', 'processor-tabular') and (attr_name in RESERVED_ATTR_NAMES or attr_name in RESERVED_ATTR_NAMES_RU):
+    elif context not in ('tabular', 'processor-tabular', 'eds-field') and (attr_name in RESERVED_ATTR_NAMES or attr_name in RESERVED_ATTR_NAMES_RU):
         print(f"WARNING: Attribute '{attr_name}' conflicts with a standard attribute name. This may cause errors when loading into 1C.", file=sys.stderr)
 
     uid = new_uuid()
     lines = []
 
-    lines.append(f'{indent}<Attribute uuid="{uid}">')
+    lines.append(f'{indent}<{elem_tag} uuid="{uid}">')
     lines.append(f"{indent}\t<Properties>")
     lines.append(f"{indent}\t\t<Name>{esc_xml_text(parsed['name'])}</Name>")
     lines.append(build_mltext_xml(f"{indent}\t\t", "Synonym", parsed["synonym"]))
@@ -977,21 +1216,35 @@ def build_attribute_fragment(parsed, context, indent):
         fill_checking = parsed["fillChecking"]
     lines.append(f"{indent}\t\t<FillChecking>{fill_checking}</FillChecking>")
 
-    lines.append(f"{indent}\t\t<ChoiceFoldersAndItems>Items</ChoiceFoldersAndItems>")
+    # Поле внешнего источника (eds-field) не имеет ChoiceFoldersAndItems и LinkByType, а ChoiceForm
+    # у него стоит ПОСЛЕ ChoiceHistoryOnInput — порядок снят с выгрузки платформы.
+    if context != "eds-field":
+        lines.append(f"{indent}\t\t<ChoiceFoldersAndItems>Items</ChoiceFoldersAndItems>")
     lines.append(f"{indent}\t\t<ChoiceParameterLinks/>")
     lines.append(f"{indent}\t\t<ChoiceParameters/>")
     lines.append(f"{indent}\t\t<QuickChoice>Auto</QuickChoice>")
     lines.append(f"{indent}\t\t<CreateOnInput>Auto</CreateOnInput>")
-    lines.append(f"{indent}\t\t<ChoiceForm/>")
-    lines.append(f"{indent}\t\t<LinkByType/>")
+    if context != "eds-field":
+        lines.append(f"{indent}\t\t<ChoiceForm/>")
+        lines.append(f"{indent}\t\t<LinkByType/>")
     lines.append(f"{indent}\t\t<ChoiceHistoryOnInput>Auto</ChoiceHistoryOnInput>")
+
+    if context == "eds-field":
+        lines.append(f"{indent}\t\t<ChoiceForm/>")
+        nids = parsed.get("nameInDataSource") or parsed["name"]
+        lines.append(f"{indent}\t\t<NameInDataSource>{esc_xml_text(str(nids))}</NameInDataSource>")
+        ro = "true" if (parsed.get("readOnly") is True or "readonly" in parsed["flags"]) else "false"
+        lines.append(f"{indent}\t\t<ReadOnly>{ro}</ReadOnly>")
+        an = "true" if (parsed.get("allowNull") is True or "nullable" in parsed["flags"]) else "false"
+        lines.append(f"{indent}\t\t<AllowNull>{an}</AllowNull>")
 
     # Use -- catalog only
     if context == "catalog":
         lines.append(f"{indent}\t\t<Use>ForItem</Use>")
 
     # Indexing/FullTextSearch/DataHistory -- not for non-stored objects
-    if context not in ("processor", "processor-tabular"):
+    # Поля внешнего источника: индексами чужой таблицы 1С не владеет.
+    if context not in ("processor", "processor-tabular", "eds-field"):
         indexing = "DontIndex"
         if "index" in parsed["flags"]:
             indexing = "Index"
@@ -1004,7 +1257,7 @@ def build_attribute_fragment(parsed, context, indent):
         lines.append(f"{indent}\t\t<DataHistory>Use</DataHistory>")
 
     lines.append(f"{indent}\t</Properties>")
-    lines.append(f"{indent}</Attribute>")
+    lines.append(f"{indent}</{elem_tag}>")
     return "\r\n".join(lines)
 
 
@@ -1316,33 +1569,31 @@ def build_column_fragment(col_def, indent):
     return "\r\n".join(lines)
 
 
-def build_simple_child_fragment(tag_name, name, indent):
-    """Build XML fragment for Form, Template, Command -- just a name wrapper."""
+def build_command_fragment(name, indent):
+    """Build XML fragment for a Command (it has no separate file -- all inline).
+
+    Property order is the platform's -- do not reorder.
+    """
     uid = new_uuid()
     synonym = split_camel_case(name)
     lines = []
-    lines.append(f'{indent}<{tag_name} uuid="{uid}">')
+    lines.append(f'{indent}<Command uuid="{uid}">')
     lines.append(f"{indent}\t<Properties>")
     lines.append(f"{indent}\t\t<Name>{esc_xml_text(name)}</Name>")
     lines.append(build_mltext_xml(f"{indent}\t\t", "Synonym", synonym))
     lines.append(f"{indent}\t\t<Comment/>")
-    # Forms get additional properties
-    if tag_name == "Form":
-        lines.append(f"{indent}\t\t<FormType>Ordinary</FormType>")
-        lines.append(f"{indent}\t\t<IncludeHelpInContents>false</IncludeHelpInContents>")
-        lines.append(f"{indent}\t\t<UsePurposes/>")
-    if tag_name == "Template":
-        lines.append(f"{indent}\t\t<TemplateType>SpreadsheetDocument</TemplateType>")
-    if tag_name == "Command":
-        lines.append(f"{indent}\t\t<Group>FormNavigationPanelGoTo</Group>")
-        lines.append(f"{indent}\t\t<Representation>Auto</Representation>")
-        lines.append(f"{indent}\t\t<ToolTip/>")
-        lines.append(f"{indent}\t\t<Picture/>")
-        lines.append(f"{indent}\t\t<Shortcut/>")
+    lines.append(f"{indent}\t\t<Group>FormNavigationPanelGoTo</Group>")
+    lines.append(f"{indent}\t\t<CommandParameterType/>")
+    lines.append(f"{indent}\t\t<ParameterUseMode>Single</ParameterUseMode>")
+    lines.append(f"{indent}\t\t<ModifiesData>false</ModifiesData>")
+    lines.append(f"{indent}\t\t<Representation>Auto</Representation>")
+    lines.append(f"{indent}\t\t<ToolTip/>")
+    lines.append(f"{indent}\t\t<Picture/>")
+    lines.append(f"{indent}\t\t<Shortcut/>")
+    lines.append(f"{indent}\t\t<OnMainServerUnavalableBehavior>Auto</OnMainServerUnavalableBehavior>")
     lines.append(f"{indent}\t</Properties>")
-    lines.append(f"{indent}</{tag_name}>")
+    lines.append(f"{indent}</Command>")
     return "\r\n".join(lines)
-
 
 # ============================================================
 # Name uniqueness check
@@ -1360,7 +1611,13 @@ def get_all_child_names():
             if localname(gc) == "Properties":
                 props_el = gc
                 break
+        # Часть детей регистрируется голым текстом, без <Properties>: <Table>Имя</Table>,
+        # <Form>Имя</Form>, <Template>Имя</Template>. Пропуская их, проверка «уже существует»
+        # становилась мёртвой — повторное добавление давало второй такой же узел.
         if props_el is None:
+            n = (child.text or "").strip()
+            if n:
+                names[n] = localname(child)
             continue
         for gc in props_el:
             if localname(gc) == "Name":
@@ -1393,11 +1650,13 @@ valid_child_types = {
     "CalculationRegister": ["dimensions", "resources", "attributes", "forms", "templates", "commands"],
     "DocumentJournal": ["columns", "forms", "templates", "commands"],
     "Constant": ["forms"],
+    "ExternalDataSource": ["tables", "functions"],
+    "Table": ["fields", "forms", "templates", "commands"],
 }
 
 # Canonical child order in ChildObjects
 child_order = [
-    "Resource", "Dimension", "Attribute", "TabularSection",
+    "Resource", "Dimension", "Attribute", "TabularSection", "Field", "Table", "Function",
     "AccountingFlag", "ExtDimensionAccountingFlag",
     "EnumValue", "Column", "AddressingAttribute", "Recalculation",
     "Form", "Template", "Command",
@@ -1414,11 +1673,277 @@ child_type_to_xml_tag = {
     "forms": "Form",
     "templates": "Template",
     "commands": "Command",
+    "fields": "Field",
+    "tables": "Table",
+    "functions": "Function",
 }
 
 # ============================================================
-# DSL key normalization
+# Section 8b: Внешние источники данных — копии из meta-compile
 # ============================================================
+# Тела ниже скопированы из meta-compile и обязаны совпадать с ним байт в байт:
+# таблица внешнего источника собирается в ОТДЕЛЬНЫЙ файл, и формат этого файла
+# должен быть один и тот же, кем бы он ни был создан. Держит check-inline-drift.mjs.
+
+xmlns_decl = 'xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:app="http://v8.1c.ru/8.2/managed-application/core" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:cmi="http://v8.1c.ru/8.2/managed-application/cmi" xmlns:ent="http://v8.1c.ru/8.1/data/enterprise" xmlns:lf="http://v8.1c.ru/8.2/managed-application/logform" xmlns:style="http://v8.1c.ru/8.1/data/ui/style" xmlns:sys="http://v8.1c.ru/8.1/data/ui/fonts/system" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:v8ui="http://v8.1c.ru/8.1/data/ui" xmlns:web="http://v8.1c.ru/8.1/data/ui/colors/web" xmlns:win="http://v8.1c.ru/8.1/data/ui/colors/windows" xmlns:xen="http://v8.1c.ru/8.3/xcf/enums" xmlns:xpr="http://v8.1c.ru/8.3/xcf/predef" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
+lines = []
+
+
+def X(text):
+    lines.append(text)
+
+# ML-значение: строка → один <v8:item> ru; dict {lang: content} → item на язык (в порядке ключей).
+
+def emit_ml_items(indent, val):
+    if isinstance(val, dict):
+        for k, v in val.items():
+            X(f'{indent}<v8:item>')
+            X(f'{indent}\t<v8:lang>{k}</v8:lang>')
+            X(f'{indent}\t<v8:content>{esc_xml_text(str(v))}</v8:content>')
+            X(f'{indent}</v8:item>')
+    else:
+        X(f'{indent}<v8:item>')
+        X(f'{indent}\t<v8:lang>ru</v8:lang>')
+        X(f'{indent}\t<v8:content>{esc_xml_text(str(val))}</v8:content>')
+        X(f'{indent}</v8:item>')
+
+def emit_mltext(indent, tag, text):
+    # Пусто (None / '') → самозакрывающийся тег.
+    if text is None or (isinstance(text, str) and text == ''):
+        X(f'{indent}<{tag}/>')
+        return
+    X(f'{indent}<{tag}>')
+    emit_ml_items(f'{indent}\t', text)
+    X(f'{indent}</{tag}>')
+
+
+def emit_md_ref_list(indent, tag, items):
+    """Список MDObjectRef (Documents/RegisterRecords/DocumentMap/…) с <xr:Item>. omit-on-empty."""
+    arr = list(items) if items else []
+    if arr:
+        X(f'{indent}<{tag}>')
+        for it in arr:
+            X(f'{indent}\t<xr:Item xsi:type="xr:MDObjectRef">{esc_xml_text(normalize_md_object_ref(str(it)))}</xr:Item>')
+        X(f'{indent}</{tag}>')
+    else:
+        X(f'{indent}<{tag}/>')
+
+def get_eds_tables(val):
+    """Таблицы: dict имя → массив полей ЛИБО объект со свойствами и ключом fields/columns."""
+    tables = {}
+    if not val:
+        return tables
+
+    def entry(v):
+        if isinstance(v, list):
+            return {'props': None, 'fields': list(v)}
+        f = v.get('fields') if v.get('fields') is not None else v.get('columns')
+        return {'props': v, 'fields': list(f) if f else []}
+
+    if isinstance(val, list):
+        for t in val:
+            tables[str(t.get('name'))] = entry(t)
+    else:
+        for k, v in val.items():
+            tables[k] = entry(v)
+    return tables
+
+def get_eds_field_ref(src_name, table_name, field_name):
+    """Ссылка на поле таблицы: в DSL короткое имя, в XML — полный путь."""
+    if not field_name:
+        return ''
+    if str(field_name).startswith('ExternalDataSource.'):
+        return str(field_name)
+    return f'ExternalDataSource.{src_name}.Table.{table_name}.Field.{field_name}'
+
+def emit_eds_field_ref_list(indent, tag, names, src_name, table_name):
+    items = [n for n in (names or []) if n]
+    if not items:
+        X(f'{indent}<{tag}/>')
+        return
+    X(f'{indent}<{tag}>')
+    for n in items:
+        X(f'{indent}\t<xr:Field>{esc_xml_text(get_eds_field_ref(src_name, table_name, n))}</xr:Field>')
+    X(f'{indent}</{tag}>')
+
+def emit_eds_field_ref_scalar(indent, tag, name, src_name, table_name):
+    if not name:
+        X(f'{indent}<{tag}/>')
+        return
+    X(f'{indent}<{tag}>{esc_xml_text(get_eds_field_ref(src_name, table_name, name))}</{tag}>')
+
+def emit_eds_function(indent, fn_name, val, type_xml):
+    """Функция внешнего источника. Параметров как объектов метаданных нет: они записаны прямо
+    в выражении как &1, &2 (см. reference/external-data-source.md).
+
+    type_xml — уже собранный узел <Type> возвращаемого значения: его рендерит вызывающий навык
+    своим эмиттером типов. Так тело функции не зависит от того, какой это навык."""
+    fn_synonym = None
+    fn_comment = ''
+    returns = ''
+    return_value = True
+    if isinstance(val, str):
+        expr = val
+    else:
+        expr = str(val.get('expression') or val.get('expressionInDataSource') or '')
+        returns = str(val.get('returns') or val.get('returnType') or '')
+        if val.get('returnValue') is not None:
+            return_value = val.get('returnValue') is True
+        fn_synonym = val.get('synonym')
+        fn_comment = str(val['comment']) if val.get('comment') else ''
+    if not expr:
+        print(f"ERROR: Функция '{fn_name}' внешнего источника данных: не задано выражение (ключ expression).",
+              file=sys.stderr)
+        sys.exit(1)
+    X(f'{indent}<Function uuid="{new_uuid()}">')
+    X(f'{indent}\t<Properties>')
+    X(f'{indent}\t\t<Name>{esc_xml_text(fn_name)}</Name>')
+    emit_mltext(f'{indent}\t\t', 'Synonym', fn_synonym)
+    if fn_comment:
+        X(f'{indent}\t\t<Comment>{esc_xml_text(fn_comment)}</Comment>')
+    else:
+        X(f'{indent}\t\t<Comment/>')
+    X(f'{indent}\t\t<ReturnValue>{"true" if return_value else "false"}</ReturnValue>')
+    if return_value and type_xml:
+        X(type_xml.rstrip('\r\n'))
+    else:
+        X(f'{indent}\t\t<Type/>')
+    X(f'{indent}\t\t<ExpressionInDataSource>{esc_xml_text(expr)}</ExpressionInDataSource>')
+    X(f'{indent}\t</Properties>')
+    X(f'{indent}</Function>')
+
+def emit_eds_table_properties(indent, src_name, table_name, t, char_xml, default_forms_xml):
+    """Свойства таблицы: 38 узлов в порядке выгрузки платформы.
+
+    char_xml и default_forms_xml — уже собранные блоки <Characteristics> и четыре слота
+    <Default*Form>: их рендерит вызывающий навык своим эмиттером. Так тело не зависит
+    от хелперов конкретного навыка и годится для копирования (check-inline-drift)."""
+    i = indent
+    t = t or {}
+    tbl_synonym = t['synonym'] if t.get('synonym') is not None else split_camel_case(table_name)
+    X(f'{i}<Name>{esc_xml_text(table_name)}</Name>')
+    emit_mltext(i, 'Synonym', tbl_synonym)
+    if t.get('comment'):
+        X(f'{i}<Comment>{esc_xml_text(str(t["comment"]))}</Comment>')
+    else:
+        X(f'{i}<Comment/>')
+
+    table_type = str(t.get('tableType') or 'Table')
+    X(f'{i}<TableType>{table_type}</TableType>')
+    # Имя в источнике по умолчанию равно имени объекта — так поступает и платформа.
+    if t.get('nameInDataSource'):
+        nids = str(t['nameInDataSource'])
+    elif table_type == 'Expression':
+        nids = ''
+    else:
+        nids = table_name
+    X(f'{i}<NameInDataSource>{esc_xml_text(nids)}</NameInDataSource>' if nids else f'{i}<NameInDataSource/>')
+    expr = str(t.get('expressionInDataSource') or t.get('expression') or '')
+    X(f'{i}<ExpressionInDataSource>{esc_xml_text(expr)}</ExpressionInDataSource>' if expr else f'{i}<ExpressionInDataSource/>')
+    X(f'{i}<TableDataType>{t.get("tableDataType") or "NonobjectData"}</TableDataType>')
+
+    emit_eds_field_ref_list(i, 'KeyFields', t.get('keyFields'), src_name, table_name)
+    emit_eds_field_ref_scalar(i, 'PresentationField', t.get('presentationField'), src_name, table_name)
+    emit_eds_field_ref_scalar(i, 'ParentField', t.get('parentField'), src_name, table_name)
+    # Признака незаполненного родителя отдельным узлом нет: NULL против «Заданного значения»
+    # различаются формой самого значения (xsi:nil против типизированного).
+    # ВАЖНО: платформа при загрузке XML сбрасывает заданное значение в пустую строку — проверено
+    # на её собственной выгрузке. Задать его можно только интерактивно, поэтому дефолт у таблицы
+    # с полем родителя — пустая строка (как после загрузки), а без него — nil.
+    if t.get('parentField'):
+        X(f'{i}<UnfilledParentValue xsi:type="xs:string"/>')
+    else:
+        X(f'{i}<UnfilledParentValue xsi:nil="true"/>')
+    if char_xml:
+        X(char_xml.rstrip('\r\n'))
+    else:
+        X(f'{i}<Characteristics/>')
+
+    X(f'{i}<UseStandardCommands>{"false" if t.get("useStandardCommands") is False else "true"}</UseStandardCommands>')
+    X(f'{i}<QuickChoice>{"true" if t.get("quickChoice") is True else "false"}</QuickChoice>')
+    # Ввод по строке: ключа нет → выводим из поля представления (так делает платформа при загрузке).
+    # Явный список, в том числе пустой, уважаем как есть — отсюда presence-aware проверка.
+    if 'inputByString' in t:
+        ibs = t.get('inputByString')
+    elif t.get('presentationField'):
+        ibs = [t['presentationField']]
+    else:
+        ibs = None
+    emit_eds_field_ref_list(i, 'InputByString', ibs, src_name, table_name)
+    X(f'{i}<CreateOnInput>{t.get("createOnInput") or "Auto"}</CreateOnInput>')
+    X(f'{i}<SearchStringModeOnInputByString>{t.get("searchStringModeOnInputByString") or "Begin"}</SearchStringModeOnInputByString>')
+    X(f'{i}<ChoiceDataGetModeOnInputByString>{t.get("choiceDataGetModeOnInputByString") or "Directly"}</ChoiceDataGetModeOnInputByString>')
+    X(f'{i}<ChoiceHistoryOnInput>{t.get("choiceHistoryOnInput") or "Auto"}</ChoiceHistoryOnInput>')
+
+    # Пустая строка — четыре слота всё равно обязаны быть: в свойствах таблицы их ровно 38.
+    if default_forms_xml:
+        X(default_forms_xml.rstrip('\r\n'))
+    else:
+        for form_tag in ('DefaultObjectForm', 'DefaultRecordForm', 'DefaultListForm', 'DefaultChoiceForm'):
+            X(f'{i}<{form_tag}/>')
+    for pres_tag in ('ObjectPresentation', 'ExtendedObjectPresentation', 'RecordPresentation',
+                     'ExtendedRecordPresentation', 'ListPresentation', 'ExtendedListPresentation', 'Explanation'):
+        key = pres_tag[0].lower() + pres_tag[1:]
+        emit_mltext(i, pres_tag, t.get(key))
+    X(f'{i}<IncludeHelpInContents>{"true" if t.get("includeHelpInContents") is True else "false"}</IncludeHelpInContents>')
+    X(f'{i}<ReadOnly>{"true" if t.get("readOnly") is True else "false"}</ReadOnly>')
+    X(f'{i}<TransactionsIsolationLevel>{t.get("transactionsIsolationLevel") or "Auto"}</TransactionsIsolationLevel>')
+    emit_eds_field_ref_scalar(i, 'DataVersionField', t.get('dataVersionField'), src_name, table_name)
+    X(f'{i}<EditType>{t.get("editType") or "InDialog"}</EditType>')
+    emit_md_ref_list(i, 'BasedOn', t.get('basedOn'))
+    emit_eds_field_ref_list(i, 'DataLockFields', t.get('dataLockFields'), src_name, table_name)
+    X(f'{i}<DataLockControlMode>{t.get("dataLockControlMode") or "Automatic"}</DataLockControlMode>')
+
+EDS_TABLE_GENERATED_TYPES = (
+    ('ExternalDataSourceTableManager', 'Manager'),
+    ('ExternalDataSourceTableObject', 'Object'),
+    ('ExternalDataSourceTableRef', 'Ref'),
+    ('ExternalDataSourceTableList', 'List'),
+    ('ExternalDataSourceTableRecord', 'Record'),
+    ('ExternalDataSourceTableRecordSet', 'RecordSet'),
+    ('ExternalDataSourceTableRecordKey', 'RecordKey'),
+    ('ExternalDataSourceTableRecordManager', 'RecordManager'),
+)
+
+
+def build_eds_table_xml(src_name, table_name, entry, fields_xml, char_xml, default_forms_xml):
+    """Отдельный XML-документ таблицы. fields_xml, char_xml, default_forms_xml — уже собранные
+    узлы: их рендерит вызывающий навык своими эмиттерами, поэтому тело не зависит от того,
+    какой это навык.
+    Возвращает строку: X пишет в общий список строк,
+    поэтому «перехват» — запомнить длину, отдать эмиттерам, срезать добавленное
+    (в ps1-порте тот же приём выражен через StringBuilder — различие рантаймов, не логики)."""
+    before = len(lines)
+
+    X('<?xml version="1.0" encoding="UTF-8"?>')
+    X(f'<MetaDataObject {xmlns_decl} version="{format_version}">')
+    X(f'\t<Table uuid="{new_uuid()}">')
+    # InternalInfo у таблицы эмитится здесь, а не через generated_types: имя элемента
+    # трёхчастное (Префикс.Источник.Таблица), общая карта такой формы не знает.
+    X('\t\t<InternalInfo>')
+    for prefix, category in EDS_TABLE_GENERATED_TYPES:
+        X(f'\t\t\t<xr:GeneratedType name="{prefix}.{src_name}.{table_name}" category="{category}">')
+        X(f'\t\t\t\t<xr:TypeId>{new_uuid()}</xr:TypeId>')
+        X(f'\t\t\t\t<xr:ValueId>{new_uuid()}</xr:ValueId>')
+        X('\t\t\t</xr:GeneratedType>')
+    X('\t\t</InternalInfo>')
+
+    X('\t\t<Properties>')
+    emit_eds_table_properties('\t\t\t', src_name, table_name, entry['props'], char_xml, default_forms_xml)
+    X('\t\t</Properties>')
+
+    if fields_xml:
+        X('\t\t<ChildObjects>')
+        X(fields_xml.rstrip('\r\n'))
+        X('\t\t</ChildObjects>')
+    else:
+        X('\t\t<ChildObjects/>')
+    X('\t</Table>')
+    X('</MetaDataObject>')
+
+    chunk = '\r\n'.join(lines[before:])
+    del lines[before:]
+    return chunk
 
 
 def resolve_operation_key(key):
@@ -1718,11 +2243,13 @@ def process_add(add_def):
             warn(f"Unknown add child type: {raw_key}")
             continue
 
-        # Validate allowed
-        allowed = valid_child_types.get(obj_type)
-        if allowed and child_type not in allowed:
-            warn(f"{child_type} not allowed for {obj_type}, skipping")
-            continue
+        # Validate allowed. Проверяем НАЛИЧИЕ ключа, а не истинность списка: пустой список
+        # (объект без допустимых детей) трактовался как «ограничений нет», и чужой ребёнок
+        # молча записывался в объект.
+        if obj_type in valid_child_types:
+            if child_type not in valid_child_types[obj_type]:
+                warn(f"{child_type} not allowed for {obj_type}, skipping")
+                continue
 
         xml_tag = child_type_to_xml_tag.get(child_type)
         if not xml_tag:
@@ -1748,6 +2275,86 @@ def process_add(add_def):
                 info(f"Added attribute: {parsed['name']}")
                 add_count += 1
                 existing_names[parsed["name"]] = "Attribute"
+
+        elif child_type == "tables":
+            # Таблица внешнего источника — ОТДЕЛЬНЫЙ файл рядом с файлом источника плюс имя
+            # в его ChildObjects. Единственная операция навыка, создающая файл: без неё
+            # добавить таблицу в существующий источник было нечем (пересборка источника
+            # целиком меняет его uuid и оставляет файлы выброшенных таблиц сиротами).
+            src_dir = os.path.join(os.path.dirname(resolved_path), obj_name)
+            tables_dir = os.path.join(src_dir, "Tables")
+            for tbl_name, entry in get_eds_tables(items).items():
+                # Характеристики и слоты форм точечным добавлением не задаются: первые требуют
+                # эмиттера характеристик (живёт в meta-compile), вторые назначает form-add при
+                # добавлении формы. Молча проглотить ключ нельзя — модель решит, что он сработал.
+                tv = entry['props'] or {}
+                bad_key = next((k for k in ('characteristics', 'defaultObjectForm', 'defaultRecordForm',
+                                            'defaultListForm', 'defaultChoiceForm') if tv.get(k)), None)
+                if bad_key:
+                    warn(f"Ключ '{bad_key}' не поддержан при добавлении таблицы: форму назначает навык form-add, характеристики — навык meta-compile. Таблица '{tbl_name}' пропущена.")
+                    continue
+                if tbl_name in existing_names:
+                    warn(f"Table '{tbl_name}' already exists, skipping")
+                    continue
+                table_path = os.path.join(tables_dir, f"{tbl_name}.xml")
+                if os.path.exists(table_path):
+                    warn(f"\u0424\u0430\u0439\u043b \u0442\u0430\u0431\u043b\u0438\u0446\u044b \u0443\u0436\u0435 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u0435\u0442: {table_path} \u2014 \u043f\u0440\u043e\u043f\u0443\u0441\u043a\u0430\u044e")
+                    continue
+                field_parts = []
+                for f in entry["fields"]:
+                    field_parts.append(build_attribute_fragment(parse_attribute_shorthand(f), "eds-field", "\t\t\t", "Field"))
+                fields_xml = "\r\n".join(field_parts)
+                table_xml = build_eds_table_xml(obj_name, tbl_name, entry, fields_xml, '', '')
+                os.makedirs(tables_dir, exist_ok=True)
+                with open(table_path, "w", encoding="utf-8-sig", newline="") as fh:
+                    fh.write(table_xml.rstrip("\r\n"))
+                nodes = import_fragment(f"{indent}<Table>{esc_xml_text(tbl_name)}</Table>")
+                ref_node = find_insertion_point("Table", {"name": tbl_name})
+                for node in nodes:
+                    insert_before_element(child_objects_el, node, ref_node, indent)
+                info(f"Added table: {tbl_name} ({table_path})")
+                add_count += 1
+                existing_names[tbl_name] = "Table"
+
+        elif child_type == "functions":
+            # Функция живёт узлом внутри файла источника — отдельного файла у неё нет.
+            for fn_name, fn_val in items.items():
+                if fn_name in existing_names:
+                    warn(f"Function '{fn_name}' already exists, skipping")
+                    continue
+                if isinstance(fn_val, str):
+                    fn_returns, fn_no_value = "String", False
+                else:
+                    fn_returns = str(fn_val.get("returns") or fn_val.get("returnType") or "String")
+                    fn_no_value = fn_val.get("returnValue") is not None and fn_val.get("returnValue") is not True
+                fn_type_xml = "" if fn_no_value else build_value_type_xml(f"{indent}\t\t", fn_returns)
+                before = len(lines)
+                emit_eds_function(indent, fn_name, fn_val, fn_type_xml)
+                fragment_xml = "\r\n".join(lines[before:])
+                del lines[before:]
+                nodes = import_fragment(fragment_xml)
+                ref_node = find_insertion_point("Function", {"name": fn_name})
+                for node in nodes:
+                    insert_before_element(child_objects_el, node, ref_node, indent)
+                info(f"Added function: {fn_name}")
+                add_count += 1
+                existing_names[fn_name] = "Function"
+
+        elif child_type == "fields":
+            # Поле таблицы внешнего источника: тот же парсер реквизита, свой тег и контекст.
+            for item in items:
+                parsed = parse_attribute_shorthand(item)
+                if parsed["name"] in existing_names:
+                    warn(f"Field '{parsed['name']}' already exists, skipping")
+                    continue
+                fragment_xml = build_attribute_fragment(parsed, "eds-field", indent, "Field")
+                nodes = import_fragment(fragment_xml)
+                ref_node = find_insertion_point("Field", parsed)
+                for node in nodes:
+                    insert_before_element(child_objects_el, node, ref_node, indent)
+                info(f"Added field: {parsed['name']}")
+                add_count += 1
+                existing_names[parsed["name"]] = "Field"
 
         elif child_type == "tabularSections":
             for item in items:
@@ -1832,26 +2439,42 @@ def process_add(add_def):
                 add_count += 1
                 existing_names[col_name] = "Column"
 
-        elif child_type in ("forms", "templates", "commands"):
-            tag_map = {"forms": "Form", "templates": "Template", "commands": "Command"}
-            tag = tag_map[child_type]
+        elif child_type in ("forms", "templates"):
+            # Форма и макет регистрируются голым текстом (<Form>Имя</Form>) и требуют ещё и
+            # собственных файлов. И то и другое делают form-add / template-add -- дублировать
+            # эту ответственность здесь нельзя: получится висячая регистрация без файла.
+            skill_name = "form-add" if child_type == "forms" else "template-add"
+            what_name = "Форму" if child_type == "forms" else "Макет"
+            warn(
+                f"{what_name} добавляет навык {skill_name} "
+                "(он создаёт и файл, и запись в ChildObjects). "
+                "meta-edit этого не делает — операция пропущена."
+            )
+
+        elif child_type == "commands":
             for item in items:
                 if isinstance(item, str):
                     item_name = item
                 else:
                     item_name = str(item.get("name", ""))
                 if item_name in existing_names:
-                    warn(f"{tag} '{item_name}' already exists, skipping")
+                    warn(f"Command '{item_name}' already exists, skipping")
                     continue
-                fragment_xml = build_simple_child_fragment(tag, item_name, indent)
+                # У команды есть модуль обработчика (Commands/<Имя>/Ext/CommandModule.bsl) — в корпусе
+                # он есть у всех команд без исключения. Пишем ту же заготовку, что и meta-compile.
+                cmd_ext_dir = os.path.join(os.path.dirname(resolved_path), obj_name, "Commands", item_name, "Ext")
+                cmd_mod_path = os.path.join(cmd_ext_dir, "CommandModule.bsl")
+                os.makedirs(cmd_ext_dir, exist_ok=True)
+                with open(cmd_mod_path, "w", encoding="utf-8-sig", newline="") as fh:
+                    fh.write("&НаКлиенте\r\nПроцедура ОбработкаКоманды(ПараметрКоманды, ПараметрыВыполненияКоманды)\r\n\r\n\t// Вставьте обработчик команды.\r\n\r\nКонецПроцедуры\r\n")
+                fragment_xml = build_command_fragment(item_name, indent)
                 nodes = import_fragment(fragment_xml)
-                ref_node = find_insertion_point(tag, {"after": "", "before": ""})
+                ref_node = find_insertion_point("Command", {"after": "", "before": ""})
                 for node in nodes:
                     insert_before_element(child_objects_el, node, ref_node, indent)
-                info(f"Added {tag.lower()}: {item_name}")
+                info(f"Added command: {item_name} ({cmd_mod_path})")
                 add_count += 1
-                existing_names[item_name] = tag
-
+                existing_names[item_name] = "Command"
 
 # ============================================================
 # REMOVE operations
@@ -1869,6 +2492,16 @@ def process_remove(remove_def):
             continue
         if child_type == "properties":
             warn("Cannot remove properties -- use modify instead")
+            continue
+        if child_type in ("forms", "templates"):
+            # Снять регистрацию мало — надо удалить и файлы; это делают form-remove / template-remove.
+            skill_name = "form-remove" if child_type == "forms" else "template-remove"
+            what_name = "Форму" if child_type == "forms" else "Макет"
+            warn(
+                f"{what_name} удаляет навык {skill_name} "
+                "(он убирает и файлы, и запись в ChildObjects). "
+                "meta-edit этого не делает — операция пропущена."
+            )
             continue
 
         xml_tag = child_type_to_xml_tag.get(child_type)
@@ -1954,6 +2587,11 @@ def modify_properties(props_def):
         if len(list(prop_el)) > 0:
             print(f"meta-edit: modify-property: свойство '{prop_name}' структурное (содержит дочерние узлы) — установка скалярного текста повредит XML; не поддерживается", file=sys.stderr)
             sys.exit(1)
+
+        # Значение свойства-перечисления приводим к канону (как это делает meta-compile): иначе
+        # в XML уезжает то, что дала модель, и платформа отвергает выгрузку уже при загрузке.
+        # Неизвестное свойство функция пропускает как есть, неизвестное значение — отвергает.
+        value_str = normalize_enum_value(prop_name, value_str)
 
         # Set inner text — clear children first, set text
         for ch in list(prop_el):
@@ -3162,7 +3800,7 @@ def main():
     parser.add_argument("-Operation", default=None, choices=valid_operations, help="Inline operation")
     parser.add_argument("-Value", default=None, help="Inline value")
     parser.add_argument("-NoValidate", action="store_true", help="Skip auto-validation")
-    args = parser.parse_args()
+    args = ci_parse_args(parser)
 
     # --- Mode validation ---
     if args.DefinitionFile and args.Operation:
@@ -3175,8 +3813,7 @@ def main():
     if args.DefinitionFile:
         if not os.path.exists(args.DefinitionFile):
             die(f"Definition file not found: {args.DefinitionFile}")
-        with open(args.DefinitionFile, "r", encoding="utf-8-sig") as f:
-            definition = json.load(f)
+        definition = ci_json(parse_json_input(read_json_file(args.DefinitionFile), args.DefinitionFile))
 
     # --- Resolve object path ---
     object_path = args.ObjectPath
@@ -3214,11 +3851,12 @@ def main():
     xml_root = xml_tree.getroot()
 
     # Префикс current-config берём из объявлений корня — им и пишем ссылочные типы.
-    global cfg_prefix, is_format_221
+    global cfg_prefix, is_format_221, format_version
     cfg_prefix = next((p for p, u in (xml_root.nsmap or {}).items() if u == CFG_NS and p), None)
     _fv = xml_root.get("version") or "2.17"
     _m = re.match(r'^(\d+)\.(\d+)$', _fv)
     is_format_221 = bool(_m) and int(_m.group(1)) * 100 + int(_m.group(2)) >= 221
+    format_version = _fv
 
     # --- Detect object type ---
     if localname(xml_root) != "MetaDataObject":

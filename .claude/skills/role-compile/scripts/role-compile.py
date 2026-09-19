@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# role-compile v1.18 — Compile 1C role from JSON
+# role-compile v1.45 — Compile 1C role from JSON
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 import argparse
 import json
@@ -7,8 +7,130 @@ import os
 import re
 import sys
 import uuid
+import xml.etree.ElementTree as ET
 
 from lxml import etree
+
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+
+def parse_json_input(text, source, expected=None, inline=False):
+    """Разбор пользовательского JSON: одна строка в stderr вместо traceback (issue #80).
+
+    expected заполняем только для полиморфного входа: у файла подсказка
+    была бы наполнителем — имя файла и текст парсера самодостаточны. inline печатает ещё и то,
+    что доехало: у файла такого вопроса нет, он лежит на диске и его видно целиком.
+
+    Импорты внутри тела: копия функции живёт в навыках с разными именами модулей
+    (skd-decompile импортирует json локально как _json), а тело обязано быть одинаковым.
+    """
+    import json as _pj
+    import sys as _psys
+    try:
+        if not str(text).strip():
+            raise ValueError("input is empty")
+        return _pj.loads(text)
+    except ValueError as exc:
+        what = "%s expects %s" % (source, expected) if expected else "Invalid JSON in %s" % source
+        if inline:
+            got = " ".join(str(text).split())
+            label = "got"
+            if not got:
+                got = "(empty)"
+            elif len(got) > 60:
+                label = "got (first 60 chars)"
+                got = got[:60]
+            what = "%s, %s: %s" % (what, label, got)
+        print("[ERROR] %s (%s)" % (what, exc), file=_psys.stderr)
+        _psys.exit(1)
+
+
+def read_json_file(path):
+    """Чтение входного JSON-файла с кодировкой из BOM (issue #80).
+
+    BOM — объявление самого файла, поэтому ему верим; без BOM ждём строгий UTF-8. Кодовую
+    страницу не подбираем: угаданное имя уехало бы в метаданные молча.
+    """
+    import os as _pos
+    import sys as _psys
+    if not _pos.path.exists(path):
+        print("[ERROR] File not found: %s" % path, file=_psys.stderr)
+        _psys.exit(1)
+    if _pos.path.isdir(path):
+        print("[ERROR] Expected a JSON file, got a directory: %s" % path, file=_psys.stderr)
+        _psys.exit(1)
+    with open(path, "rb") as _fh:
+        data = _fh.read()
+    if data[:3] == b"\xef\xbb\xbf":
+        return data[3:].decode("utf-8")
+    if data[:2] == b"\xff\xfe":
+        return data[2:].decode("utf-16-le")
+    if data[:2] == b"\xfe\xff":
+        return data[2:].decode("utf-16-be")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        print("[ERROR] %s is not valid UTF-8: %s - save the file as UTF-8, or add a BOM if it is UTF-16"
+              % (path, exc), file=_psys.stderr)
+        _psys.exit(1)
+
+
+class CIDict(dict):
+    # Ключи храним КАК ЕСТЬ: часть из них — имена объектов (табличные части, стандартные
+    # реквизиты), они попадают в XML. Регистронезависим только поиск. Порядок вставки
+    # сохраняется — от него зависит порядок эмиссии.
+    def _actual(self, key):
+        if not isinstance(key, str) or dict.__contains__(self, key):
+            return key
+        ci = self.__dict__.get('_ci')
+        if ci is None or len(ci) != len(self):
+            ci = {k.lower(): k for k in self if isinstance(k, str)}
+            self.__dict__['_ci'] = ci
+        return ci.get(key.lower(), key)
+
+    def __getitem__(self, key):
+        return dict.__getitem__(self, self._actual(key))
+
+    def __contains__(self, key):
+        return dict.__contains__(self, self._actual(key))
+
+    def get(self, key, default=None):
+        return dict.get(self, self._actual(key), default)
+
+    def pop(self, key, *default):
+        return dict.pop(self, self._actual(key), *default)
+
+    def __setitem__(self, key, value):
+        # запись по ключу, отличающемуся регистром, обновляет существующий, а не плодит дубль
+        dict.__setitem__(self, self._actual(key), value)
+
+def ci_json(obj):
+    """Рекурсивно оборачивает разобранный JSON: словари → CIDict, списки обходятся."""
+    if isinstance(obj, dict):
+        return CIDict((k, ci_json(v)) for k, v in obj.items())
+    if isinstance(obj, list):
+        return [ci_json(v) for v in obj]
+    return obj
+
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
 
 
 # ============================================================
@@ -189,6 +311,16 @@ def assert_edit_allowed(target_path, require):
 
 def detect_format_version(d):
     while d:
+        # Автономная внешняя обработка/отчёт: своего Configuration.xml у неё нет, версию несёт
+        # корень самой обработки. Без этого форма и макет внутри обработки 2.21 писались бы 2.17.
+        ext_path = d + ".xml"
+        if os.path.isfile(ext_path):
+            with open(ext_path, "r", encoding="utf-8-sig") as f:
+                ext_head = f.read(2000)
+            if re.search(r'<(ExternalDataProcessor|ExternalReport)[ >]', ext_head):
+                m = re.search(r'<MetaDataObject[^>]+version="(\d+\.\d+)"', ext_head)
+                if m:
+                    return m.group(1)
         cfg_path = os.path.join(d, "Configuration.xml")
         if os.path.isfile(cfg_path):
             with open(cfg_path, "r", encoding="utf-8-sig") as f:
@@ -218,6 +350,11 @@ def detect_eol(text):
     return '\r\n' if '\r\n' in text else '\n'
 
 def esc_xml(s):
+    # Эскейп ЗНАЧЕНИЯ АТРИБУТА: & < > и кавычка — внутри "..." литеральная " невалидна.
+    return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+
+def esc_xml_text(s):
     """Экранирование ТЕКСТА элемента: только & < > . Кавычки платформа в тексте не экранирует
     (92142 сырых кавычки на корпус, ни одной &quot;); &quot; она принимает, но нормализует обратно."""
     return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
@@ -230,7 +367,7 @@ def emit_mltext(lines, indent, tag, text):
     lines.append(f"{indent}<{tag}>")
     lines.append(f"{indent}\t<v8:item>")
     lines.append(f"{indent}\t\t<v8:lang>ru</v8:lang>")
-    lines.append(f"{indent}\t\t<v8:content>{esc_xml(text)}</v8:content>")
+    lines.append(f"{indent}\t\t<v8:content>{esc_xml_text(text)}</v8:content>")
     lines.append(f"{indent}\t</v8:item>")
     lines.append(f"{indent}</{tag}>")
 
@@ -240,8 +377,11 @@ def new_uuid():
 
 
 def write_utf8_bom(path, content):
+    # newline='' — без трансляции: иначе текстовый режим Python дал бы CRLF на Windows
+    # и LF на macOS, то есть вывод навыка зависел бы от ОС.
     with open(path, 'w', encoding='utf-8-sig', newline='') as f:
         f.write(content)
+
 
 
 # --- Russian synonyms -> canonical English names ---
@@ -253,15 +393,18 @@ TYPE_ALIASES = {
     "РегистрНакопления": "AccumulationRegister",
     "РегистрБухгалтерии": "AccountingRegister",
     "РегистрРасчета": "CalculationRegister",
+    "РегистрРасчёта": "CalculationRegister",
     "Константа": "Constant",
     "ПланСчетов": "ChartOfAccounts",
     "ПланВидовХарактеристик": "ChartOfCharacteristicTypes",
     "ПланВидовРасчета": "ChartOfCalculationTypes",
+    "ПланВидовРасчёта": "ChartOfCalculationTypes",
     "ПланОбмена": "ExchangePlan",
     "БизнесПроцесс": "BusinessProcess",
     "Задача": "Task",
     "Обработка": "DataProcessor",
     "Отчет": "Report",
+    "Отчёт": "Report",
     "ОбщаяФорма": "CommonForm",
     "ОбщаяКоманда": "CommonCommand",
     "Подсистема": "Subsystem",
@@ -274,7 +417,24 @@ TYPE_ALIASES = {
     "ПараметрСеанса": "SessionParameter",
     "ОбщийРеквизит": "CommonAttribute",
     "Конфигурация": "Configuration",
+    "ВнешнийИсточникДанных": "ExternalDataSource",
+    # Типы без прав в ролях: алиасы нужны не ради генерации, а ради отказа по делу —
+    # иначе на русскую запись навык ответит «неизвестный тип 'ОбщийМодуль'».
     "Перечисление": "Enum",
+    "ОбщийМодуль": "CommonModule",
+    "ОпределяемыйТип": "DefinedType",
+    "ОбщаяКартинка": "CommonPicture",
+    "ОбщийМакет": "CommonTemplate",
+    "Язык": "Language",
+    "ФункциональнаяОпция": "FunctionalOption",
+    "ПараметрФункциональныхОпций": "FunctionalOptionsParameter",
+    "ПодпискаНаСобытие": "EventSubscription",
+    "РегламентноеЗадание": "ScheduledJob",
+    "ЭлементСтиля": "StyleItem",
+    "ХранилищеНастроек": "SettingsStorage",
+    "ПакетXDTO": "XDTOPackage",
+    "WSСсылка": "WSReference",
+    "Нумератор": "DocumentNumerator",
     # Nested
     "Реквизит": "Attribute",
     "СтандартныйРеквизит": "StandardAttribute",
@@ -369,7 +529,9 @@ KNOWN_RIGHTS = {
     ],
     "AccumulationRegister": ["Read", "Update", "View", "Edit", "TotalsControl"],
     "AccountingRegister": ["Read", "Update", "View", "Edit", "TotalsControl"],
-    "CalculationRegister": ["Read", "View"],
+    "CalculationRegister": [
+        "Read", "Update", "View", "Edit",
+    ],
     "Constant": [
         "Read", "Update", "View", "Edit",
         "ReadDataHistory", "ViewDataHistory", "UpdateDataHistory",
@@ -377,14 +539,13 @@ KNOWN_RIGHTS = {
         "EditDataHistoryVersionComment", "SwitchToDataHistoryVersion",
     ],
     "ChartOfAccounts": [
-        "Read", "Insert", "Update", "Delete", "View", "Edit", "InputByString",
-        "InteractiveInsert", "InteractiveSetDeletionMark", "InteractiveClearDeletionMark",
-        "InteractiveDelete",
-        "InteractiveDeletePredefinedData", "InteractiveSetDeletionMarkPredefinedData",
-        "InteractiveClearDeletionMarkPredefinedData", "InteractiveDeleteMarkedPredefinedData",
-        "ReadDataHistory", "ReadDataHistoryOfMissingData",
-        "UpdateDataHistory", "UpdateDataHistoryOfMissingData",
-        "UpdateDataHistorySettings", "UpdateDataHistoryVersionComment",
+        "Read", "Insert", "Update", "Delete",
+        "View", "Edit", "InputByString", "InteractiveInsert",
+        "InteractiveSetDeletionMark", "InteractiveClearDeletionMark", "InteractiveDelete", "InteractiveDeleteMarked",
+        "InteractiveDeletePredefinedData", "InteractiveSetDeletionMarkPredefinedData", "InteractiveClearDeletionMarkPredefinedData", "InteractiveDeleteMarkedPredefinedData",
+        "ReadDataHistory", "ReadDataHistoryOfMissingData", "UpdateDataHistory", "UpdateDataHistoryOfMissingData",
+        "UpdateDataHistorySettings", "UpdateDataHistoryVersionComment", "ViewDataHistory", "EditDataHistoryVersionComment",
+        "SwitchToDataHistoryVersion",
     ],
     "ChartOfCharacteristicTypes": [
         "Read", "Insert", "Update", "Delete", "View", "Edit", "InputByString",
@@ -398,11 +559,13 @@ KNOWN_RIGHTS = {
         "EditDataHistoryVersionComment", "SwitchToDataHistoryVersion",
     ],
     "ChartOfCalculationTypes": [
-        "Read", "Insert", "Update", "Delete", "View", "Edit", "InputByString",
-        "InteractiveInsert", "InteractiveSetDeletionMark", "InteractiveClearDeletionMark",
-        "InteractiveDelete",
-        "InteractiveDeletePredefinedData", "InteractiveSetDeletionMarkPredefinedData",
-        "InteractiveClearDeletionMarkPredefinedData", "InteractiveDeleteMarkedPredefinedData",
+        "Read", "Insert", "Update", "Delete",
+        "View", "Edit", "InputByString", "InteractiveInsert",
+        "InteractiveSetDeletionMark", "InteractiveClearDeletionMark", "InteractiveDelete", "InteractiveDeleteMarked",
+        "InteractiveDeletePredefinedData", "InteractiveSetDeletionMarkPredefinedData", "InteractiveClearDeletionMarkPredefinedData", "InteractiveDeleteMarkedPredefinedData",
+        "ReadDataHistory", "ReadDataHistoryOfMissingData", "UpdateDataHistory", "UpdateDataHistoryOfMissingData",
+        "UpdateDataHistorySettings", "UpdateDataHistoryVersionComment", "ViewDataHistory", "EditDataHistoryVersionComment",
+        "SwitchToDataHistoryVersion",
     ],
     "ExchangePlan": [
         "Read", "Insert", "Update", "Delete", "View", "Edit", "InputByString",
@@ -414,14 +577,20 @@ KNOWN_RIGHTS = {
         "EditDataHistoryVersionComment", "SwitchToDataHistoryVersion",
     ],
     "BusinessProcess": [
-        "Read", "Insert", "Update", "Delete", "View", "Edit", "InputByString",
-        "Start", "InteractiveInsert", "InteractiveSetDeletionMark", "InteractiveClearDeletionMark",
-        "InteractiveDelete", "InteractiveActivate", "InteractiveStart",
+        "Read", "Insert", "Update", "Delete",
+        "View", "Edit", "InputByString", "Start",
+        "InteractiveInsert", "InteractiveSetDeletionMark", "InteractiveClearDeletionMark", "InteractiveDelete",
+        "InteractiveDeleteMarked", "InteractiveActivate", "InteractiveStart", "ReadDataHistory",
+        "ReadDataHistoryOfMissingData", "UpdateDataHistory", "UpdateDataHistoryOfMissingData", "UpdateDataHistorySettings",
+        "UpdateDataHistoryVersionComment", "ViewDataHistory", "EditDataHistoryVersionComment", "SwitchToDataHistoryVersion",
     ],
     "Task": [
-        "Read", "Insert", "Update", "Delete", "View", "Edit", "InputByString",
-        "Execute", "InteractiveInsert", "InteractiveSetDeletionMark", "InteractiveClearDeletionMark",
-        "InteractiveDelete", "InteractiveActivate", "InteractiveExecute",
+        "Read", "Insert", "Update", "Delete",
+        "View", "Edit", "InputByString", "Execute",
+        "InteractiveInsert", "InteractiveSetDeletionMark", "InteractiveClearDeletionMark", "InteractiveDelete",
+        "InteractiveDeleteMarked", "InteractiveActivate", "InteractiveExecute", "ReadDataHistory",
+        "ReadDataHistoryOfMissingData", "UpdateDataHistory", "UpdateDataHistoryOfMissingData", "UpdateDataHistorySettings",
+        "UpdateDataHistoryVersionComment", "ViewDataHistory", "EditDataHistoryVersionComment", "SwitchToDataHistoryVersion",
     ],
     "DataProcessor": ["Use", "View"],
     "Report": ["Use", "View"],
@@ -436,10 +605,82 @@ KNOWN_RIGHTS = {
     "IntegrationService": ["Use"],
     "SessionParameter": ["Get", "Set"],
     "CommonAttribute": ["View", "Edit"],
+    "ExternalDataSource": [
+        "Use", "Administration", "StandardAuthenticationChange",
+        "SessionStandardAuthenticationChange", "SessionOSAuthenticationChange",
+    ],
 }
 
-NESTED_RIGHTS = ["View", "Edit"]
-COMMAND_RIGHTS = ["View"]
+# Виды вложенности (предпоследний сегмент пути) → допустимые права. Списки сняты с корпуса
+# типовых конфигураций и с выгрузки роли, где права проставлены по всему дереву редактора:
+# догадкам тут не место — закрытый список превращает промах в ложный отказ.
+NESTED_KIND_RIGHTS = {
+    "Attribute": ["View", "Edit"],
+    "StandardAttribute": ["View", "Edit"],
+    "TabularSection": ["View", "Edit"],
+    "StandardTabularSection": ["View", "Edit"],
+    "Dimension": ["View", "Edit"],
+    "Resource": ["View", "Edit"],
+    "AccountingFlag": ["View", "Edit"],
+    "ExtDimensionAccountingFlag": ["View", "Edit"],
+    "AddressingAttribute": ["View", "Edit"],
+    "Field": ["View", "Edit"],
+    "Command": ["View"],
+    "Subsystem": ["View"],
+    "Operation": ["Use"],
+    "Method": ["Use"],
+    "IntegrationServiceChannel": ["Use"],
+    "Recalculation": ["Read", "Update"],
+    "Cube": ["Read", "View"],
+    "DimensionTable": ["Read", "View"],
+    "Function": ["Use", "View"],
+    "Table": [
+        "Read", "Insert", "Update", "Delete", "View", "Edit", "InputByString",
+        "InteractiveInsert", "InteractiveDelete",
+    ],
+}
+
+# Виды, существующие только у одного типа-родителя: без этой привязки
+# `Catalog.Товары.Field.Цена` прошёл бы как валидный вложенный объект.
+KIND_OWNERS = {
+    'Table': 'ExternalDataSource',
+    'Cube': 'ExternalDataSource',
+    'Function': 'ExternalDataSource',
+    'Field': 'ExternalDataSource',
+    'DimensionTable': 'ExternalDataSource',
+    'Recalculation': 'CalculationRegister',
+    'Operation': 'WebService',
+    'Method': 'HTTPService',
+    'IntegrationServiceChannel': 'IntegrationService',
+}
+
+# Право на сервис живёт на ЛИСТЕ — методе шаблона URL, операции, канале, — а не на самом
+# сервисе: корневого узла нет ни в одной типовой роли (907 записей корпуса — ноль), в
+# Конфигураторе галки на корне нет вовсе. Короткая запись `HTTPService.X: Use` выражает
+# намерение «открой сервис целиком» и раскрывается в листья по метаданным сервиса.
+SERVICE_LEAVES = {
+    'WebService': {'dir': 'WebServices', 'kinds': ['Operation']},
+    'HTTPService': {'dir': 'HTTPServices', 'kinds': ['URLTemplate', 'Method']},
+    'IntegrationService': {'dir': 'IntegrationServices', 'kinds': ['IntegrationServiceChannel']},
+}
+
+# Один и тот же вид под разными родителями имеет разный набор: измерение регистра —
+# View + Edit, измерение куба внешнего источника — только View. Объединять нельзя,
+# объединение молча разрешило бы Edit там, где платформа его не даёт.
+NESTED_KIND_RIGHTS_BY_TYPE = {
+    "ExternalDataSource": {
+        "Dimension": ["View"],
+        "Resource": ["View"],
+    },
+}
+
+# Типы без прав в ролях (в дереве редактора ролей их нет). Список НЕ управляет поведением —
+# отказ даёт отсутствие типа в KNOWN_RIGHTS; здесь только выбор формулировки.
+NO_RIGHTS_TYPES = [
+    "Enum", "CommonModule", "DefinedType", "CommonPicture", "CommonTemplate", "Language",
+    "FunctionalOption", "FunctionalOptionsParameter", "EventSubscription", "ScheduledJob",
+    "StyleItem", "Style", "SettingsStorage", "XDTOPackage", "WSReference", "DocumentNumerator",
+]
 
 # --- Presets ---
 
@@ -514,6 +755,446 @@ def is_nested_object(object_name):
     return len(object_name.split('.')) >= 3
 
 
+def get_nested_kind(object_name):
+    """Вид вложенности — предпоследний сегмент: путь бывает и восьмисегментным
+    (ExternalDataSource.И.Cube.К.DimensionTable.Т.Field.П), считать от конца."""
+    parts = object_name.split('.')
+    if len(parts) < 3:
+        return None
+    return parts[-2]
+
+
+def get_nested_rights(object_type, kind):
+    by_type = NESTED_KIND_RIGHTS_BY_TYPE.get(object_type)
+    if by_type and kind in by_type:
+        return by_type[kind]
+    return NESTED_KIND_RIGHTS.get(kind)
+
+
+# --- Зависимости прав (замерено на платформе) ---
+# Платформа при загрузке сама доводит набор до замыкания: выдал Edit — получил ещё
+# Read, Update и View. Пишем замыкание сразу, иначе файл и база расходятся.
+# Таблица общая для типов; исключения — там, где у типа своя механика (обработка и отчёт
+# держатся на Use, план счетов не тянет Read под историю данных).
+RIGHT_DEPS = {
+    "Delete": ["Read"],
+    "Edit": ["Read", "Update", "View"],
+    "EditDataHistoryVersionComment": ["Read", "ReadDataHistory", "UpdateDataHistoryVersionComment", "View"],
+    "Execute": ["Read", "Update"],
+    "InputByString": ["Read", "View"],
+    "Insert": ["Read"],
+    "InteractiveActivate": ["Read", "Update"],
+    "InteractiveChangeOfPosted": ["Edit", "Read", "Update", "View"],
+    "InteractiveClearDeletionMark": ["Edit", "Read", "Update", "View"],
+    "InteractiveClearDeletionMarkPredefinedData": ["Edit", "InteractiveClearDeletionMark", "Read", "Update", "View"],
+    "InteractiveDelete": ["Delete", "Edit", "Read", "Update", "View"],
+    "InteractiveDeleteMarked": ["Delete", "Edit", "Read", "Update", "View"],
+    "InteractiveDeleteMarkedPredefinedData": ["Delete", "Edit", "InteractiveDeleteMarked", "Read", "Update", "View"],
+    "InteractiveDeletePredefinedData": ["Delete", "Edit", "InteractiveDelete", "Read", "Update", "View"],
+    "InteractiveExecute": ["Execute", "Read", "Update"],
+    "InteractiveInsert": ["Edit", "Insert", "Read", "Update", "View"],
+    "InteractivePosting": ["Edit", "Posting", "Read", "Update", "View"],
+    "InteractivePostingRegular": ["Edit", "InteractivePosting", "Posting", "Read", "Update", "View"],
+    "InteractiveSetDeletionMark": ["Edit", "Read", "Update", "View"],
+    "InteractiveSetDeletionMarkPredefinedData": ["Edit", "InteractiveSetDeletionMark", "Read", "Update", "View"],
+    "InteractiveStart": ["Read", "Start", "Update"],
+    "InteractiveUndoPosting": ["Edit", "Read", "UndoPosting", "Update", "View"],
+    "Posting": ["Read", "Update"],
+    "ReadDataHistory": ["Read"],
+    "ReadDataHistoryOfMissingData": ["Read", "ReadDataHistory"],
+    "Start": ["Read", "Update"],
+    "SwitchToDataHistoryVersion": ["Read", "View"],
+    "UndoPosting": ["Read", "Update"],
+    "Update": ["Read"],
+    "UpdateDataHistory": ["Read", "ReadDataHistory"],
+    "UpdateDataHistoryOfMissingData": ["Read", "ReadDataHistory", "ReadDataHistoryOfMissingData", "UpdateDataHistory"],
+    "UpdateDataHistoryVersionComment": ["Read", "ReadDataHistory"],
+    "View": ["Read"],
+    "ViewDataHistory": ["Read", "ReadDataHistory", "View"],
+}
+
+RIGHT_DEPS_BY_TYPE = {
+    "ChartOfAccounts": {
+        "ReadDataHistory": [],
+        "ReadDataHistoryOfMissingData": ["ReadDataHistory"],
+        "UpdateDataHistory": ["ReadDataHistory"],
+        "UpdateDataHistoryOfMissingData": ["ReadDataHistory", "ReadDataHistoryOfMissingData", "UpdateDataHistory"],
+        "UpdateDataHistoryVersionComment": ["ReadDataHistory"],
+    },
+    "DataProcessor": {
+        "View": ["Use"],
+    },
+    "InformationRegister": {
+        "UpdateDataHistoryOfMissingData": ["Read", "ReadDataHistory", "UpdateDataHistory"],
+    },
+    "Report": {
+        "View": ["Use"],
+    },
+}
+
+CONFIGURATION_LEGACY_DEPS = ["AnalyticsSystemClient", "MainWindowModeEmbeddedWorkplace", "MainWindowModeFullscreenWorkplace", "MainWindowModeKiosk", "MainWindowModeNormal", "MainWindowModeWorkplace"]
+
+# Права конфигурации: до формата 2.19 платформа взводила весь блок режимов окна вместе с
+# любым правом, с 2.19 (8.3.26) перестала. Сами права допустимы и там, и там.
+CONFIGURATION_LEGACY_RANK = 218
+
+
+# Платформа хранит только то, что ОТЛИЧАЕТСЯ от значения по умолчанию для роли: при
+# setForNewObjects=false на верхнем уровне живут разрешения, при true — запреты; у реквизитных
+# вложенных объектов ту же роль играет setForAttributesByDefault. Совпавшее с умолчанием
+# платформа выбрасывает при первой же загрузке, поэтому не пишем его и сами.
+ATTRIBUTE_KINDS = [
+    "Attribute", "StandardAttribute", "TabularSection", "StandardTabularSection",
+    "Dimension", "Resource", "AccountingFlag", "ExtDimensionAccountingFlag", "AddressingAttribute",
+]
+
+
+def get_default_right_value(object_name, set_for_new_objects, set_for_attributes_by_default):
+    parts = object_name.split('.')
+    if len(parts) < 3:
+        return set_for_new_objects
+    # Внешние источники данных под это правило не проверялись — трогаем только то, что замерено.
+    if parts[0] == 'ExternalDataSource':
+        return "false"
+    kind = parts[-2]
+    if kind in ATTRIBUTE_KINDS:
+        return set_for_attributes_by_default
+    # Команды, подсистемы, операции сервисов флагами роли не управляются — там живут разрешения.
+    return "false"
+
+
+def close_rights_dependencies(object_name, rights, format_rank):
+    """Замыкание набора прав объекта. Возвращает (итоговые права, что дописано)."""
+    parts = object_name.split('.')
+    nested = len(parts) >= 3
+    object_type = parts[0]
+    allowed = (get_nested_rights(object_type, get_nested_kind(object_name)) if nested
+               else KNOWN_RIGHTS.get(object_type))
+    if not allowed:
+        return rights, []
+    have = {}
+    for r in rights:
+        have.setdefault(r['Name'], r)
+    by_type = RIGHT_DEPS_BY_TYPE.get(object_type, {})
+    added = []
+    # Вперёд — только от РАЗРЕШЁННЫХ прав: платформа замыкает выданное, а не запрещённое.
+    queue = [n for n in have if have[n]['Value'] == 'true']
+    while queue:
+        name = queue.pop(0)
+        need = by_type[name] if name in by_type else RIGHT_DEPS.get(name)
+        if not need:
+            continue
+        for dep in need:
+            if dep not in allowed:
+                continue
+            if dep in have:
+                # Разрешение перебивает запрет — так поступает и платформа при загрузке.
+                if have[dep]['Value'] != 'true':
+                    have[dep]['Value'] = 'true'
+                    added.append(dep)
+                    queue.append(dep)
+                continue
+            have[dep] = {'Name': dep, 'Value': 'true', 'Condition': None}
+            added.append(dep)
+            queue.append(dep)
+    # Назад — от ЗАПРЕТОВ: право, которому запрещённое нужно, платформа запрещает следом.
+    deny_queue = [n for n in have if have[n]['Value'] != 'true']
+    while deny_queue:
+        name = deny_queue.pop(0)
+        for candidate in allowed:
+            if candidate == name or candidate in have:
+                continue
+            need = by_type[candidate] if candidate in by_type else RIGHT_DEPS.get(candidate)
+            if not need or name not in need:
+                continue
+            have[candidate] = {'Name': candidate, 'Value': 'false', 'Condition': None}
+            added.append(candidate)
+            deny_queue.append(candidate)
+    if object_type == 'Configuration' and format_rank <= CONFIGURATION_LEGACY_RANK and have:
+        for dep in CONFIGURATION_LEGACY_DEPS:
+            if dep in have:
+                continue
+            have[dep] = {'Name': dep, 'Value': 'true', 'Condition': None}
+            added.append(dep)
+    return list(have.values()), added
+
+
+# --- Канонический порядок прав и узлов (замерено на платформе) ---
+# Платформа нормализует порядок <right> внутри <object> и порядок самих <object>:
+# права идут в фиксированном для типа порядке, узлы — по uuid объекта метаданных.
+# Пишем сразу так же, иначе первая же выгрузка из Конфигуратора даст диф на ровном месте.
+RIGHT_ORDER = {
+    "AccountingRegister": ["Read", "Update", "View", "Edit", "TotalsControl"],
+    "AccumulationRegister": ["Read", "Update", "View", "Edit", "TotalsControl"],
+    "BusinessProcess": [
+        "Read", "Insert", "Update", "Delete",
+        "View", "InteractiveInsert", "Edit", "InteractiveDelete",
+        "InteractiveSetDeletionMark", "InteractiveClearDeletionMark", "InteractiveDeleteMarked", "InputByString",
+        "InteractiveActivate", "Start", "InteractiveStart", "ReadDataHistory",
+        "ReadDataHistoryOfMissingData", "UpdateDataHistory", "UpdateDataHistoryOfMissingData", "UpdateDataHistorySettings",
+        "UpdateDataHistoryVersionComment", "ViewDataHistory", "EditDataHistoryVersionComment", "SwitchToDataHistoryVersion",
+    ],
+    "CalculationRegister": ["Read", "Update", "View", "Edit"],
+    "Catalog": [
+        "Read", "Insert", "Update", "Delete",
+        "View", "InteractiveInsert", "Edit", "InteractiveDelete",
+        "InteractiveSetDeletionMark", "InteractiveClearDeletionMark", "InteractiveDeleteMarked", "InputByString",
+        "InteractiveDeletePredefinedData", "InteractiveSetDeletionMarkPredefinedData", "InteractiveClearDeletionMarkPredefinedData", "InteractiveDeleteMarkedPredefinedData",
+        "ReadDataHistory", "ReadDataHistoryOfMissingData", "UpdateDataHistory", "UpdateDataHistoryOfMissingData",
+        "UpdateDataHistorySettings", "UpdateDataHistoryVersionComment", "ViewDataHistory", "EditDataHistoryVersionComment",
+        "SwitchToDataHistoryVersion",
+    ],
+    "ChartOfAccounts": [
+        "Read", "Insert", "Update", "Delete",
+        "View", "InteractiveInsert", "Edit", "InteractiveDelete",
+        "InteractiveSetDeletionMark", "InteractiveClearDeletionMark", "InteractiveDeleteMarked", "InputByString",
+        "InteractiveDeletePredefinedData", "InteractiveSetDeletionMarkPredefinedData", "InteractiveClearDeletionMarkPredefinedData", "InteractiveDeleteMarkedPredefinedData",
+        "ReadDataHistory", "ReadDataHistoryOfMissingData", "UpdateDataHistory", "UpdateDataHistoryOfMissingData",
+        "UpdateDataHistorySettings", "UpdateDataHistoryVersionComment", "ViewDataHistory", "EditDataHistoryVersionComment",
+        "SwitchToDataHistoryVersion",
+    ],
+    "ChartOfCalculationTypes": [
+        "Read", "Insert", "Update", "Delete",
+        "View", "InteractiveInsert", "Edit", "InteractiveDelete",
+        "InteractiveSetDeletionMark", "InteractiveClearDeletionMark", "InteractiveDeleteMarked", "InputByString",
+        "InteractiveDeletePredefinedData", "InteractiveSetDeletionMarkPredefinedData", "InteractiveClearDeletionMarkPredefinedData", "InteractiveDeleteMarkedPredefinedData",
+        "ReadDataHistory", "ReadDataHistoryOfMissingData", "UpdateDataHistory", "UpdateDataHistoryOfMissingData",
+        "UpdateDataHistorySettings", "UpdateDataHistoryVersionComment", "ViewDataHistory", "EditDataHistoryVersionComment",
+        "SwitchToDataHistoryVersion",
+    ],
+    "ChartOfCharacteristicTypes": [
+        "Read", "Insert", "Update", "Delete",
+        "View", "InteractiveInsert", "Edit", "InteractiveDelete",
+        "InteractiveSetDeletionMark", "InteractiveClearDeletionMark", "InteractiveDeleteMarked", "InputByString",
+        "InteractiveDeletePredefinedData", "InteractiveSetDeletionMarkPredefinedData", "InteractiveClearDeletionMarkPredefinedData", "InteractiveDeleteMarkedPredefinedData",
+        "ReadDataHistory", "ReadDataHistoryOfMissingData", "UpdateDataHistory", "UpdateDataHistoryOfMissingData",
+        "UpdateDataHistorySettings", "UpdateDataHistoryVersionComment", "ViewDataHistory", "EditDataHistoryVersionComment",
+        "SwitchToDataHistoryVersion",
+    ],
+    "CommonAttribute": ["View", "Edit"],
+    "CommonCommand": ["View"],
+    "CommonForm": ["View"],
+    "Configuration": [
+        "Administration", "DataAdministration", "UpdateDataBaseConfiguration", "ExclusiveMode",
+        "ActiveUsers", "EventLog", "ThinClient", "WebClient",
+        "MobileClient", "ThickClient", "ExternalConnection", "Automation",
+        "TechnicalSpecialistMode", "CollaborationSystemInfoBaseRegistration", "MainWindowModeNormal", "MainWindowModeWorkplace",
+        "MainWindowModeEmbeddedWorkplace", "MainWindowModeFullscreenWorkplace", "MainWindowModeKiosk", "AnalyticsSystemClient",
+        "SaveUserData", "ConfigurationExtensionsAdministration", "InteractiveOpenExtDataProcessors", "InteractiveOpenExtReports",
+        "Output",
+    ],
+    "Constant": [
+        "Read", "Update", "View", "Edit",
+        "ReadDataHistory", "UpdateDataHistory", "UpdateDataHistorySettings", "UpdateDataHistoryVersionComment",
+        "ViewDataHistory", "EditDataHistoryVersionComment", "SwitchToDataHistoryVersion",
+    ],
+    "DataProcessor": ["Use", "View"],
+    "Document": [
+        "Read", "Insert", "Update", "Delete",
+        "Posting", "UndoPosting", "View", "InteractiveInsert",
+        "Edit", "InteractiveDelete", "InteractiveSetDeletionMark", "InteractiveClearDeletionMark",
+        "InteractiveDeleteMarked", "InteractivePosting", "InteractivePostingRegular", "InteractiveUndoPosting",
+        "InteractiveChangeOfPosted", "InputByString", "ReadDataHistory", "ReadDataHistoryOfMissingData",
+        "UpdateDataHistory", "UpdateDataHistoryOfMissingData", "UpdateDataHistorySettings", "UpdateDataHistoryVersionComment",
+        "ViewDataHistory", "EditDataHistoryVersionComment", "SwitchToDataHistoryVersion",
+    ],
+    "DocumentJournal": ["Read", "View"],
+    "ExchangePlan": [
+        "Read", "Insert", "Update", "Delete",
+        "View", "InteractiveInsert", "Edit", "InteractiveDelete",
+        "InteractiveSetDeletionMark", "InteractiveClearDeletionMark", "InteractiveDeleteMarked", "InputByString",
+        "ReadDataHistory", "ReadDataHistoryOfMissingData", "UpdateDataHistory", "UpdateDataHistoryOfMissingData",
+        "UpdateDataHistorySettings", "UpdateDataHistoryVersionComment", "ViewDataHistory", "EditDataHistoryVersionComment",
+        "SwitchToDataHistoryVersion",
+    ],
+    "FilterCriterion": ["View"],
+    "HTTPService": ["Use"],
+    "InformationRegister": [
+        "Read", "Update", "View", "Edit",
+        "TotalsControl", "ReadDataHistory", "ReadDataHistoryOfMissingData", "UpdateDataHistory",
+        "UpdateDataHistoryOfMissingData", "UpdateDataHistorySettings", "UpdateDataHistoryVersionComment", "ViewDataHistory",
+        "EditDataHistoryVersionComment", "SwitchToDataHistoryVersion",
+    ],
+    "IntegrationService": ["Use"],
+    "Report": ["Use", "View"],
+    "Sequence": ["Read", "Update"],
+    "SessionParameter": ["Get", "Set"],
+    "Subsystem": ["View"],
+    "Task": [
+        "Read", "Insert", "Update", "Delete",
+        "View", "InteractiveInsert", "Edit", "InteractiveDelete",
+        "InteractiveSetDeletionMark", "InteractiveClearDeletionMark", "InteractiveDeleteMarked", "InputByString",
+        "InteractiveActivate", "Execute", "InteractiveExecute", "ReadDataHistory",
+        "ReadDataHistoryOfMissingData", "UpdateDataHistory", "UpdateDataHistoryOfMissingData", "UpdateDataHistorySettings",
+        "UpdateDataHistoryVersionComment", "ViewDataHistory", "EditDataHistoryVersionComment", "SwitchToDataHistoryVersion",
+    ],
+    "WebService": ["Use"],
+}
+
+NESTED_RIGHT_ORDER = {
+    "AccountingFlag": ["View", "Edit"],
+    "AddressingAttribute": ["View", "Edit"],
+    "Attribute": ["View", "Edit"],
+    "Command": ["View"],
+    "Dimension": ["View", "Edit"],
+    "ExtDimensionAccountingFlag": ["View", "Edit"],
+    "IntegrationServiceChannel": ["Use"],
+    "Method": ["Use"],
+    "Operation": ["Use"],
+    "Recalculation": ["Read", "Update"],
+    "Resource": ["View", "Edit"],
+    "StandardAttribute": ["View", "Edit"],
+    "StandardTabularSection": ["View", "Edit"],
+    "Subsystem": ["View"],
+    "TabularSection": ["View", "Edit"],
+}
+
+# Каталоги объектов метаданных — нужны, чтобы прочитать uuid и расставить <object>.
+TYPE_DIRS = {
+    "Catalog": "Catalogs", "Document": "Documents", "DocumentJournal": "DocumentJournals",
+    "Sequence": "Sequences", "Constant": "Constants", "Report": "Reports",
+    "DataProcessor": "DataProcessors", "InformationRegister": "InformationRegisters",
+    "AccumulationRegister": "AccumulationRegisters", "AccountingRegister": "AccountingRegisters",
+    "CalculationRegister": "CalculationRegisters", "ChartOfAccounts": "ChartsOfAccounts",
+    "ChartOfCharacteristicTypes": "ChartsOfCharacteristicTypes",
+    "ChartOfCalculationTypes": "ChartsOfCalculationTypes", "ExchangePlan": "ExchangePlans",
+    "BusinessProcess": "BusinessProcesses", "Task": "Tasks", "Subsystem": "Subsystems",
+    "CommonForm": "CommonForms", "CommonCommand": "CommonCommands",
+    "CommonAttribute": "CommonAttributes", "FilterCriterion": "FilterCriteria",
+    "SessionParameter": "SessionParameters", "WebService": "WebServices",
+    "HTTPService": "HTTPServices", "IntegrationService": "IntegrationServices",
+    "ExternalDataSource": "ExternalDataSources",
+}
+
+
+def sort_rights_canonical(object_name, rights):
+    """Порядок прав объекта: известные — по таблице, незнакомые — следом, в порядке ввода."""
+    parts = object_name.split('.')
+    order = NESTED_RIGHT_ORDER.get(parts[-2]) if len(parts) >= 3 else RIGHT_ORDER.get(parts[0])
+    if not order:
+        return rights
+    by_name = {}
+    for r in rights:
+        by_name.setdefault(r['Name'], r)
+    sorted_rights = []
+    for name in order:
+        if name in by_name:
+            sorted_rights.append(by_name.pop(name))
+    for r in rights:
+        if r['Name'] in by_name:
+            sorted_rights.append(by_name.pop(r['Name']))
+    return sorted_rights
+
+
+# У стандартных реквизитов и стандартных табличных частей uuid в выгрузке нет: они системные.
+# Отсутствие uuid для них — норма, а не потерянный объект.
+def is_standard_kind(object_name):
+    parts = object_name.split('.')
+    if len(parts) < 3:
+        return False
+    return parts[-2].startswith("Standard")
+
+
+# uuid объекта прав: у верхнего уровня — из файла объекта, у вложенного — спуском по дереву.
+# Искать регуляркой по всему файлу нельзя: реквизит шапки и реквизит табличной части часто
+# называются одинаково, и поиск нашёл бы первый попавшийся. Дочерние подсистемы лежат
+# отдельными файлами, поэтому для них спуск идёт по каталогам.
+# У стандартных реквизитов uuid в выгрузке нет вовсе — для них возвращаем None молча.
+def get_rights_object_uuid(object_name, config_root):
+    parts = object_name.split('.')
+    if parts[0] == 'Configuration':
+        cfg_path = os.path.join(config_root, 'Configuration.xml')
+        if not os.path.isfile(cfg_path):
+            return None
+        with open(cfg_path, 'r', encoding='utf-8-sig') as f:
+            m = re.search(r'<Configuration uuid="([0-9a-fA-F-]+)"', f.read())
+        return m.group(1) if m else None
+    directory = TYPE_DIRS.get(parts[0])
+    if not directory or len(parts) < 2:
+        return None
+    # Подсистемы вложены каталогами: Subsystems/Родитель/Subsystems/Ребёнок.xml
+    owner_path = os.path.join(config_root, directory, parts[1] + '.xml')
+    i = 2
+    while len(parts) > i + 1 and parts[i] == 'Subsystem':
+        owner_path = os.path.join(os.path.splitext(owner_path)[0], 'Subsystems', parts[i + 1] + '.xml')
+        i += 2
+    if not os.path.isfile(owner_path):
+        return None
+    try:
+        tree = etree.parse(owner_path)
+    except Exception:
+        return None
+    md = '{http://v8.1c.ru/8.3/MDClasses}'
+    node = tree.getroot()[0] if len(tree.getroot()) else None
+    if node is None:
+        return None
+    # Оставшиеся пары «вид, имя» ищем строго внутри текущего узла.
+    while i + 1 < len(parts):
+        kind, name = parts[i], parts[i + 1]
+        child = None
+        for candidate in node.findall(f'{md}ChildObjects/{md}{kind}'):
+            props = candidate.find(f'{md}Properties/{md}Name')
+            if props is not None and (props.text or '') == name:
+                child = candidate
+                break
+        if child is None:
+            return None
+        node = child
+        i += 2
+    return node.get('uuid')
+
+
+def sort_objects_by_uuid(objects, config_root):
+    """Порядок узлов: по uuid объекта; неразрешённые — в конец, в порядке ввода."""
+    known, unknown = [], []
+    for o in objects:
+        uuid_value = get_rights_object_uuid(o['Name'], config_root)
+        if uuid_value:
+            known.append((uuid_value, o))
+        else:
+            if not is_standard_kind(o['Name']):
+                print(f"[role-compile] {o['Name']}: объект не найден в выгрузке, uuid неизвестен — "
+                      f"узел записан в конец (платформа переставит его при первой выгрузке)",
+                      file=sys.stderr)
+            unknown.append(o)
+    known.sort(key=lambda pair: pair[0])
+    return [o for _, o in known] + unknown
+
+
+# Отказ копится, а не печатается сразу: роль пишется целиком, поэтому единственный
+# безопасный момент отказа — до первой записи, и показать надо все причины сразу.
+VALIDATION_ERRORS = []
+
+
+def add_validation_error(message):
+    VALIDATION_ERRORS.append(message)
+
+
+def validate_object_name(object_name):
+    """Тип по белому списку (всегда, включая вложенные пути) и вид вложенности.
+    Запрещённый и незнакомый тип — разные диагнозы."""
+    object_type = get_object_type(object_name)
+    if object_type not in KNOWN_RIGHTS:
+        if object_type in NO_RIGHTS_TYPES:
+            add_validation_error(f"{object_name}: тип '{object_type}' не имеет прав в роли — уберите объект из списка")
+        else:
+            similar = [t for t in KNOWN_RIGHTS if object_type in t or t in object_type][:3]
+            sug = f" Возможно: {', '.join(similar)}?" if similar else ''
+            add_validation_error(f"{object_name}: неизвестный тип объекта '{object_type}'.{sug}")
+        return False
+
+    if is_nested_object(object_name):
+        kind = get_nested_kind(object_name)
+        if kind in KIND_OWNERS and object_type != KIND_OWNERS[kind]:
+            add_validation_error(f"{object_name}: вид '{kind}' бывает только у {KIND_OWNERS[kind]}")
+            return False
+        if get_nested_rights(object_type, kind) is None:
+            add_validation_error(f"{object_name}: неизвестный вид вложенности '{kind}'")
+            return False
+
+    return True
+
+
 def resolve_preset(object_type, preset_name):
     preset = preset_name.lstrip('@')
     if preset not in PRESETS:
@@ -534,29 +1215,181 @@ def resolve_preset(object_type, preset_name):
 def validate_right_name(object_name, right_name):
     object_type = get_object_type(object_name)
 
-    if is_nested_object(object_name):
-        if '.Command.' in object_name:
-            if right_name not in COMMAND_RIGHTS:
-                print(f"WARNING: {object_name}: '{right_name}' not valid for commands (only: View)", file=sys.stderr)
-                return False
-        else:
-            if right_name not in NESTED_RIGHTS:
-                print(f"WARNING: {object_name}: '{right_name}' not valid for nested objects (only: View, Edit)", file=sys.stderr)
-                return False
-        return True
-
+    # Тип уже проверен validate_object_name — здесь только права, иначе про один
+    # запрещённый тип напечатается столько строк, сколько у него перечислено прав.
     if object_type not in KNOWN_RIGHTS:
-        print(f"WARNING: {object_name}: unknown object type '{object_type}'", file=sys.stderr)
+        return False
+
+    if is_nested_object(object_name):
+        kind = get_nested_kind(object_name)
+        valid_nested = get_nested_rights(object_type, kind)
+        if valid_nested is None:
+            return False
+        if right_name not in valid_nested:
+            add_validation_error(f"{object_name}: право '{right_name}' недопустимо для вида '{kind}' (допустимо: {', '.join(valid_nested)})")
+            return False
         return True
 
     valid_rights = KNOWN_RIGHTS[object_type]
     if right_name not in valid_rights:
-        suggestions = [r for r in valid_rights if right_name in r or r in right_name]
-        sug_str = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
-        print(f"WARNING: {object_name}: unknown right '{right_name}'.{sug_str}", file=sys.stderr)
+        suggestions = [r for r in valid_rights if right_name in r or r in right_name][:3]
+        sug_str = f" Возможно: {', '.join(suggestions)}?" if suggestions else ""
+        add_validation_error(f"{object_name}: право '{right_name}' не существует у типа '{object_type}'.{sug_str}")
         return False
 
     return True
+
+
+# "@путь" в значении условия — текст берётся из файла: условия RLS типовых занимают десятки
+# строк с кавычками, и внутри JSON-строки это источник ошибок экранирования. Относительный
+# путь ищется рядом с JSON-описанием роли, затем в текущем каталоге.
+def resolve_text_from_file(val, base_dir):
+    if not val.startswith("@"):
+        return val
+    file_path = val[1:]
+    if os.path.isabs(file_path):
+        candidates = [file_path]
+    else:
+        candidates = [
+            os.path.join(base_dir, file_path),
+            os.path.join(os.getcwd(), file_path),
+        ]
+    for c in candidates:
+        if os.path.exists(c):
+            with open(c, 'r', encoding='utf-8-sig') as f:
+                return f.read().rstrip()
+    print(f"Файл значения не найден: {file_path} (искали: {', '.join(candidates)})", file=sys.stderr)
+    sys.exit(1)
+
+
+TEXT_BASE_DIR = os.getcwd()
+
+
+MD_NS = 'http://v8.1c.ru/8.3/MDClasses'
+
+# Метаданные сервиса читаются один раз на имя: раскрытие и проверка заимствования
+# спрашивают один и тот же файл.
+SERVICE_META_CACHE = {}
+
+
+def get_service_meta(object_type, service_name, config_root):
+    key = f"{object_type}.{service_name}"
+    if key in SERVICE_META_CACHE:
+        return SERVICE_META_CACHE[key]
+
+    spec = SERVICE_LEAVES[object_type]
+    xml_path = os.path.join(config_root, spec['dir'], f"{service_name}.xml")
+    result = {'path': xml_path, 'found': False, 'adopted': False, 'leaves': []}
+
+    if os.path.isfile(xml_path):
+        try:
+            root = etree.parse(xml_path).getroot()
+            node = root.find(f"{{{MD_NS}}}{object_type}")
+            if node is not None:
+                result['found'] = True
+                # ObjectBelonging=Adopted — сервис заимствован в расширение.
+                ob = node.find(f"{{{MD_NS}}}Properties/{{{MD_NS}}}ObjectBelonging")
+                if ob is not None and (ob.text or '') == 'Adopted':
+                    result['adopted'] = True
+
+                # Спуск по видам: у HTTP-сервиса лист лежит на два уровня ниже
+                # (URLTemplate → Method), у остальных — на один.
+                level = [(node, f"{object_type}.{service_name}")]
+                for kind in spec['kinds']:
+                    nxt = []
+                    for item_node, item_name in level:
+                        for child in item_node.findall(f"{{{MD_NS}}}ChildObjects/{{{MD_NS}}}{kind}"):
+                            name_node = child.find(f"{{{MD_NS}}}Properties/{{{MD_NS}}}Name")
+                            if name_node is None:
+                                continue
+                            nxt.append((child, f"{item_name}.{kind}.{name_node.text}"))
+                    level = nxt
+                result['leaves'] = [n for _, n in level]
+        except Exception:
+            # Битый XML — не наша забота: раскрывать нечего, дальше отработает отказ
+            # «метаданные не найдены» с тем же путём в подсказке.
+            pass
+
+    SERVICE_META_CACHE[key] = result
+    return result
+
+
+def get_service_leaf_hint(object_type, service_name):
+    """Подсказка формата: единственное, что отличается у трёх видов сервисов, — путь до листа."""
+    if object_type == 'HTTPService':
+        return f"{object_type}.{service_name}.URLTemplate.<Шаблон>.Method.<Метод>: Use"
+    if object_type == 'WebService':
+        return f"{object_type}.{service_name}.Operation.<Операция>: Use"
+    return f"{object_type}.{service_name}.IntegrationServiceChannel.<Канал>: Use"
+
+
+# Роль расширения, включённая в <DefaultRoles>, прав на заимствованные объекты давать не
+# может — платформа отвечает «Назначение прав доступа на заимствованные объекты основными
+# ролями в расширениях недопустимо». Считаем один раз: имя роли за прогон не меняется.
+IS_DEFAULT_ROLE = None
+
+
+def test_default_role(config_root, name):
+    global IS_DEFAULT_ROLE
+    if IS_DEFAULT_ROLE is not None:
+        return IS_DEFAULT_ROLE
+    IS_DEFAULT_ROLE = False
+
+    cfg_path = os.path.join(config_root, 'Configuration.xml')
+    if os.path.isfile(cfg_path):
+        with open(cfg_path, 'r', encoding='utf-8-sig') as f:
+            text = f.read()
+        # Только расширение: у обычной конфигурации DefaultRoles значит другое и запрета нет.
+        if '<ConfigurationExtensionPurpose>' in text:
+            m = re.search(r'<DefaultRoles>(.*?)</DefaultRoles>', text, re.S)
+            # Сравнение регистрозависимое — паритет с -cmatch в PS1, где регистронезависимый
+            # -match принял бы «расш1_роль1» за основную роль «Расш1_Роль1».
+            if m and re.search(re.escape(f"Role.{name}") + r'\s*<', m.group(1)):
+                IS_DEFAULT_ROLE = True
+    return IS_DEFAULT_ROLE
+
+
+def expand_service_entry(parsed, config_root, name):
+    """Возвращает список записей на замену исходной: сервисный корень раскрывается в листья,
+    всё остальное проходит как есть."""
+    obj_name = parsed['Name']
+    object_type = get_object_type(obj_name)
+    if object_type not in SERVICE_LEAVES:
+        return [parsed]
+
+    parts = obj_name.split('.')
+    if len(parts) < 2:
+        return [parsed]
+    service_name = parts[1]
+    meta = get_service_meta(object_type, service_name, config_root)
+
+    if meta['adopted'] and test_default_role(config_root, name):
+        add_validation_error(
+            f"{obj_name}: '{name}' — основная роль расширения (входит в DefaultRoles), "
+            f"а {object_type}.{service_name} заимствован; назначать права на заимствованные объекты "
+            "основными ролями расширения платформа запрещает. Заведите отдельную роль и не включайте её в основные.")
+        return []
+
+    # Полный путь пользователь задал сам — раскрывать нечего.
+    if len(parts) > 2:
+        return [parsed]
+
+    hint = get_service_leaf_hint(object_type, service_name)
+    if not meta['found']:
+        add_validation_error(
+            f"{obj_name}: метаданные сервиса не найдены ({meta['path']}); "
+            f"право на сервис целиком платформа игнорирует — укажите листья явно: {hint}")
+        return []
+    if not meta['leaves']:
+        add_validation_error(
+            f"{obj_name}: у сервиса нет ни одного вложенного объекта, раскрывать нечего; "
+            "право на сервис целиком платформа игнорирует. "
+            f"Для заимствованного сервиса заимствуйте нужные методы, затем: {hint}")
+        return []
+
+    expanded = [{'Name': leaf, 'Rights': parsed['Rights']} for leaf in meta['leaves']]
+    print(f"     {obj_name} -> раскрыт (вложенных объектов: {len(expanded)})")
+    return expanded
 
 
 def parse_object_entry(entry):
@@ -568,6 +1401,10 @@ def parse_object_entry(entry):
             return None
         obj_name = translate_object_name(entry[:colon_idx].strip())
         rights_str = entry[colon_idx + 1:].strip()
+        # Объект с непроходным именем дальше не разбираем: пресет для несуществующего типа
+        # добавил бы к отказу ещё и бессмысленное предупреждение.
+        if not validate_object_name(obj_name):
+            return None
         object_type = get_object_type(obj_name)
 
         if rights_str.startswith('@'):
@@ -586,6 +1423,9 @@ def parse_object_entry(entry):
     obj_name = translate_object_name(str(entry.get('name', '')))
     if not obj_name:
         print("WARNING: Object entry missing 'name' field", file=sys.stderr)
+        return None
+
+    if not validate_object_name(obj_name):
         return None
 
     object_type = get_object_type(obj_name)
@@ -624,7 +1464,7 @@ def parse_object_entry(entry):
         for p_name, p_value in entry['rls'].items():
             rls_right = translate_right_name(p_name)
             if rls_right in rights_map:
-                rights_map[rls_right]['Condition'] = str(p_value)
+                rights_map[rls_right]['Condition'] = resolve_text_from_file(str(p_value), TEXT_BASE_DIR)
             else:
                 print(f"WARNING: {obj_name}: RLS for '{rls_right}' but this right is not in the rights list", file=sys.stderr)
 
@@ -640,13 +1480,212 @@ def parse_object_entry(entry):
     return {'Name': obj_name, 'Rights': rights}
 
 
+def get_new_object_position(cfg_dir):
+    """Куда навык ставит новую запись в <ChildObjects> — настройка newObjectPosition.
+
+    databases[].newObjectPosition базы, чей configSrc охватывает каталог родительского XML,
+    иначе корневое поле, иначе end. Значения: end — после последнего объекта того же вида
+    (так дописывает Конфигуратор); byName — по имени среди объектов того же вида.
+    Файл ищем от рабочего каталога вверх, каталог конфигурации — запасной путь: так же
+    его ищут support-guard и группа db-*, а скрипт навыка зовут по абсолютному пути, и cwd
+    остаётся рабочим каталогом проекта.
+    configSrc считается от каталога .v8-project.json, как задокументировано в
+    docs/v8-project-guide.md. Реестр семьи: tests/skills/check-inline-drift.mjs.
+    """
+    try:
+        pj = _sg_find_v8project(os.getcwd()) or _sg_find_v8project(os.path.abspath(cfg_dir or "."))
+        if not pj:
+            return "end"
+        proj = json.loads(open(pj, encoding="utf-8-sig").read())
+        proj_dir = os.path.dirname(pj)
+        cfg_full = os.path.normcase(os.path.abspath(cfg_dir or ".")).rstrip("\\/")
+        for db in proj.get("databases", []):
+            src = db.get("configSrc")
+            if src and db.get("newObjectPosition"):
+                src_full = os.path.normcase(os.path.abspath(os.path.join(proj_dir, src))).rstrip("\\/")
+                if cfg_full == src_full or cfg_full.startswith(src_full + os.sep):
+                    return "byName" if str(db["newObjectPosition"]).lower() == "byname" else "end"
+        if str(proj.get("newObjectPosition") or "").lower() == "byname":
+            return "byName"
+        return "end"
+    except Exception:
+        return "end"
+
+
+def is_order_sensitive_type(type_name):
+    """Виды, у которых порядок в дереве несёт смысл: автоматически их не упорядочиваем.
+
+    CommonAttribute — исключение самого стандарта (#std467): у общих реквизитов-разделителей
+    порядок в дереве задаёт порядок установки параметров сеанса. Subsystem и CommandGroup:
+    пока они не перечислены в <SubsystemsOrder> / <GroupsOrder> файла Ext/CommandInterface.xml,
+    порядок дерева задаёт порядок в интерфейсе, а платформа эти списки сама не заводит
+    (в выгрузке ACC вне GroupsOrder 15 живых групп из 39). Language исключён из осторожности,
+    без замера: языков обычно один-два, и в типовых их порядок не алфавитный.
+    Явно названный вид сортируется в любом случае.
+    Реестр семьи: tests/skills/check-inline-drift.mjs.
+    """
+    return type_name in ("CommonAttribute", "Subsystem", "CommandGroup", "Language")
+
+
+def compare_metadata_names(a, b):
+    """Порядок имён объектов метаданных, как в дереве Конфигуратора.
+
+    Ключ — пары «ранг+символ»: регистр не учитывается, подчёркивание раньше цифр, цифры раньше
+    букв, буквы по кодам (латиница раньше кириллицы), ё на месте е. Культурные таблицы не
+    используются — они разные на разных ОС и в разных рантаймах, а так оба порта сравнивают
+    одинаково везде. Равные ключи разводит ordinal-сравнение исходных строк.
+    Возвращает -1 | 0 | 1. Реестр семьи: tests/skills/check-inline-drift.mjs.
+    """
+    keys = []
+    for name in (a, b):
+        parts = []
+        for ch in name.lower():
+            if ch == "ё":
+                ch = "е"
+            if ch.isdigit():
+                parts.append("1" + ch)
+            elif ch.isalpha():
+                parts.append("2" + ch)
+            else:
+                parts.append("0" + ch)
+        keys.append("".join(parts))
+    if keys[0] != keys[1]:
+        return -1 if keys[0] < keys[1] else 1
+    if a != b:
+        return -1 if a < b else 1
+    return 0
+
+
+# Канонический порядок видов в <ChildObjects> — эталон в docs/1c-configuration-spec.md,
+# таблица «Порядок типов в ChildObjects». Нужен, чтобы новая группа вида вставала на своё
+# место: иначе платформа переставит её при первой же выгрузке и даст диф на ровном месте.
+# Реестр карт: tests/skills/check-type-maps.mjs.
+CHILD_OBJECT_TYPES = [
+    'Language', 'Subsystem', 'StyleItem', 'Style',
+    'CommonPicture', 'SessionParameter', 'Role', 'CommonTemplate',
+    'FilterCriterion', 'CommonModule', 'CommonAttribute', 'ExchangePlan',
+    'XDTOPackage', 'WebService', 'HTTPService', 'WSReference',
+    'EventSubscription', 'ScheduledJob', 'SettingsStorage', 'FunctionalOption',
+    'FunctionalOptionsParameter', 'DefinedType', 'Bot', 'PaletteColor', 'CommonCommand', 'CommandGroup',
+    'Constant', 'CommonForm', 'Catalog', 'Document',
+    'DocumentNumerator', 'Sequence', 'DocumentJournal', 'Enum',
+    'Report', 'DataProcessor', 'InformationRegister', 'AccumulationRegister',
+    'ChartOfCharacteristicTypes', 'ChartOfAccounts', 'AccountingRegister',
+    'ChartOfCalculationTypes', 'CalculationRegister',
+    'BusinessProcess', 'Task', 'ExternalDataSource', 'IntegrationService',
+]
+
+
+def register_in_childobjects(parent_xml_path, parent_tag, child_tag, child_name):
+    """Регистрация объекта в <ChildObjects> родительского XML.
+
+    Общая реализация: эталон — meta-compile, копии — role-compile, xdto-compile.
+    Реестр семьи: tests/skills/check-inline-drift.mjs.
+    Возвращает исход: added | already | no-childobj | no-config.
+    """
+    if not os.path.isfile(parent_xml_path):
+        return 'no-config'
+
+    # Read raw content, preserving BOM/EOL byte-for-byte (newline='' => no translation)
+    with open(parent_xml_path, 'r', encoding='utf-8-sig', newline='') as f:
+        config_content = f.read()
+
+    ns = 'http://v8.1c.ru/8.3/MDClasses'
+    # ET is used ONLY read-only here: to locate ChildObjects and detect a duplicate.
+    # We deliberately do NOT re-serialize Configuration.xml with ElementTree.write():
+    # it drops every xmlns declaration used only inside attribute VALUES (e.g.
+    # xsi:type="app:ApplicationUsePurpose" in UsePurposes) because ET never sees such
+    # prefixes in element/attribute names. The dropped declaration makes XDTO read the
+    # value as anyType and Designer refuses to load the file (issue #38). Registration is
+    # therefore done by raw-text insertion, preserving BOM, EOL and all namespaces
+    # byte-for-byte (same approach as subsystem-compile).
+    tree = ET.parse(parent_xml_path)
+    root = tree.getroot()
+
+    child_objects = root.find(f'{{{ns}}}{parent_tag}/{{{ns}}}ChildObjects')
+    if child_objects is None:
+        # Try direct path
+        parent_elem = root.find(f'{{{ns}}}{parent_tag}')
+        if parent_elem is not None:
+            child_objects = parent_elem.find(f'{{{ns}}}ChildObjects')
+
+    if child_objects is None:
+        return 'no-childobj'
+
+    existing = child_objects.findall(f'{{{ns}}}{child_tag}')
+    if any((e.text or '').strip() == child_name for e in existing):
+        return 'already'
+
+    eol = '\r\n' if '\r\n' in config_content else '\n'
+    entry = f'<{child_tag}>{esc_xml_text(child_name)}</{child_tag}>'
+
+    block = re.search(r'<ChildObjects\s*>.*?</ChildObjects>', config_content, re.S)
+    if block is None:
+        # Empty self-closing <ChildObjects/> => open it with the first entry.
+        empty = re.search(r'<ChildObjects\s*/>', config_content)
+        if empty is None:
+            return 'no-childobj'
+        replacement = f'<ChildObjects>{eol}\t\t\t{entry}{eol}\t\t</ChildObjects>'
+        new_content = config_content[:empty.start()] + replacement + config_content[empty.end():]
+        write_utf8_bom(parent_xml_path, new_content)
+        return 'added'
+
+    # byName: перед первым объектом того же вида, чьё имя больше нового.
+    # Виды с осмысленным порядком в дереве пропускаем — см. is_order_sensitive_type.
+    if (not is_order_sensitive_type(child_tag)
+            and get_new_object_position(os.path.dirname(os.path.abspath(parent_xml_path))) == 'byName'):
+        line_rx = re.compile(rf'(?m)^([ \t]*)<{child_tag}>([^<]*)</{child_tag}>')
+        for m in line_rx.finditer(config_content, block.start(), block.end()):
+            if compare_metadata_names(m.group(2), child_name) > 0:
+                new_content = (config_content[:m.start()]
+                               + f'{m.group(1)}{entry}{eol}'
+                               + config_content[m.start():])
+                write_utf8_bom(parent_xml_path, new_content)
+                return 'added'
+
+    close_same = f'</{child_tag}>'
+    last_same = config_content.rfind(close_same, block.start(), block.end())
+    if last_same != -1:
+        # After the last element of the same type (keeps them grouped).
+        insert_at = last_same + len(close_same)
+        new_content = (config_content[:insert_at]
+                       + f'{eol}\t\t\t{entry}'
+                       + config_content[insert_at:])
+    else:
+        # Группы своего вида ещё нет: ставим её в канонический порядок видов — перед первой
+        # группой вида старше по CHILD_OBJECT_TYPES. Дописать в конец блока нельзя: платформа
+        # переставит группу при первой же выгрузке и даст диф на ровном месте.
+        anchor = None
+        if child_tag in CHILD_OBJECT_TYPES:
+            own_idx = CHILD_OBJECT_TYPES.index(child_tag)
+            type_rx = re.compile(r'(?m)^([ \t]*)<(\w+)>[^<]*</\2>')
+            for m in type_rx.finditer(config_content, block.start(), block.end()):
+                other = m.group(2)
+                if other in CHILD_OBJECT_TYPES and CHILD_OBJECT_TYPES.index(other) > own_idx:
+                    anchor = m
+                    break
+        if anchor is not None:
+            new_content = (config_content[:anchor.start()]
+                           + f'{anchor.group(1)}{entry}{eol}'
+                           + config_content[anchor.start():])
+        else:
+            # Видов старше в файле нет — новая строка перед </ChildObjects>,
+            # отступ закрывающего тега переиспользуется.
+            close_at = config_content.rfind('</ChildObjects>', block.start(), block.end())
+            new_content = (config_content[:close_at]
+                           + f'\t{entry}{eol}\t\t'
+                           + config_content[close_at:])
+    write_utf8_bom(parent_xml_path, new_content)
+    return 'added'
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description='Compile 1C role from JSON', allow_abbrev=False)
     parser.add_argument('-JsonPath', type=str, required=True)
     parser.add_argument('-OutputDir', type=str, required=True)
-    args = parser.parse_args()
+    args = ci_parse_args(parser)
 
     # --- 1. Load and validate JSON ---
     json_path = args.JsonPath
@@ -654,8 +1693,7 @@ def main():
         print(f"File not found: {json_path}", file=sys.stderr)
         sys.exit(1)
 
-    with open(json_path, 'r', encoding='utf-8-sig') as f:
-        defn = json.load(f)
+    defn = ci_json(parse_json_input(read_json_file(json_path), json_path))
 
     if not defn.get('name'):
         print("JSON must have 'name' field (role programmatic name)", file=sys.stderr)
@@ -674,12 +1712,34 @@ def main():
     format_version = detect_format_version(out_dir_resolved)
 
     # --- 2. Parse all object entries ---
+    # Относительный путь @файла ищем сначала рядом с JSON-описанием роли.
+    global TEXT_BASE_DIR
+    TEXT_BASE_DIR = os.path.dirname(os.path.abspath(args.JsonPath))
+
     parsed_objects = []
+    seen_object_names = set()
     if defn.get('objects'):
         for entry in defn['objects']:
             parsed = parse_object_entry(entry)
-            if parsed:
-                parsed_objects.append(parsed)
+            if not parsed:
+                continue
+            for p in expand_service_entry(parsed, out_dir_resolved, role_name):
+                # Дубль возникает штатно: раскрытый лист совпал с явно заданным. Права на
+                # листе одни и те же (Use), так что вторая запись — шум, а не конфликт.
+                if p['Name'] in seen_object_names:
+                    print(f"WARNING: {p['Name']}: объект указан дважды, вторая запись пропущена", file=sys.stderr)
+                    continue
+                seen_object_names.add(p['Name'])
+                parsed_objects.append(p)
+
+    # Отказ ДО записи: роль пишется тремя файлами (метаданные, права, регистрация в
+    # Configuration.xml), и частично записанная роль хуже отсутствующей. Печатаем все
+    # причины разом — иначе пользователь чинит их по одной.
+    if VALIDATION_ERRORS:
+        print(f"[role-compile] Роль не создана: {len(VALIDATION_ERRORS)} ошибок в описании прав.", file=sys.stderr)
+        for e in VALIDATION_ERRORS:
+            print(f"  ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # --- 3. Generate UUID ---
     uid = new_uuid()
@@ -702,11 +1762,11 @@ def main():
     lines.append('\t\t\t<Synonym>')
     lines.append('\t\t\t\t<v8:item>')
     lines.append('\t\t\t\t\t<v8:lang>ru</v8:lang>')
-    lines.append(f'\t\t\t\t\t<v8:content>{esc_xml(synonym)}</v8:content>')
+    lines.append(f'\t\t\t\t\t<v8:content>{esc_xml_text(synonym)}</v8:content>')
     lines.append('\t\t\t\t</v8:item>')
     lines.append('\t\t\t</Synonym>')
     if comment:
-        lines.append(f'\t\t\t<Comment>{esc_xml(comment)}</Comment>')
+        lines.append(f'\t\t\t<Comment>{esc_xml_text(comment)}</Comment>')
     else:
         lines.append('\t\t\t<Comment/>')
     lines.append('\t\t</Properties>')
@@ -731,6 +1791,35 @@ def main():
     lines.append(f'\t<setForAttributesByDefault>{sfab}</setForAttributesByDefault>')
     lines.append(f'\t<independentRightsOfChildObjects>{irco}</independentRightsOfChildObjects>')
 
+    # Замыкание зависимостей: платформа при загрузке всё равно доведёт набор до полного,
+    # и файл разошёлся бы с базой. Дописанное показываем — права выдаются не молча.
+    closure_notes = []
+    for o in parsed_objects:
+        o['Rights'], added = close_rights_dependencies(o['Name'], o['Rights'], format_rank(format_version))
+        if added:
+            closure_notes.append(f"     {o['Name']}: по зависимости добавлено — {', '.join(added)}")
+
+    # Порядок как у платформы: узлы по uuid объекта, права — по канону типа. Иначе первая же
+    # выгрузка из Конфигуратора переставит их и даст диф, которого никто не делал.
+    parsed_objects = sort_objects_by_uuid(parsed_objects, out_dir_resolved)
+    for o in parsed_objects:
+        o['Rights'] = sort_rights_canonical(o['Name'], o['Rights'])
+
+    # Записи, равные умолчанию роли, платформа не хранит — отбрасываем их сами и говорим об этом.
+    dropped_by_default = []
+    for obj in parsed_objects:
+        default_value = get_default_right_value(obj['Name'], sfno, sfab)
+        kept = []
+        for right in obj['Rights']:
+            # Право с ограничением отличается от умолчания самим ограничением — его платформа хранит,
+            # и выбросить его значило бы молча потерять написанное условие.
+            if right['Value'] == default_value and not right['Condition']:
+                dropped_by_default.append(f"{obj['Name']}.{right['Name']}")
+                continue
+            kept.append(right)
+        obj['Rights'] = kept
+    parsed_objects = [o for o in parsed_objects if o['Rights']]
+
     # Object blocks
     total_rights = 0
     for obj in parsed_objects:
@@ -742,7 +1831,7 @@ def main():
             lines.append(f'\t\t\t<value>{right["Value"]}</value>')
             if right['Condition']:
                 lines.append('\t\t\t<restrictionByCondition>')
-                lines.append(f'\t\t\t\t<condition>{esc_xml(right["Condition"])}</condition>')
+                lines.append(f'\t\t\t\t<condition>{esc_xml_text(right["Condition"])}</condition>')
                 lines.append('\t\t\t</restrictionByCondition>')
             lines.append('\t\t</right>')
             total_rights += 1
@@ -753,8 +1842,8 @@ def main():
     if defn.get('templates'):
         for tpl in defn['templates']:
             lines.append('\t<restrictionTemplate>')
-            lines.append(f'\t\t<name>{esc_xml(str(tpl["name"]))}</name>')
-            lines.append(f'\t\t<condition>{esc_xml(str(tpl["condition"]))}</condition>')
+            lines.append(f'\t\t<name>{esc_xml_text(str(tpl["name"]))}</name>')
+            lines.append(f'\t\t<condition>{esc_xml_text(resolve_text_from_file(str(tpl["condition"]), TEXT_BASE_DIR))}</condition>')
             lines.append('\t</restrictionTemplate>')
             template_count += 1
 
@@ -792,43 +1881,7 @@ def main():
 
     # --- 7. Register in Configuration.xml ---
     config_xml_path = os.path.join(config_dir, 'Configuration.xml')
-    reg_result = None
-
-    if os.path.exists(config_xml_path):
-        # newline='' => без трансляции переводов строк: иначе CRLF молча схлопнется
-        # в LF при чтении и файл будет переписан в LF.
-        with open(config_xml_path, 'r', encoding='utf-8-sig', newline='') as f:
-            raw_text = f.read()
-
-        eol = detect_eol(raw_text)
-
-        # Check if already registered
-        if f'<Role>{role_name}</Role>' in raw_text:
-            reg_result = 'already'
-        else:
-            # Find last <Role>...</Role> and insert after it
-            role_pattern = re.compile(r'(<Role>[^<]*</Role>)')
-            matches = list(role_pattern.finditer(raw_text))
-            new_role_tag = f'<Role>{role_name}</Role>'
-
-            if matches:
-                # Insert after last existing <Role>
-                last_match = matches[-1]
-                insert_pos = last_match.end()
-                raw_text = raw_text[:insert_pos] + eol + f'\t\t\t{new_role_tag}' + raw_text[insert_pos:]
-            else:
-                # No existing roles — insert before </ChildObjects>
-                # Отступ вставки берём у закрывающего тега +1 уровень: подстановка
-                # по голому '</ChildObjects>' удваивала бы уже присутствующий отступ
-                # строки (получалось 5 табов вместо 3 — PS-порт через DOM даёт 3).
-                raw_text = re.sub(r'([ \t]*)</ChildObjects>',
-                                  lambda m: m.group(1) + '\t' + new_role_tag + eol + m.group(1) + '</ChildObjects>',
-                                  raw_text, count=1)
-
-            write_utf8_bom(config_xml_path, raw_text)
-            reg_result = 'added'
-    else:
-        reg_result = 'no-config'
+    reg_result = register_in_childobjects(config_xml_path, 'Configuration', 'Role', role_name)
 
     # --- 8. Summary ---
     print(f"[OK] Role '{role_name}' compiled")
@@ -836,6 +1889,13 @@ def main():
     print(f"     Metadata: {metadata_path}")
     print(f"     Rights:   {rights_path}")
     print(f"     Objects: {len(parsed_objects)}, Rights: {total_rights}, Templates: {template_count}")
+    if dropped_by_default:
+        print("[role-compile] Не записаны права, совпадающие с умолчанием роли "
+              f"(платформа их не хранит): {', '.join(dropped_by_default)}", file=sys.stderr)
+        print("  Запрет хранится у реквизитов и табличных частей (они наследуют права объекта) "
+              "либо в роли с setForNewObjects=true; выдача прав — наоборот.", file=sys.stderr)
+    for note in closure_notes:
+        print(note)
     if reg_result == 'added':
         print(f"     Configuration.xml: <Role>{role_name}</Role> added to ChildObjects")
     elif reg_result == 'already':

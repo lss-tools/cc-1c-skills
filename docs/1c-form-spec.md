@@ -144,15 +144,51 @@ CommonForms регистрируются в `Configuration.xml`:
 | Catalog | DefaultObjectForm, DefaultFolderForm, DefaultListForm, DefaultChoiceForm, DefaultFolderChoiceForm |
 | ChartOfCharacteristicTypes | DefaultObjectForm, DefaultFolderForm, DefaultListForm, DefaultChoiceForm, DefaultFolderChoiceForm |
 | ChartOfAccounts | DefaultObjectForm, DefaultListForm, DefaultChoiceForm |
+| ChartOfCalculationTypes | DefaultObjectForm, DefaultListForm, DefaultChoiceForm |
 | DataProcessor | DefaultForm |
 | Report | DefaultForm |
+| ExternalDataProcessor | DefaultForm |
+| ExternalReport | DefaultForm |
 | InformationRegister | DefaultRecordForm, DefaultListForm |
+| AccumulationRegister | DefaultListForm |
+| AccountingRegister | DefaultListForm |
+| CalculationRegister | DefaultListForm |
+| DocumentJournal | DefaultForm |
+| Enum | DefaultListForm, DefaultChoiceForm |
+| FilterCriterion | DefaultForm |
+| SettingsStorage | DefaultSaveForm, DefaultLoadForm |
 | ExchangePlan | DefaultObjectForm, DefaultListForm, DefaultChoiceForm |
 | BusinessProcess | DefaultObjectForm, DefaultListForm, DefaultChoiceForm |
 | Task | DefaultObjectForm, DefaultListForm, DefaultChoiceForm |
+| Constant | DefaultForm — но собственных форм у константы нет, свойство указывает на общую форму |
+| Table | DefaultObjectForm, DefaultRecordForm, DefaultListForm, DefaultChoiceForm |
 | CommonForm | — (регистрируется в Configuration.xml, нет DefaultForm) |
 
 > Report.DefaultForm может указывать на общую форму: `CommonForm.ФормаОтчета`.
+
+#### Главный реквизит формы по назначению
+
+Главный реквизит (`<MainAttribute>true</MainAttribute>`) задаёт вид формы. `{Имя}` — имя объекта.
+
+| Назначение | Свойство объекта | Главный реквизит | Для каких типов |
+|------------|------------------|------------------|-----------------|
+| Форма объекта | DefaultObjectForm | `{Тип}Object.{Имя}` | Catalog, Document, ChartOfAccounts, ChartOfCharacteristicTypes, ChartOfCalculationTypes, ExchangePlan, BusinessProcess, Task, Table |
+| Форма обработки/отчёта | DefaultForm | `{Тип}Object.{Имя}` | DataProcessor, Report, ExternalDataProcessor, ExternalReport |
+| Форма группы | DefaultFolderForm | `{Тип}Object.{Имя}` | Catalog, ChartOfCharacteristicTypes |
+| Форма списка | DefaultListForm (у DocumentJournal и FilterCriterion — DefaultForm) | `DynamicList` + `MainTable` | все типы со списком |
+| Форма выбора | DefaultChoiceForm | `DynamicList` + `MainTable` | Catalog, Document, ChartOf*, ExchangePlan, BusinessProcess, Task, Enum |
+| Форма выбора группы | DefaultFolderChoiceForm | `DynamicList` + `MainTable` | Catalog, ChartOfCharacteristicTypes |
+| Форма записи | DefaultRecordForm | `InformationRegisterRecordManager.{Имя}` или `ExternalDataSourceTableRecordManager.{Источник}.{Имя}` | InformationRegister, Table |
+| Форма набора записей | — (свойства нет) | `{Тип}RecordSet.{Имя}` | все регистры |
+| Форма сохранения/загрузки настроек | DefaultSaveForm / DefaultLoadForm | нет | SettingsStorage |
+| Произвольная форма | — (свойства нет) | нет | любой тип с собственными формами |
+
+> Формы без главного реквизита («произвольные») — обычное дело, а не полуфабрикат: на acc+erp это
+> 907 форм справочников, 941 форма документов, 3482 формы отчётов.
+>
+> У формы набора записей нет свойства, которым её можно назначить основной, — сама форма при этом
+> допустима. У регистров накопления и бухгалтерии `{Тип}RecordSet` как главный реквизит в типовых
+> не встречается: их формы — списки.
 
 ---
 
@@ -182,7 +218,7 @@ CommonForms регистрируются в `Configuration.xml`:
 </Form>
 ```
 
-Все 17 namespace-деклараций **идентичны** во всех формах конфигурации. Атрибут `version` одинаков во всей выгрузке и определяется платформой (`2.17` для 8.3.20–8.3.24, далее `2.18` / `2.19` / `2.20`); примеры ниже приведены для `2.17`.
+Все 17 namespace-деклараций **идентичны** во всех формах конфигурации. Атрибут `version` одинаков во всей выгрузке и определяется платформой выгрузки — по одной версии на релиз (см. [1c-configuration-spec.md §7.1](1c-configuration-spec.md#71-лестница-версий)); примеры ниже приведены для `2.17`.
 
 ### Назначение namespace-префиксов
 
@@ -212,22 +248,51 @@ CommonForms регистрируются в `Configuration.xml`:
 
 ```
 <Form>
-  ┌─ Свойства формы (необязательные, в произвольном порядке)
+  ┌─ Свойства формы (необязательные) — часть до <CommandSet>, часть после
   ├─ <CommandSet>           — исключённые стандартные команды
+  ├─ …продолжение свойств формы (AutoTime, UsePostingMode, RepostOnWrite, ReportResult…)
   ├─ <AutoCommandBar>       — главная командная панель (обязательный, id="-1")
   ├─ <Events>               — обработчики событий формы
   ├─ <ChildItems>           — дерево UI-элементов
   ├─ <Attributes>           — реквизиты формы
+  ├─ <Commands>             — пользовательские команды
   ├─ <Parameters>           — параметры открытия формы
-  └─ <Commands>             — пользовательские команды
+  └─ <CommandInterface>     — командный интерфейс формы
 </Form>
+```
+
+Порядок **строгий**, а не произвольный: на 30223 формах корпуса (ERP, УТ, УНФ 8.5, БП, общие
+формы) не встретилось ни одной пары элементов, идущей в разном порядке в разных формах.
+
+Важно: `<CommandSet>` стоит **в середине блока свойств**, а не перед ним — свойства есть и до, и
+после него. У всех 794 форм документов ERP с `CommandSet` он предшествует `AutoCommandBar`, а
+`AutoTime`/`UsePostingMode`/`RepostOnWrite` идут **после** `CommandSet`.
+
+Надёжная граница между свойствами и структурными секциями — **`<AutoCommandBar>`**: он присутствует
+в 100% форм корпуса, и ни одно свойство никогда не стоит после него. Код, отделяющий свойства от
+структуры, должен опираться на него, а не на «первую встреченную секцию».
+
+Полный наблюдаемый порядок:
+
+```
+Title · Width · Height · WindowOpeningMode · EnterKeyBehavior · AutoSaveDataInSettings ·
+SaveDataInSettings · SaveWindowSettings · SettingsStorage · AutoTitle · AutoURL · Group ·
+ChildItemsWidth · ChildrenAlign · HorizontalSpacing · Scale · VerticalSpacing · HorizontalAlign ·
+VerticalAlign · AutoFillCheck · Customizable · Enabled · CommandBarLocation · VerticalScroll ·
+ScalingMode · ConversationsRepresentation · MobileDeviceCommandBarContent · ScaleVariant ·
+CommandSet · GroupList · ShowTitle · CreateButtonsGroupPicture · CreateButtonsGroupTitle ·
+ShowCloseButton · CollapseItemsByImportanceVariant · WindowViewMode · ShowCommandBar · AutoTime ·
+ReportResult · DetailsData · ReportFormType · UseForFoldersAndItems · UsePostingMode ·
+RepostOnWrite · VariantAppearance · AutoShowState · CustomSettingsFolder · ReportResultViewMode ·
+ViewModeApplicationOnSetReportResult · AutoCommandBar · Events · ChildItems · Attributes ·
+Commands · Parameters · CommandInterface
 ```
 
 ---
 
 ## 3. Свойства формы
 
-Прямые дочерние элементы `<Form>` (все необязательные, указываются до `<CommandSet>`/`<AutoCommandBar>`):
+Прямые дочерние элементы `<Form>` — все необязательные, порядок между ними фиксирован (см. §2):
 
 ### Общие свойства (все типы форм)
 
@@ -258,8 +323,8 @@ CommonForms регистрируются в `Configuration.xml`:
 
 | Элемент | Значения | Описание |
 |---------|----------|----------|
-| `<AutoTime>` | `CurrentOrLast`, `Current`, `Last` | Управление временем документа |
-| `<UsePostingMode>` | `Auto`, `Postings`, `Movements` | Режим проведения |
+| `<AutoTime>` | `CurrentOrLast`, `DontUse`, `Current`, `Last` | Управление временем документа. В корпусе встречаются только `CurrentOrLast` и `DontUse` |
+| `<UsePostingMode>` | `Auto`, `Regular` | Режим проведения |
 | `<RepostOnWrite>` | `true`/`false` | Перепроведение при записи |
 
 ### Свойства справочников (Catalogs, ChartsOfAccounts)
@@ -274,7 +339,7 @@ CommonForms регистрируются в `Configuration.xml`:
 |---------|----------|----------|
 | `<ReportResult>` | string | Имя реквизита результата (`Результат`) |
 | `<DetailsData>` | string | Имя реквизита расшифровки (`ДанныеРасшифровки`) |
-| `<ReportFormType>` | `Main`, `Settings`, `Choice` | Тип формы отчёта |
+| `<ReportFormType>` | `Main`, `Settings`, `Variant` | Тип формы отчёта |
 | `<AutoShowState>` | `Auto`, `Show`, `Hide` | Автоотображение состояния |
 | `<ReportResultViewMode>` | `Auto`, `Table`, `Spreadsheet` | Режим отображения результата |
 | `<ViewModeApplicationOnSetReportResult>` | `Auto`, `Always`, `Never` | Применение режима |
@@ -897,6 +962,11 @@ ChildItems
 ```
 
 ### 9.1. Система типов
+
+Перечни ниже — самые полные в документации и НЕ только про формы: те же имена стоят в `<v8:Type>`
+любого объекта метаданных. Набор доступных типов зависит от владельца: у реквизита, хранимого в базе,
+это скаляры + ссылочные + ОпределяемыйТип/Характеристика; у реквизита обработки или формы — ещё и рантайм-типы
+из таблиц `v8:*`, `v8ui:*`, `dcs*:*` и системные перечисления `ent:*`.
 
 #### Примитивные типы (xs:*)
 

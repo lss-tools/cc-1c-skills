@@ -1,5 +1,6 @@
-﻿# form-add v1.23 — Add managed form to 1C config object
+﻿# form-add v1.29 — Add managed form to 1C config object
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
+[CmdletBinding(PositionalBinding=$false)]
 param(
 	[Parameter(Mandatory)]
 	[string]$ObjectPath,
@@ -9,8 +10,15 @@ param(
 
 	[string]$Synonym = $FormName,
 
-	[string]$Purpose = "Object",
+	# Пусто = основная форма вида (Primary в таблице): у справочника это форма объекта,
+	# у регистра сведений — форма записи, у журнала — форма списка. Жёсткое "Object"
+	# по умолчанию было бы неверным для видов, у которых формы объекта не бывает.
+	[string]$Purpose = "",
 
+	# Алиас с дефисом внутри имени: вызов вида --set-default PowerShell разбирает как имя
+	# параметра "set-default" и без алиаса отвечает отказом биндинга. Написания -SetDefault,
+	# --SetDefault и --setdefault совпадают с именем параметра и так.
+	[Alias('set-default')]
 	[switch]$SetDefault
 )
 
@@ -241,26 +249,175 @@ if (-not $metaDataObject) {
 	$metaDataObject = $xmlDoc.DocumentElement
 }
 
-$supportedTypes = @(
-	"Document", "Catalog", "DataProcessor", "Report",
-	"ExternalDataProcessor", "ExternalReport",
-	"InformationRegister", "AccumulationRegister", "ChartOfAccounts", "ChartOfCharacteristicTypes",
-	"ExchangePlan", "BusinessProcess", "Task", "DocumentJournal"
-)
+# --- Таблица видов: вид → допустимые назначения ---
+#
+# Одна запись на вид вместо разрозненных списков «поддерживаемые типы», «объектные типы»,
+# «обработко-подобные» и «карта типов реквизита». Раньше они расходились молча: DocumentJournal
+# был среди поддерживаемых, но не в карте типов, и в форму уходило `cfg:.Журнал` — платформа
+# такую выгрузку не принимает, а навык рапортовал успех.
+#
+# MainAttr — тип главного реквизита; `{0}` подставляется именем объекта:
+#   "DynamicList" — динамический список (добавляется Settings/MainTable);
+#   $null         — произвольная форма, блока Attributes нет вовсе.
+# Slot — свойство объекта под «основную форму»; $null — такого свойства у вида нет.
+# Эталон таблицы — docs/1c-form-spec.md, сверяется гардом check-form-purposes.mjs.
 
+$formKinds = @{
+	"Catalog" = @{
+		"Object"       = @{ MainAttr = "CatalogObject.{1}"; AttrName = "Объект"; Slot = "DefaultObjectForm"; SavedData = $true; Primary = $true }
+		"Folder"       = @{ MainAttr = "CatalogObject.{1}"; AttrName = "Объект"; Slot = "DefaultFolderForm"; SavedData = $true }
+		"List"         = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultListForm" }
+		"Choice"       = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultChoiceForm" }
+		"FolderChoice" = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultFolderChoiceForm" }
+		"Custom"       = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"ChartOfCharacteristicTypes" = @{
+		"Object"       = @{ MainAttr = "ChartOfCharacteristicTypesObject.{1}"; AttrName = "Объект"; Slot = "DefaultObjectForm"; SavedData = $true; Primary = $true }
+		"Folder"       = @{ MainAttr = "ChartOfCharacteristicTypesObject.{1}"; AttrName = "Объект"; Slot = "DefaultFolderForm"; SavedData = $true }
+		"List"         = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultListForm" }
+		"Choice"       = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultChoiceForm" }
+		"FolderChoice" = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultFolderChoiceForm" }
+		"Custom"       = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"Document" = @{
+		"Object" = @{ MainAttr = "DocumentObject.{1}"; AttrName = "Объект"; Slot = "DefaultObjectForm"; SavedData = $true; Primary = $true }
+		"List"   = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultListForm" }
+		"Choice" = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultChoiceForm" }
+		"Custom" = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"ChartOfAccounts" = @{
+		"Object" = @{ MainAttr = "ChartOfAccountsObject.{1}"; AttrName = "Объект"; Slot = "DefaultObjectForm"; SavedData = $true; Primary = $true }
+		"List"   = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultListForm" }
+		"Choice" = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultChoiceForm" }
+		"Custom" = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"ChartOfCalculationTypes" = @{
+		"Object" = @{ MainAttr = "ChartOfCalculationTypesObject.{1}"; AttrName = "Объект"; Slot = "DefaultObjectForm"; SavedData = $true; Primary = $true }
+		"List"   = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultListForm" }
+		"Choice" = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultChoiceForm" }
+		"Custom" = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"ExchangePlan" = @{
+		"Object" = @{ MainAttr = "ExchangePlanObject.{1}"; AttrName = "Объект"; Slot = "DefaultObjectForm"; SavedData = $true; Primary = $true }
+		"List"   = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultListForm" }
+		"Choice" = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultChoiceForm" }
+		"Custom" = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"BusinessProcess" = @{
+		"Object" = @{ MainAttr = "BusinessProcessObject.{1}"; AttrName = "Объект"; Slot = "DefaultObjectForm"; SavedData = $true; Primary = $true }
+		"List"   = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultListForm" }
+		"Choice" = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultChoiceForm" }
+		"Custom" = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"Task" = @{
+		"Object" = @{ MainAttr = "TaskObject.{1}"; AttrName = "Объект"; Slot = "DefaultObjectForm"; SavedData = $true; Primary = $true }
+		"List"   = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultListForm" }
+		"Choice" = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultChoiceForm" }
+		"Custom" = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"DataProcessor" = @{
+		"Object" = @{ MainAttr = "DataProcessorObject.{1}"; AttrName = "Объект"; Slot = "DefaultForm"; Primary = $true }
+		"Custom" = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"Report" = @{
+		"Object" = @{ MainAttr = "ReportObject.{1}"; AttrName = "Объект"; Slot = "DefaultForm"; Primary = $true }
+		"Custom" = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"ExternalDataProcessor" = @{
+		"Object" = @{ MainAttr = "ExternalDataProcessorObject.{1}"; AttrName = "Объект"; Slot = "DefaultForm"; Primary = $true }
+		"Custom" = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"ExternalReport" = @{
+		"Object" = @{ MainAttr = "ExternalReportObject.{1}"; AttrName = "Объект"; Slot = "DefaultForm"; Primary = $true }
+		"Custom" = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"InformationRegister" = @{
+		"Record"    = @{ MainAttr = "InformationRegisterRecordManager.{1}"; AttrName = "Запись"; Slot = "DefaultRecordForm"; SavedData = $true; Primary = $true }
+		"List"      = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultListForm" }
+		"RecordSet" = @{ MainAttr = "InformationRegisterRecordSet.{1}"; AttrName = "Набор"; Slot = $null; SavedData = $true }
+		"Custom"    = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"AccumulationRegister" = @{
+		"List"      = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultListForm"; Primary = $true }
+		"RecordSet" = @{ MainAttr = "AccumulationRegisterRecordSet.{1}"; AttrName = "Набор"; Slot = $null; SavedData = $true }
+		"Custom"    = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"AccountingRegister" = @{
+		"List"      = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultListForm"; Primary = $true }
+		"RecordSet" = @{ MainAttr = "AccountingRegisterRecordSet.{1}"; AttrName = "Набор"; Slot = $null; SavedData = $true }
+		"Custom"    = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"CalculationRegister" = @{
+		"List"      = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultListForm"; Primary = $true }
+		"RecordSet" = @{ MainAttr = "CalculationRegisterRecordSet.{1}"; AttrName = "Набор"; Slot = $null; SavedData = $true }
+		"Custom"    = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"DocumentJournal" = @{
+		"List"   = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultForm"; Primary = $true }
+		"Custom" = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"FilterCriterion" = @{
+		"List"   = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultForm"; Primary = $true }
+		"Custom" = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"Enum" = @{
+		"List"   = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultListForm"; Primary = $true }
+		"Choice" = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultChoiceForm" }
+		"Custom" = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	"SettingsStorage" = @{
+		"Save"   = @{ MainAttr = $null; AttrName = $null; Slot = "DefaultSaveForm"; Primary = $true }
+		"Load"   = @{ MainAttr = $null; AttrName = $null; Slot = "DefaultLoadForm" }
+		"Custom" = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+	# Таблица внешнего источника — единственный вид, чьё имя в ссылках трёхчастное
+	# (Источник.Таблица): подставляется {2}, а не {1}.
+	"Table" = @{
+		"Object" = @{ MainAttr = "ExternalDataSourceTableObject.{2}"; AttrName = "Объект"; Slot = "DefaultObjectForm"; SavedData = $true; Primary = $true }
+		"Record" = @{ MainAttr = "ExternalDataSourceTableRecordManager.{2}"; AttrName = "Запись"; Slot = "DefaultRecordForm"; SavedData = $true }
+		"List"   = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultListForm" }
+		"Choice" = @{ MainAttr = "DynamicList"; AttrName = "Список"; Slot = "DefaultChoiceForm" }
+		"Custom" = @{ MainAttr = $null; AttrName = $null; Slot = $null }
+	}
+}
+
+# Виды, у которых свойство DefaultForm есть, но собственных форм не бывает — отказ с причиной,
+# а не «тип не поддерживается».
+$noOwnForms = @{
+	"Constant" = "у константы нет собственных форм — используйте общую форму (CommonForm)"
+}
+
+$supportedTypes = @($formKinds.Keys) + @($noOwnForms.Keys)
+
+# Отдельный факт, не выводимый из таблицы назначений: у форм обработок и отчётов в метаданных
+# формы есть <ExtendedPresentation>.
+$processorLikeTypes = @("DataProcessor", "Report", "ExternalDataProcessor", "ExternalReport")
+
+# Вид объекта — первый элемент-потомок MetaDataObject, а не первое совпавшее по всему документу
+# имя. Поиск по документу зависел от порядка перебора видов: у бизнес-процесса есть свойство
+# <Task>, и он определялся как задача, после чего имя объекта не находилось вовсе.
 $objectType = $null
 $objectNode = $null
-foreach ($t in $supportedTypes) {
-	$node = $xmlDoc.SelectSingleNode("//md:$t", $nsMgr)
-	if ($node) {
-		$objectType = $t
-		$objectNode = $node
+foreach ($child in $metaDataObject.ChildNodes) {
+	if ($child.NodeType -eq [System.Xml.XmlNodeType]::Element) {
+		$objectType = $child.LocalName
+		$objectNode = $child
 		break
 	}
 }
 
+if ($objectType -and -not ($formKinds.ContainsKey($objectType) -or $noOwnForms.ContainsKey($objectType))) {
+	Write-Error "Тип объекта '$objectType' не поддерживается. Поддерживаемые типы: $(($formKinds.Keys | Sort-Object) -join ', ')"
+	exit 1
+}
+
 if (-not $objectType) {
-	Write-Error "Не удалось определить тип объекта. Поддерживаемые типы: $($supportedTypes -join ', ')"
+	Write-Error "Не удалось определить тип объекта. Поддерживаемые типы: $(($formKinds.Keys | Sort-Object) -join ', ')"
+	exit 1
+}
+
+if ($noOwnForms.ContainsKey($objectType)) {
+	Write-Error "$objectType не поддерживается: $($noOwnForms[$objectType])"
 	exit 1
 }
 
@@ -274,48 +431,101 @@ if (-not $objectName) {
 Write-Host ""
 Write-Host "=== form-add ==="
 Write-Host ""
+# Ссылка на объект и имя для типов формы. У всех видов это "Вид.Имя", и только
+# у таблицы внешнего источника — "ExternalDataSource.<Источник>.Table.<Таблица>", а в именах
+# типов — "<Источник>.<Таблица>". Имя источника в самом файле таблицы не хранится —
+# единственное место, где навык смотрит на путь: ExternalDataSources/<Источник>/Tables/<Таблица>.xml
+$objectQualifiedName = $objectName
+$objectRef = "$objectType.$objectName"
+if ($objectType -eq "Table") {
+	$tablesDir = Split-Path -Parent $objectXmlFull.Path
+	$edsSource = Split-Path -Leaf (Split-Path -Parent $tablesDir)
+	if (-not $edsSource -or (Split-Path -Leaf $tablesDir) -ne "Tables") {
+		Write-Error "Таблица внешнего источника ожидается по пути ExternalDataSources/<Источник>/Tables/<Таблица>.xml, а не '$($objectXmlFull.Path)'"
+		exit 1
+	}
+	$objectQualifiedName = "$edsSource.$objectName"
+	$objectRef = "ExternalDataSource.$edsSource.Table.$objectName"
+	$tdtNode = $xmlDoc.SelectSingleNode("//md:Table/md:Properties/md:TableDataType", $nsMgr)
+	$tableDataType = if ($tdtNode) { $tdtNode.InnerText.Trim() } else { "ObjectData" }
+}
+
 Write-Host "Object: $objectType.$objectName"
 
 # --- Фаза 2: Валидация Purpose ---
 
-$Purpose = $Purpose.Substring(0,1).ToUpper() + $Purpose.Substring(1).ToLower()
-# Нормализация
-switch ($Purpose) {
-	"Object" { }
-	"List"   { }
-	"Choice" { }
-	"Record" { }
-	default {
-		Write-Error "Недопустимое назначение: $Purpose. Допустимые: Object, List, Choice, Record"
+# Назначение ищем в таблице регистронезависимо — как принимает PowerShell (в py-порту .lower()).
+$kindPurposes = $formKinds[$objectType]
+
+# Обиходные написания назначения приводим к канону молча: русское название вида формы и
+# английское с суффиксом Form. Ключ нормализуем — регистр, пробелы и разделители не значимы.
+# Канон в документации один; здесь только приём ошибочного ввода, чтобы вызов не падал на форме
+# записи вместо назначения. Применимость назначения к виду объекта проверяется ниже как обычно.
+$purposeSynonyms = @{
+	"формаобъекта"="Object"; "формаэлемента"="Object"; "формадокумента"="Object"
+	"объект"="Object"; "элемент"="Object"; "документ"="Object"; "objectform"="Object"
+	"формасписка"="List"; "список"="List"; "listform"="List"
+	"формавыбора"="Choice"; "выбор"="Choice"; "choiceform"="Choice"
+	"формагруппы"="Folder"; "группа"="Folder"; "folderform"="Folder"
+	"формавыборагруппы"="FolderChoice"; "выборгруппы"="FolderChoice"; "folderchoiceform"="FolderChoice"
+	"формазаписи"="Record"; "запись"="Record"; "recordform"="Record"
+	"форманаборазаписей"="RecordSet"; "наборзаписей"="RecordSet"; "recordsetform"="RecordSet"
+	"формасохранения"="Save"; "формасохранениянастроек"="Save"; "сохранение"="Save"; "saveform"="Save"
+	"формазагрузки"="Load"; "формазагрузкинастроек"="Load"; "загрузка"="Load"; "loadform"="Load"
+	"произвольная"="Custom"; "произвольнаяформа"="Custom"; "customform"="Custom"
+}
+if ($Purpose) {
+	$purposeProbe = ($Purpose -replace '[\s_-]', '').ToLowerInvariant()
+	$isKnownPurpose = $false
+	foreach ($p in $kindPurposes.Keys) {
+		if ($p.ToLowerInvariant() -eq $Purpose.ToLowerInvariant()) { $isKnownPurpose = $true; break }
+	}
+	if (-not $isKnownPurpose -and $purposeSynonyms.ContainsKey($purposeProbe)) {
+		$Purpose = $purposeSynonyms[$purposeProbe]
+	}
+}
+if (-not $Purpose) {
+	if ($objectType -eq "Table" -and $tableDataType -eq "NonobjectData") {
+		# Пометка Primary в таблице видов одна на вид, а у таблицы с составным ключом
+		# формы объекта не бывает — основной становится форма записи.
+		$Purpose = "Record"
+	} else {
+		foreach ($p in $kindPurposes.Keys) {
+			if ($kindPurposes[$p].Primary) { $Purpose = $p; break }
+		}
+	}
+}
+$purposeKey = $null
+foreach ($p in $kindPurposes.Keys) {
+	if ($p.ToLowerInvariant() -eq $Purpose.ToLowerInvariant()) { $purposeKey = $p; break }
+}
+if (-not $purposeKey) {
+	Write-Error "Назначение '$Purpose' недопустимо для $objectType. Допустимые: $(($kindPurposes.Keys | Sort-Object) -join ', ')"
+	exit 1
+}
+$Purpose = $purposeKey
+$purposeRule = $kindPurposes[$Purpose]
+
+# У таблицы внешнего источника набор назначений зависит от вида данных (замерено на
+# 8.3.24.1691): ObjectData — Object/List/Choice, NonobjectData — Record/List/Choice. Неверная пара
+# не отвергается схемой формы, а валит загрузку всей конфигурации «Исключением XDTO» без причины.
+if ($objectType -eq "Table") {
+	if ($tableDataType -eq "NonobjectData" -and $Purpose -eq "Object") {
+		Write-Error "Таблица '$objectName' с составным ключом (TableDataType=NonobjectData): формы объекта у неё нет — используйте -Purpose Record."
+		exit 1
+	}
+	if ($tableDataType -ne "NonobjectData" -and $Purpose -eq "Record") {
+		Write-Error "Таблица '$objectName' с ключом из одного поля (TableDataType=ObjectData): формы записи у неё нет — используйте -Purpose Object."
 		exit 1
 	}
 }
 
-$objectLikeTypes = @("Document", "Catalog", "ChartOfAccounts", "ChartOfCharacteristicTypes", "ExchangePlan", "BusinessProcess", "Task")
-$processorLikeTypes = @("DataProcessor", "Report", "ExternalDataProcessor", "ExternalReport")
-
-switch ($Purpose) {
-	"Object" {
-		# допустимо для всех типов
-	}
-	"List" {
-		if ($objectType -eq "DataProcessor") {
-			Write-Error "Purpose=List недопустим для DataProcessor"
-			exit 1
-		}
-	}
-	"Choice" {
-		if ($objectType -in $processorLikeTypes -or $objectType -eq "InformationRegister") {
-			Write-Error "Purpose=Choice недопустим для $objectType"
-			exit 1
-		}
-	}
-	"Record" {
-		if ($objectType -ne "InformationRegister") {
-			Write-Error "Purpose=Record допустим только для InformationRegister"
-			exit 1
-		}
-	}
+# Гард от повторения дефекта: запись таблицы обязана быть заполненной. Пустой MainAttr — это
+# произвольная форма (законное состояние), а вот наполовину заполненная запись означала бы, что
+# таблицу правили невнимательно, и в XML уйдёт мусор вроде `cfg:.Журнал`.
+if ($purposeRule.MainAttr -and -not $purposeRule.AttrName) {
+	Write-Error "Внутренняя ошибка таблицы видов: у $objectType/$Purpose задан MainAttr без AttrName"
+	exit 1
 }
 
 # --- Фаза 3: Создание файлов ---
@@ -395,101 +605,46 @@ Write-XmlFile $formMetaPath $formMetaXml $encBom
 
 $formXmlPath = Join-Path $formExtDir "Form.xml"
 
-if ($Purpose -eq "List" -or $Purpose -eq "Choice") {
-	# Динамический список
-	# MainTable: тип.имя
-	$mainTable = "$objectType.$objectName"
+# Одна ветка вместо трёх: что писать, решает запись таблицы видов. Раньше тип главного
+# реквизита брался из отдельной карты, и отсутствие вида в ней давало `cfg:.Имя` — молча.
+$attributesBlock = ""
+if ($purposeRule.MainAttr) {
+	$mainAttrType = $purposeRule.MainAttr -f $objectType, $objectName, $objectQualifiedName
+	$mainAttrName = $purposeRule.AttrName
 
-	$formXml = @"
-<?xml version="1.0" encoding="UTF-8"?>
-<Form $($script:formNsDecl) version="$($script:formatVersion)">
-	<AutoCommandBar name="ФормаКоманднаяПанель" id="-1">
-		<Autofill>true</Autofill>
-	</AutoCommandBar>
-	<ChildItems/>
-	<Attributes>
-		<Attribute name="Список" id="1">
-			<Type>
-				<v8:Type>cfg:DynamicList</v8:Type>
-			</Type>
-			<MainAttribute>true</MainAttribute>
-			<Settings xsi:type="DynamicList">
-				<MainTable>$mainTable</MainTable>
-			</Settings>
-		</Attribute>
-	</Attributes>
-</Form>
-"@
-} elseif ($Purpose -eq "Record") {
-	# Запись регистра сведений
-	$mainAttrName = "Запись"
-	$mainAttrType = "InformationRegisterRecordManager.$objectName"
+	# Динамический список несёт MainTable, остальные типы — SavedData по записи таблицы.
+	$tailLines = ""
+	if ($mainAttrType -eq "DynamicList") {
+		$mainTable = $objectRef
+		$tailLines = "`n`t`t`t<Settings xsi:type=""DynamicList"">`n`t`t`t`t<MainTable>$mainTable</MainTable>`n`t`t`t</Settings>"
+	} elseif ($purposeRule.SavedData) {
+		$tailLines = "`n`t`t`t<SavedData>true</SavedData>"
+	}
 
-	$formXml = @"
-<?xml version="1.0" encoding="UTF-8"?>
-<Form $($script:formNsDecl) version="$($script:formatVersion)">
-	<AutoCommandBar name="ФормаКоманднаяПанель" id="-1">
-		<Autofill>true</Autofill>
-	</AutoCommandBar>
-	<ChildItems/>
+	$attributesBlock = @"
+
 	<Attributes>
 		<Attribute name="$mainAttrName" id="1">
 			<Type>
 				<v8:Type>cfg:$mainAttrType</v8:Type>
 			</Type>
-			<MainAttribute>true</MainAttribute>
-			<SavedData>true</SavedData>
+			<MainAttribute>true</MainAttribute>$tailLines
 		</Attribute>
 	</Attributes>
-</Form>
-"@
-} else {
-	# Object — форма объекта
-	$mainAttrName = "Объект"
-
-	# Маппинг типа объекта на тип реквизита
-	$attrTypeMap = @{
-		"Document"                    = "DocumentObject"
-		"Catalog"                     = "CatalogObject"
-		"DataProcessor"               = "DataProcessorObject"
-		"Report"                      = "ReportObject"
-		"ExternalDataProcessor"       = "ExternalDataProcessorObject"
-		"ExternalReport"              = "ExternalReportObject"
-		"ChartOfAccounts"             = "ChartOfAccountsObject"
-		"ChartOfCharacteristicTypes"  = "ChartOfCharacteristicTypesObject"
-		"ExchangePlan"                = "ExchangePlanObject"
-		"BusinessProcess"             = "BusinessProcessObject"
-		"Task"                        = "TaskObject"
-		"InformationRegister"         = "InformationRegisterRecordManager"
-		"AccumulationRegister"        = "AccumulationRegisterRecordSet"
-	}
-
-	$mainAttrType = "$($attrTypeMap[$objectType]).$objectName"
-
-	# SavedData: standard for Catalog/Document/etc, but not for processor-like (DataProcessor/Report/External*)
-	$savedDataLine = ""
-	if ($objectType -notin $processorLikeTypes) {
-		$savedDataLine = "`n`t`t`t<SavedData>true</SavedData>"
-	}
-
-	$formXml = @"
-<?xml version="1.0" encoding="UTF-8"?>
-<Form $($script:formNsDecl) version="$($script:formatVersion)">
-	<AutoCommandBar name="ФормаКоманднаяПанель" id="-1">
-		<Autofill>true</Autofill>
-	</AutoCommandBar>
-	<ChildItems/>
-	<Attributes>
-		<Attribute name="$mainAttrName" id="1">
-			<Type>
-				<v8:Type>cfg:$mainAttrType</v8:Type>
-			</Type>
-			<MainAttribute>true</MainAttribute>$savedDataLine
-		</Attribute>
-	</Attributes>
-</Form>
 "@
 }
+
+# Произвольная форма (MainAttr = $null) — без блока Attributes вовсе. В типовых это самая
+# частая форма после объектной: 907 у справочников, 941 у документов, 3482 у отчётов.
+$formXml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<Form $($script:formNsDecl) version="$($script:formatVersion)">
+	<AutoCommandBar name="ФормаКоманднаяПанель" id="-1">
+		<Autofill>true</Autofill>
+	</AutoCommandBar>
+	<ChildItems/>$attributesBlock
+</Form>
+"@
 
 if (Test-Path $formXmlPath) {
 	Write-Host "[SKIP] Form.xml already exists: $formXmlPath — not overwriting"
@@ -606,26 +761,19 @@ if ($insertBefore) {
 $existingForms = $childObjects.SelectNodes("md:Form", $nsMgr)
 $isFirstFormForPurpose = $false
 $defaultPropName = $null
-$defaultValue = "$objectType.$objectName.Form.$FormName"
+$defaultValue = "$objectRef.Form.$FormName"
 
-# Определяем имя свойства для DefaultForm
-switch ($Purpose) {
-	"Object" {
-		if ($objectType -in $processorLikeTypes) {
-			$defaultPropName = "DefaultForm"
-		} else {
-			$defaultPropName = "DefaultObjectForm"
-		}
+# Свойство «основная форма» — из записи таблицы. Раньше выбиралось по одному Purpose без учёта
+# вида, и для журнала писалось DefaultListForm, которого у журнала нет: слот не находился, навык
+# молча ничего не делал.
+$defaultPropName = $purposeRule.Slot
+
+$defaultNode = $null
+if ($defaultPropName) {
+	$defaultNode = $xmlDoc.SelectSingleNode("//md:${objectType}/md:Properties/md:$defaultPropName", $nsMgr)
+	if ($defaultNode) {
+		$isFirstFormForPurpose = [string]::IsNullOrWhiteSpace($defaultNode.InnerText)
 	}
-	"List"   { $defaultPropName = "DefaultListForm" }
-	"Choice" { $defaultPropName = "DefaultChoiceForm" }
-	"Record" { $defaultPropName = "DefaultRecordForm" }
-}
-
-# Проверяем, установлено ли уже значение
-$defaultNode = $xmlDoc.SelectSingleNode("//md:${objectType}/md:Properties/md:$defaultPropName", $nsMgr)
-if ($defaultNode) {
-	$isFirstFormForPurpose = [string]::IsNullOrWhiteSpace($defaultNode.InnerText)
 }
 
 $defaultUpdated = $false
@@ -687,5 +835,9 @@ if ($alreadyRegistered) {
 }
 if ($defaultUpdated) {
 	Write-Host "${defaultPropName}: $defaultValue"
+} elseif (-not $defaultPropName) {
+	# Молчать здесь нельзя: пользователь ждёт, что форма станет основной, а свойства под неё
+	# у платформы нет (форма набора записей, произвольная форма).
+	Write-Host "Основной не назначена: у $objectType нет свойства для формы с назначением $Purpose"
 }
 Write-Host ""

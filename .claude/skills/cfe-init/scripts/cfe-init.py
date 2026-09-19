@@ -1,19 +1,45 @@
 #!/usr/bin/env python3
-# cfe-init v1.7 — Create 1C configuration extension scaffold (CFE)
+# cfe-init v1.11 — Create 1C configuration extension scaffold (CFE) (+write_xml_file/write_utf8_bom: общий эталон записи)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 """Generates minimal XML source files for a 1C configuration extension."""
 import sys, os, re, argparse, uuid
 from xml.etree import ElementTree as ET
 
-def esc_xml(s):
-    return s.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;')
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
+
+def esc_xml_text(s):
+    # Эскейп ТЕКСТА элемента: только & < > — кавычку и апостроф платформа держит сырыми.
+    return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 def new_uuid():
     return str(uuid.uuid4())
 
 def write_utf8_bom(path, content):
+    # newline='' — без трансляции: иначе текстовый режим Python дал бы CRLF на Windows
+    # и LF на macOS, то есть вывод навыка зависел бы от ОС.
     with open(path, 'w', encoding='utf-8-sig', newline='') as f:
         f.write(content)
+
 
 def write_xml_file(path, content):
     """XML в каноне выгрузки Конфигуратора: CRLF в разделителях, без перевода в конце.
@@ -45,7 +71,7 @@ def main():
     parser.add_argument('-CompatibilityMode', dest='CompatibilityMode', default='Version8_3_24')
     parser.add_argument('-ConfigPath', dest='ConfigPath', default=None)
     parser.add_argument('-NoRole', dest='NoRole', action='store_true')
-    args = parser.parse_args()
+    args = ci_parse_args(parser)
 
     name = args.Name
     synonym = args.Synonym if args.Synonym else name
@@ -129,12 +155,12 @@ def main():
     # --- Synonym XML ---
     synonym_xml = ""
     if synonym:
-        synonym_xml = f"\r\n\t\t\t\t<v8:item>\r\n\t\t\t\t\t<v8:lang>ru</v8:lang>\r\n\t\t\t\t\t<v8:content>{esc_xml(synonym)}</v8:content>\r\n\t\t\t\t</v8:item>\r\n\t\t\t"
+        synonym_xml = f"\r\n\t\t\t\t<v8:item>\r\n\t\t\t\t\t<v8:lang>ru</v8:lang>\r\n\t\t\t\t\t<v8:content>{esc_xml_text(synonym)}</v8:content>\r\n\t\t\t\t</v8:item>\r\n\t\t\t"
 
     # Элемент целиком, а не значение внутри пары: при пустом значении Конфигуратор
     # пишет <Vendor/>, а не <Vendor></Vendor>.
-    vendor_el = f"<Vendor>{esc_xml(vendor)}</Vendor>" if vendor else "<Vendor/>"
-    version_el = f"<Version>{esc_xml(version)}</Version>" if version else "<Version/>"
+    vendor_el = f"<Vendor>{esc_xml_text(vendor)}</Vendor>" if vendor else "<Vendor/>"
+    version_el = f"<Version>{esc_xml_text(version)}</Version>" if version else "<Version/>"
 
     # --- Role name ---
     role_name = f"{name_prefix}ОсновнаяРоль"
@@ -211,12 +237,12 @@ def main():
 {contained_objects}\t\t</InternalInfo>
 \t\t<Properties>
 \t\t\t<ObjectBelonging>Adopted</ObjectBelonging>
-\t\t\t<Name>{esc_xml(name)}</Name>
+\t\t\t<Name>{esc_xml_text(name)}</Name>
 \t\t\t<Synonym>{synonym_xml}</Synonym>
 \t\t\t<Comment/>
 \t\t\t<ConfigurationExtensionPurpose>{purpose}</ConfigurationExtensionPurpose>
 \t\t\t<KeepMappingToExtendedConfigurationObjectsByIDs>true</KeepMappingToExtendedConfigurationObjectsByIDs>
-\t\t\t<NamePrefix>{esc_xml(name_prefix)}</NamePrefix>
+\t\t\t<NamePrefix>{esc_xml_text(name_prefix)}</NamePrefix>
 \t\t\t<ConfigurationExtensionCompatibilityMode>{compat}</ConfigurationExtensionCompatibilityMode>
 \t\t\t<DefaultRunMode>ManagedApplication</DefaultRunMode>
 \t\t\t<UsePurposes>
@@ -265,7 +291,7 @@ def main():
 <MetaDataObject {xmlns_decl} version="{format_version}">
 \t<Role uuid="{uuid_role}">
 \t\t<Properties>
-\t\t\t<Name>{esc_xml(role_name)}</Name>
+\t\t\t<Name>{esc_xml_text(role_name)}</Name>
 \t\t\t<Synonym/>
 \t\t\t<Comment/>
 \t\t</Properties>

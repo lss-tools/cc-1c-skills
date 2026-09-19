@@ -1,5 +1,6 @@
-﻿# subsystem-edit v1.15 — Edit existing 1C subsystem XML
+﻿# subsystem-edit v1.25 — Edit existing 1C subsystem XML (+тип Bot; cfe-diff/cfe-borrow: недостающие типы)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
+[CmdletBinding(PositionalBinding=$false)]
 param(
 	[Parameter(Mandatory)][Alias('Path')][string]$SubsystemPath,
 	[string]$DefinitionFile,
@@ -10,6 +11,70 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# --- Разбор пользовательского JSON ---
+# Одна строка в stderr вместо дампа исключения ConvertFrom-Json (issue #80): агент по стектрейсу
+# идёт чинить скрипт, а не свой вызов. $source — файл или параметр. $expected заполняем только
+# для полиморфного входа: у файла подсказка была бы наполнителем. -Inline печатает ещё и то,
+# что доехало: у файла такого вопроса нет — путь назван, позицию дал парсер, файл на диске.
+# Возврат через -NoEnumerate: без него одноэлементный
+# JSON-массив разворачивался бы в скаляр вторым анруллингом.
+function ConvertFrom-JsonInput([string]$text, [string]$source, [string]$expected, [switch]$Inline) {
+	try {
+		# PS 5.1 на пустой строке отдаёт $null, а не ошибку — навык уходил дальше с $null,
+		# тогда как py-порт падал. Проверяем сами, чтобы порты вели себя одинаково.
+		if ([string]::IsNullOrWhiteSpace($text)) { throw 'input is empty' }
+		$parsed = $text | ConvertFrom-Json
+	} catch {
+		$what = if ($expected) { "$source expects $expected" } else { "Invalid JSON in $source" }
+		if ($Inline) {
+			$got = ($text -replace '\s+', ' ').Trim()
+			$label = 'got'
+			if (-not $got) { $got = '(empty)' }
+			elseif ($got.Length -gt 60) { $label = 'got (first 60 chars)'; $got = $got.Substring(0, 60) }
+			$what = "${what}, ${label}: ${got}"
+		}
+		[Console]::Error.WriteLine("[ERROR] ${what} ($($_.Exception.Message))")
+		exit 1
+	}
+	Write-Output -NoEnumerate $parsed
+}
+
+# --- Чтение входного JSON-файла ---
+# Кодировку берём из BOM — это объявление самого файла, а не догадка. Без BOM ждём строгий UTF-8:
+# Get-Content -Encoding UTF8 на файле в cp1251 тихо меняет кириллицу на U+FFFD, JSON после этого
+# разбирается успешно, и в конфигурацию уезжает имя из «замен». Кодовую страницу не подбираем:
+# угаданное имя уйдёт в метаданные так же молча.
+function Read-JsonInputFile([string]$path) {
+	# Проверка здесь, а не по навыкам: часть навыков проверяла путь сама, часть — нет, и один и тот
+	# же промах давал то внятную строку, то дамп MethodInvocationException. Навыки со своей
+	# проверкой срабатывают раньше и сохраняют свой текст.
+	if (-not (Test-Path -LiteralPath $path)) {
+		[Console]::Error.WriteLine("[ERROR] File not found: $path")
+		exit 1
+	}
+	if (Test-Path -LiteralPath $path -PathType Container) {
+		[Console]::Error.WriteLine("[ERROR] Expected a JSON file, got a directory: $path")
+		exit 1
+	}
+	$bytes = [System.IO.File]::ReadAllBytes($path)
+	if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+		return [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+	}
+	if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+		return [System.Text.Encoding]::Unicode.GetString($bytes, 2, $bytes.Length - 2)
+	}
+	if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+		return [System.Text.Encoding]::BigEndianUnicode.GetString($bytes, 2, $bytes.Length - 2)
+	}
+	try {
+		return (New-Object System.Text.UTF8Encoding($false, $true)).GetString($bytes)
+	} catch {
+		$detail = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+		[Console]::Error.WriteLine("[ERROR] ${path} is not valid UTF-8: ${detail} - save the file as UTF-8, or add a BOM if it is UTF-16")
+		exit 1
+	}
+}
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 # --- Content type normalization (plural→singular, Russian→English) ---
@@ -34,7 +99,7 @@ $script:contentTypeMap = @{
 	"FunctionalOptionsParameters"="FunctionalOptionsParameter"
 	"DefinedTypes"="DefinedType"; "DocumentNumerators"="DocumentNumerator"
 	"Sequences"="Sequence"; "Subsystems"="Subsystem"
-	"StyleItems"="StyleItem"; "IntegrationServices"="IntegrationService"
+	"StyleItems"="StyleItem"; "IntegrationServices"="IntegrationService"; "Bots"="Bot"; "Bot"="Bot"
 	# Russian singular
 	"Справочник"="Catalog"; "Каталог"="Catalog"; "Документ"="Document"
 	"Перечисление"="Enum"; "Константа"="Constant"
@@ -320,9 +385,15 @@ foreach ($child in $script:propsEl.ChildNodes) {
 Info "Subsystem: $($script:objName)"
 
 # --- XML manipulation helpers (from meta-edit pattern) ---
-function Esc-Xml([string]$s) {
-	# Экранирование ТЕКСТА элемента: только & < > . Кавычки в тексте платформа НЕ экранирует —
-	# пишет литерально (92142 сырых кавычки на корпус, ни одной &quot;).
+function Esc-Xml {
+	param([string]$s)
+	# Эскейп ЗНАЧЕНИЯ АТРИБУТА: & < > и кавычка — внутри "..." литеральная " невалидна.
+	return $s.Replace('&','&amp;').Replace('<','&lt;').Replace('>','&gt;').Replace('"','&quot;')
+}
+
+function Esc-XmlText {
+	param([string]$s)
+	# Эскейп ТЕКСТА элемента: только & < > — кавычку и апостроф платформа держит сырыми.
 	return $s.Replace('&','&amp;').Replace('<','&lt;').Replace('>','&gt;')
 }
 
@@ -337,7 +408,7 @@ function Write-ChildSubsystemStub([string]$childPath, [string]$childName, [strin
 	[void]$sb.AppendLine("<MetaDataObject $($script:xmlnsDecl) version=`"$formatVersion`">")
 	[void]$sb.AppendLine("`t<Subsystem uuid=`"$childUuid`">")
 	[void]$sb.AppendLine("`t`t<Properties>")
-	[void]$sb.AppendLine("`t`t`t<Name>$(Esc-Xml $childName)</Name>")
+	[void]$sb.AppendLine("`t`t`t<Name>$(Esc-XmlText $childName)</Name>")
 	[void]$sb.AppendLine("`t`t`t<Synonym/>")
 	[void]$sb.AppendLine("`t`t`t<Comment/>")
 	[void]$sb.AppendLine("`t`t`t<IncludeHelpInContents>true</IncludeHelpInContents>")
@@ -423,10 +494,10 @@ function Expand-SelfClosingElement($container, $parentIndent) {
 }
 
 # --- Parse value: string or JSON array ---
-function Parse-ValueList([string]$val) {
+function Parse-ValueList([string]$val, [string]$opName) {
 	$val = $val.Trim()
 	if ($val.StartsWith("[")) {
-		$arr = $val | ConvertFrom-Json
+		$arr = ConvertFrom-JsonInput $val "-Value for operation '$opName'" "a JSON array of object names" -Inline
 		$result = @(); foreach ($item in $arr) { $result += "$item" }
 		return ,$result
 	}
@@ -559,7 +630,7 @@ function Do-RemoveChild([string]$childName) {
 }
 
 function Do-SetProperty([string]$jsonVal) {
-	$propDef = $jsonVal | ConvertFrom-Json
+	$propDef = ConvertFrom-JsonInput $jsonVal "-Value for operation 'set-property'" "a JSON object {name, value}" -Inline
 	$propName = "$($propDef.name)"
 	$propValue = "$($propDef.value)"
 
@@ -632,8 +703,8 @@ if ($DefinitionFile) {
 	if (-not [System.IO.Path]::IsPathRooted($DefinitionFile)) {
 		$DefinitionFile = Join-Path (Get-Location).Path $DefinitionFile
 	}
-	$jsonText = Get-Content -Raw -Encoding UTF8 $DefinitionFile
-	$ops = $jsonText | ConvertFrom-Json
+	$jsonText = Read-JsonInputFile $DefinitionFile
+	$ops = ConvertFrom-JsonInput $jsonText $DefinitionFile
 	if ($ops -is [System.Array]) {
 		foreach ($op in $ops) { $operations += $op }
 	} else {
@@ -648,8 +719,8 @@ foreach ($op in $operations) {
 	$opValue = if ($op.value) { "$($op.value)" } else { "$Value" }
 
 	switch ($opName) {
-		"add-content"    { Do-AddContent (Parse-ValueList $opValue) }
-		"remove-content" { Do-RemoveContent (Parse-ValueList $opValue) }
+		"add-content"    { Do-AddContent (Parse-ValueList $opValue $opName) }
+		"remove-content" { Do-RemoveContent (Parse-ValueList $opValue $opName) }
 		"add-child"      { Do-AddChild $opValue }
 		"remove-child"   { Do-RemoveChild $opValue }
 		"set-property"   { Do-SetProperty $opValue }

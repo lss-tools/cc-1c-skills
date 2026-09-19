@@ -1,0 +1,19 @@
+{
+  "name": "Ошибка: неизвестная подкоманда",
+  "fakePlatform": {
+    "log": ""
+  },
+  "args_extra": [
+    "-V8Path",
+    "{fakePlatform}",
+    "-InfoBasePath",
+    "{workDir}/ib",
+    "-Command",
+    "bogus"
+  ],
+  "expectError": true,
+  "expect": {
+    "stdoutContains": "unknown command 'bogus'"
+  },
+  "noSnapshot": "разбор аргументов, платформа не запускается"
+}

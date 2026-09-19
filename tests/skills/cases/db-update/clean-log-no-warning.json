@@ -1,0 +1,16 @@
+{
+  "name": "Чистый лог: предупреждения нет (иначе паттерн, ловящий всё подряд, прошёл бы остальные кейсы)",
+  "fakePlatform": {
+    "log": "﻿Загрузка конфигурации из файлов.\r\nЗагрузка завершена. Суммарное время выполнения операции: 780 миллисекунд.\r\n"
+  },
+  "args_extra": [
+    "-V8Path",
+    "{fakePlatform}",
+    "-InfoBasePath",
+    "{workDir}/ib"
+  ],
+  "expect": {
+    "stdoutNotContains": "[warning] platform reported success, but the log contains"
+  },
+  "noSnapshot": "навык ничего не пишет в рабочий каталог — проверяется разбор лога платформы"
+}

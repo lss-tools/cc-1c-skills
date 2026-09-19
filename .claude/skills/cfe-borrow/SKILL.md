@@ -31,6 +31,7 @@ allowed-tools:
 | `ExtensionPath` | Путь к каталогу расширения (обязат.) |
 | `ConfigPath` | Путь к конфигурации-источнику (обязат.) |
 | `Object` | Что заимствовать (обязат.), batch через `;;` |
+| `Module` | Создать пустые модули объекта: `ObjectModule`, `ManagerModule`, `RecordSetModule`, `ValueManagerModule` (через запятую) или `None`. У типов с единственным модулем (`CommonModule`, `HTTPService`, `WebService`) он создаётся и без параметра |
 | `BorrowMainAttribute` | Заимствовать основной реквизит формы. Без параметра — не заимствует. `Form` — реквизиты, используемые на форме. `All` — все реквизиты объекта. Требует форму в -Object |
 
 ## Формат -Object
@@ -41,7 +42,6 @@ allowed-tools:
 - `Enum.ВидыОплат` — перечисление
 - `Catalog.Контрагенты.Form.ФормаЭлемента` — форма объекта (заимствование формы)
 - `Catalog.X ;; CommonModule.Y ;; Enum.Z` — несколько объектов
-Поддерживаются все 44 типа объектов конфигурации.
 
 ### Заимствование форм
 
@@ -66,36 +66,44 @@ allowed-tools:
 2. `/meta-edit` — добавить новый реквизит в объект расширения
 3. `/form-edit` — вывести реквизит на заимствованную форму
 
-**Защита существующих данных**: если зависимый объект уже заимствован с содержимым (реквизитами, формами) — скрипт не перезаписывает его, а добавляет только недостающее.
+**Защита существующих данных**: уже заимствованный объект не перезаписывается — добавляется только недостающее. Повторный вызов безопасен: собственные реквизиты расширения, заимствованные подобъекты и код в модулях сохраняются.
 
 ## Команда
 
 ```powershell
-powershell.exe -NoProfile -File "${CLAUDE_SKILL_DIR}/scripts/cfe-borrow.ps1" -ExtensionPath src -ConfigPath C:\cfsrc\erp -Object "Catalog.Контрагенты"
+powershell.exe -NoProfile -File "${CLAUDE_SKILL_DIR}/scripts/cfe-borrow.ps1" -ExtensionPath src\cfe\extname -ConfigPath src\cf -Object "Catalog.Контрагенты"
 ```
 
 ## Примеры
 
 ```powershell
 # Заимствовать один объект
-... -ExtensionPath src -ConfigPath C:\cfsrc\erp -Object "Catalog.Контрагенты"
+... -ExtensionPath src\cfe\extname -ConfigPath src\cf -Object "Catalog.Контрагенты"
+
+# Заимствовать справочник вместе с модулями объекта и менеджера
+... -ExtensionPath src\cfe\extname -ConfigPath src\cf -Object "Catalog.Контрагенты" -Module ObjectModule,ManagerModule
+
+# Общий модуль без файла модуля
+... -ExtensionPath src\cfe\extname -ConfigPath src\cf -Object "CommonModule.РаботаСФайлами" -Module None
 
 # Заимствовать форму (автоматически заимствует родительский объект)
-... -ExtensionPath src -ConfigPath C:\cfsrc\erp -Object "Catalog.Контрагенты.Form.ФормаЭлемента"
+... -ExtensionPath src\cfe\extname -ConfigPath src\cf -Object "Catalog.Контрагенты.Form.ФормаЭлемента"
 
 # Несколько объектов за раз
-... -ExtensionPath src -ConfigPath C:\cfsrc\erp -Object "Catalog.Контрагенты ;; CommonModule.ОбщийМодуль ;; Enum.ВидыОплат"
+... -ExtensionPath src\cfe\extname -ConfigPath src\cf -Object "Catalog.Контрагенты ;; CommonModule.ОбщийМодуль ;; Enum.ВидыОплат"
 
 # Заимствовать форму с основным реквизитом (реквизиты по DataPath формы)
-... -ExtensionPath src -ConfigPath C:\cfsrc\erp -Object "Catalog.Номенклатура.Form.ФормаЭлемента" -BorrowMainAttribute
+... -ExtensionPath src\cfe\extname -ConfigPath src\cf -Object "Catalog.Номенклатура.Form.ФормаЭлемента" -BorrowMainAttribute
 
 # Заимствовать форму с ВСЕМИ реквизитами объекта
-... -ExtensionPath src -ConfigPath C:\cfsrc\erp -Object "Catalog.Номенклатура.Form.ФормаЭлемента" -BorrowMainAttribute All
+... -ExtensionPath src\cfe\extname -ConfigPath src\cf -Object "Catalog.Номенклатура.Form.ФормаЭлемента" -BorrowMainAttribute All
 ```
 
 ## Верификация
 
 ```
-/cfe-validate <ExtensionPath>
+/cfe-validate <ExtensionPath> -ConfigPath <ConfigPath>
 ```
+
+Конфигурацию-источник передавай и валидатору: заимствованные формы он проверяет по ней.
 

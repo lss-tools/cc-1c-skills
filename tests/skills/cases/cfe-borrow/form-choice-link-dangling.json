@@ -1,0 +1,102 @@
+{
+  "name": "Связь параметров выбора на несуществующий реквизит объекта вырезается целиком",
+  "preRun": [
+    {
+      "script": "meta-compile/scripts/meta-compile",
+      "input": {
+        "type": "Catalog",
+        "name": "Склады"
+      },
+      "args": {
+        "-JsonPath": "{inputFile}",
+        "-OutputDir": "{workDir}"
+      }
+    },
+    {
+      "script": "meta-compile/scripts/meta-compile",
+      "input": {
+        "type": "Catalog",
+        "name": "Ячейки"
+      },
+      "args": {
+        "-JsonPath": "{inputFile}",
+        "-OutputDir": "{workDir}"
+      }
+    },
+    {
+      "script": "meta-compile/scripts/meta-compile",
+      "input": {
+        "type": "Document",
+        "name": "Размещение",
+        "attributes": [
+          {
+            "name": "Ячейка",
+            "type": "CatalogRef.Ячейки"
+          }
+        ]
+      },
+      "args": {
+        "-JsonPath": "{inputFile}",
+        "-OutputDir": "{workDir}"
+      }
+    },
+    {
+      "script": "form-add/scripts/form-add",
+      "args": {
+        "-ObjectPath": "{workDir}/Documents/Размещение.xml",
+        "-FormName": "ФормаДокумента"
+      }
+    },
+    {
+      "script": "form-compile/scripts/form-compile",
+      "input": {
+        "title": "Размещение",
+        "elements": [
+          {
+            "input": "Ячейка",
+            "path": "Объект.Ячейка",
+            "choiceParameterLinks": [
+              {
+                "name": "Отбор.Владелец",
+                "dataPath": "Объект.НетТакогоРеквизита"
+              }
+            ]
+          }
+        ],
+        "attributes": [
+          {
+            "name": "Объект",
+            "type": "DocumentObject.Размещение",
+            "main": true
+          }
+        ]
+      },
+      "args": {
+        "-JsonPath": "{inputFile}",
+        "-OutputPath": "{workDir}/Documents/Размещение/Forms/ФормаДокумента/Ext/Form.xml"
+      }
+    },
+    {
+      "script": "cfe-init/scripts/cfe-init",
+      "args": {
+        "-Name": "Тест",
+        "-OutputDir": "{workDir}/cfe",
+        "-ConfigPath": "{workDir}"
+      }
+    }
+  ],
+  "params": {
+    "extensionPath": "cfe",
+    "object": "Document.Размещение.Form.ФормаДокумента"
+  },
+  "expect": {
+    "fileNotContains": {
+      "file": "cfe/Documents/Размещение/Forms/ФормаДокумента/Ext/Form.xml",
+      "text": [
+        "<xr:Link>",
+        "<ChoiceParameterLinks>"
+      ]
+    }
+  },
+  "skipPlatformVerify": "вход намеренно содержит путь, который платформа отвергает: в валидной конфигурации форма не может ссылаться на несуществующий реквизит объекта, а проверяется именно поведение навыка на таком пути. Расширение на выходе валидно, но verify-snapshots грузит и конфигурацию-источник"
+}

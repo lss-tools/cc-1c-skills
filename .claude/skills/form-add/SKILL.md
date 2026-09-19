@@ -1,7 +1,7 @@
 ---
 name: form-add
 description: Добавить пустую управляемую форму к объекту 1С. Используй когда нужно создать у объекта новую форму
-argument-hint: <ObjectPath> <FormName> [Purpose] [--set-default]
+argument-hint: <ObjectPath> <FormName> [-Purpose <Purpose>] [-Synonym <Synonym>] [-SetDefault]
 allowed-tools:
   - Bash
   - Read
@@ -18,16 +18,16 @@ allowed-tools:
 ## Usage
 
 ```
-/form-add <ObjectPath> <FormName> [Purpose] [Synonym] [--set-default]
+/form-add <ObjectPath> <FormName> [-Purpose <Purpose>] [-Synonym <Synonym>] [-SetDefault]
 ```
 
 | Параметр    | Обязательный | По умолчанию | Описание                                     |
 |-------------|:------------:|--------------|----------------------------------------------|
 | ObjectPath  | да           | —            | Путь к XML-файлу объекта (Documents/Док.xml)  |
 | FormName    | да           | —            | Имя формы (ФормаДокумента)                    |
-| Purpose     | нет          | Object       | Назначение: Object, List, Choice, Record      |
+| Purpose     | нет          | основная форма вида | Назначение формы — см. таблицу ниже: у справочника это форма объекта, у регистра сведений — форма записи, у журнала — форма списка |
 | Synonym     | нет          | = FormName   | Синоним формы                                 |
-| --set-default | нет        | авто         | Установить как форму по умолчанию             |
+| -SetDefault | нет          | авто         | Сделать основной. Без флага основной становится первая форма каждого назначения |
 
 ## Команда
 
@@ -37,30 +37,57 @@ powershell.exe -NoProfile -File "${CLAUDE_SKILL_DIR}/scripts/form-add.ps1" -Obje
 
 ## Purpose — назначение формы
 
-| Purpose | Допустимые типы объектов | Основной реквизит | DefaultForm-свойство |
-|---------|-------------------------|-------------------|---------------------|
-| Object  | Document, Catalog, DataProcessor, Report, ExternalDataProcessor, ExternalReport, ChartOf*, ExchangePlan, BusinessProcess, Task | Объект (тип: *Object.Имя) | DefaultObjectForm (DefaultForm для DataProcessor/Report/ExternalDataProcessor/ExternalReport) |
-| List    | Все кроме DataProcessor | Список (DynamicList) | DefaultListForm |
-| Choice  | Document, Catalog, ChartOf*, ExchangePlan, BusinessProcess, Task | Список (DynamicList) | DefaultChoiceForm |
-| Record  | InformationRegister | Запись (InformationRegisterRecordManager) | DefaultRecordForm |
+| Purpose | Какая форма | Становится основной |
+|---------|-------------|---------------------|
+| Object | форма объекта (элемента, документа, обработки) | да |
+| List | форма списка | да |
+| Choice | форма выбора | да |
+| Folder | форма группы | да |
+| FolderChoice | форма выбора группы | да |
+| Record | форма записи | да |
+| RecordSet | форма набора записей | нет — в платформе нет такого свойства |
+| Save | форма сохранения настроек | да |
+| Load | форма загрузки настроек | да |
+| Custom | произвольная форма, без привязки к объекту | нет |
+
+### Что доступно типу объекта
+
+| Тип объекта | Назначения |
+|-------------|------------|
+| Catalog, ChartOfCharacteristicTypes | Object, Folder, List, Choice, FolderChoice, Custom |
+| Document, ChartOfAccounts, ChartOfCalculationTypes, ExchangePlan, BusinessProcess, Task | Object, List, Choice, Custom |
+| DataProcessor, Report, ExternalDataProcessor, ExternalReport | Object, Custom |
+| InformationRegister | Record, List, RecordSet, Custom |
+| AccumulationRegister, AccountingRegister, CalculationRegister | List, RecordSet, Custom |
+| DocumentJournal, FilterCriterion | List, Custom |
+| Enum | List, Choice, Custom |
+| SettingsStorage | Save, Load, Custom |
+| Table (таблица внешнего источника) | `tableDataType=ObjectData` — Object, List, Choice, Custom; `NonobjectData` — Record, List, Choice, Custom |
+
+Недопустимое сочетание отклоняется со списком доступных для этого типа. У константы собственных
+форм нет — для неё используется общая форма (`CommonForm`).
+
+Таблица внешнего источника адресуется файлом таблицы:
+`ExternalDataSources/<Источник>/Tables/<Таблица>.xml`. Ссылки в такой форме трёхчастные;
+без `-Purpose` берётся форма объекта, а у таблицы с составным ключом — форма записи.
 
 ## Примеры
 
 ```
 # Форма документа
-/form-add Documents/АвансовыйОтчет.xml ФормаДокумента --purpose Object
+/form-add Documents/АвансовыйОтчет.xml ФормаДокумента -Purpose Object
 
 # Форма списка каталога
-/form-add Catalogs/Контрагенты.xml ФормаСписка --purpose List
+/form-add Catalogs/Контрагенты.xml ФормаСписка -Purpose List
 
 # Форма записи регистра сведений
-/form-add InformationRegisters/КурсыВалют.xml ФормаЗаписи --purpose Record
+/form-add InformationRegisters/КурсыВалют.xml ФормаЗаписи -Purpose Record
 
 # Форма выбора с синонимом
-/form-add Catalogs/Номенклатура.xml ФормаВыбора --purpose Choice --synonym "Выбор номенклатуры"
+/form-add Catalogs/Номенклатура.xml ФормаВыбора -Purpose Choice -Synonym "Выбор номенклатуры"
 
 # Установить как форму по умолчанию
-/form-add Documents/Заказ.xml ФормаДокументаНовая --purpose Object --set-default
+/form-add Documents/Заказ.xml ФормаДокументаНовая -Purpose Object -SetDefault
 ```
 
 ## Workflow

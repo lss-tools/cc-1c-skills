@@ -1,5 +1,6 @@
-﻿# subsystem-compile v1.19 — Create 1C subsystem from JSON definition
+﻿# subsystem-compile v1.33 — Create 1C subsystem from JSON definition
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
+[CmdletBinding(PositionalBinding=$false)]
 param(
 	[string]$DefinitionFile,
 	[string]$Value,
@@ -9,6 +10,70 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# --- Разбор пользовательского JSON ---
+# Одна строка в stderr вместо дампа исключения ConvertFrom-Json (issue #80): агент по стектрейсу
+# идёт чинить скрипт, а не свой вызов. $source — файл или параметр. $expected заполняем только
+# для полиморфного входа: у файла подсказка была бы наполнителем. -Inline печатает ещё и то,
+# что доехало: у файла такого вопроса нет — путь назван, позицию дал парсер, файл на диске.
+# Возврат через -NoEnumerate: без него одноэлементный
+# JSON-массив разворачивался бы в скаляр вторым анруллингом.
+function ConvertFrom-JsonInput([string]$text, [string]$source, [string]$expected, [switch]$Inline) {
+	try {
+		# PS 5.1 на пустой строке отдаёт $null, а не ошибку — навык уходил дальше с $null,
+		# тогда как py-порт падал. Проверяем сами, чтобы порты вели себя одинаково.
+		if ([string]::IsNullOrWhiteSpace($text)) { throw 'input is empty' }
+		$parsed = $text | ConvertFrom-Json
+	} catch {
+		$what = if ($expected) { "$source expects $expected" } else { "Invalid JSON in $source" }
+		if ($Inline) {
+			$got = ($text -replace '\s+', ' ').Trim()
+			$label = 'got'
+			if (-not $got) { $got = '(empty)' }
+			elseif ($got.Length -gt 60) { $label = 'got (first 60 chars)'; $got = $got.Substring(0, 60) }
+			$what = "${what}, ${label}: ${got}"
+		}
+		[Console]::Error.WriteLine("[ERROR] ${what} ($($_.Exception.Message))")
+		exit 1
+	}
+	Write-Output -NoEnumerate $parsed
+}
+
+# --- Чтение входного JSON-файла ---
+# Кодировку берём из BOM — это объявление самого файла, а не догадка. Без BOM ждём строгий UTF-8:
+# Get-Content -Encoding UTF8 на файле в cp1251 тихо меняет кириллицу на U+FFFD, JSON после этого
+# разбирается успешно, и в конфигурацию уезжает имя из «замен». Кодовую страницу не подбираем:
+# угаданное имя уйдёт в метаданные так же молча.
+function Read-JsonInputFile([string]$path) {
+	# Проверка здесь, а не по навыкам: часть навыков проверяла путь сама, часть — нет, и один и тот
+	# же промах давал то внятную строку, то дамп MethodInvocationException. Навыки со своей
+	# проверкой срабатывают раньше и сохраняют свой текст.
+	if (-not (Test-Path -LiteralPath $path)) {
+		[Console]::Error.WriteLine("[ERROR] File not found: $path")
+		exit 1
+	}
+	if (Test-Path -LiteralPath $path -PathType Container) {
+		[Console]::Error.WriteLine("[ERROR] Expected a JSON file, got a directory: $path")
+		exit 1
+	}
+	$bytes = [System.IO.File]::ReadAllBytes($path)
+	if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+		return [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+	}
+	if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+		return [System.Text.Encoding]::Unicode.GetString($bytes, 2, $bytes.Length - 2)
+	}
+	if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+		return [System.Text.Encoding]::BigEndianUnicode.GetString($bytes, 2, $bytes.Length - 2)
+	}
+	try {
+		return (New-Object System.Text.UTF8Encoding($false, $true)).GetString($bytes)
+	} catch {
+		$detail = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+		[Console]::Error.WriteLine("[ERROR] ${path} is not valid UTF-8: ${detail} - save the file as UTF-8, or add a BOM if it is UTF-16")
+		exit 1
+	}
+}
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 # --- 1. Load JSON ---
@@ -29,12 +94,16 @@ if ($DefinitionFile) {
 		Write-Error "Definition file not found: $DefinitionFile"
 		exit 1
 	}
-	$json = Get-Content -Raw -Encoding UTF8 $DefinitionFile
+	$json = Read-JsonInputFile $DefinitionFile
+	$jsonSource = $DefinitionFile
+	$jsonInline = $false
 } else {
 	$json = $Value
+	$jsonSource = "-Value"
+	$jsonInline = $true
 }
 
-$def = $json | ConvertFrom-Json
+$def = ConvertFrom-JsonInput $json $jsonSource -Inline:$jsonInline
 
 if (-not $def.name) {
 	Write-Error "JSON must have 'name' field"
@@ -188,9 +257,15 @@ function X([string]$text) {
 	$script:xml.AppendLine($text) | Out-Null
 }
 
-function Esc-Xml([string]$s) {
-	# Экранирование ТЕКСТА элемента: только & < > . Кавычки в тексте платформа НЕ экранирует —
-	# пишет литерально (92142 сырых кавычки на корпус, ни одной &quot;).
+function Esc-Xml {
+	param([string]$s)
+	# Эскейп ЗНАЧЕНИЯ АТРИБУТА: & < > и кавычка — внутри "..." литеральная " невалидна.
+	return $s.Replace('&','&amp;').Replace('<','&lt;').Replace('>','&gt;').Replace('"','&quot;')
+}
+
+function Esc-XmlText {
+	param([string]$s)
+	# Эскейп ТЕКСТА элемента: только & < > — кавычку и апостроф платформа держит сырыми.
 	return $s.Replace('&','&amp;').Replace('<','&lt;').Replace('>','&gt;')
 }
 
@@ -211,7 +286,7 @@ function Emit-MLText([string]$indent, [string]$tag, [string]$text) {
 	X "$indent<$tag>"
 	X "$indent`t<v8:item>"
 	X "$indent`t`t<v8:lang>ru</v8:lang>"
-	X "$indent`t`t<v8:content>$(Esc-Xml $text)</v8:content>"
+	X "$indent`t`t<v8:content>$(Esc-XmlText $text)</v8:content>"
 	X "$indent`t</v8:item>"
 	X "$indent</$tag>"
 }
@@ -227,7 +302,7 @@ function Write-ChildSubsystemStub([string]$childPath, [string]$childName, [strin
 	[void]$sb.AppendLine("<MetaDataObject $($script:xmlnsDecl) version=`"$formatVersion`">")
 	[void]$sb.AppendLine("`t<Subsystem uuid=`"$childUuid`">")
 	[void]$sb.AppendLine("`t`t<Properties>")
-	[void]$sb.AppendLine("`t`t`t<Name>$(Esc-Xml $childName)</Name>")
+	[void]$sb.AppendLine("`t`t`t<Name>$(Esc-XmlText $childName)</Name>")
 	[void]$sb.AppendLine("`t`t`t<Synonym/>")
 	[void]$sb.AppendLine("`t`t`t<Comment/>")
 	[void]$sb.AppendLine("`t`t`t<IncludeHelpInContents>true</IncludeHelpInContents>")
@@ -288,6 +363,8 @@ $script:contentTypeMap = @{
 	"Subsystems"                   = "Subsystem"
 	"StyleItems"                   = "StyleItem"
 	"IntegrationServices"          = "IntegrationService"
+	"Bots"                         = "Bot"
+	"Bot"                          = "Bot"
 	# Russian singular → English
 	"Справочник"                   = "Catalog"
 	"Каталог"                      = "Catalog"
@@ -430,6 +507,14 @@ if ($def.children) {
 function Detect-FormatVersion([string]$dir) {
 	$d = $dir
 	while ($d) {
+		# Автономная внешняя обработка/отчёт: своего Configuration.xml у неё нет, версию несёт
+		# корень самой обработки. Без этого форма и макет внутри обработки 2.21 писались бы 2.17.
+		$extPath = "$d.xml"
+		if (Test-Path $extPath) {
+			$extText = [System.IO.File]::ReadAllText($extPath, [System.Text.Encoding]::UTF8)
+			$extHead = $extText.Substring(0, [Math]::Min(2000, $extText.Length))
+			if ($extHead -match '<(ExternalDataProcessor|ExternalReport)[ >]' -and $extHead -match '<MetaDataObject[^>]+version="(\d+\.\d+)"') { return $Matches[1] }
+		}
 		$cfgPath = Join-Path $d "Configuration.xml"
 		if (Test-Path $cfgPath) {
 			$cfgText = [System.IO.File]::ReadAllText($cfgPath, [System.Text.Encoding]::UTF8)
@@ -475,14 +560,14 @@ X "`t<Subsystem uuid=`"$uuid`">"
 X "`t`t<Properties>"
 
 # Name
-X "`t`t`t<Name>$(Esc-Xml $objName)</Name>"
+X "`t`t`t<Name>$(Esc-XmlText $objName)</Name>"
 
 # Synonym
 Emit-MLText "`t`t`t" "Synonym" $synonym
 
 # Comment
 if ($comment) {
-	X "`t`t`t<Comment>$(Esc-Xml $comment)</Comment>"
+	X "`t`t`t<Comment>$(Esc-XmlText $comment)</Comment>"
 } else {
 	X "`t`t`t<Comment/>"
 }
@@ -509,7 +594,7 @@ if ($picture) {
 if ($contentItems.Count -gt 0) {
 	X "`t`t`t<Content>"
 	foreach ($item in $contentItems) {
-		X "`t`t`t`t<xr:Item xsi:type=`"xr:MDObjectRef`">$(Esc-Xml $item)</xr:Item>"
+		X "`t`t`t`t<xr:Item xsi:type=`"xr:MDObjectRef`">$(Esc-XmlText $item)</xr:Item>"
 	}
 	X "`t`t`t</Content>"
 } else {
@@ -522,7 +607,7 @@ X "`t`t</Properties>"
 if ($children.Count -gt 0) {
 	X "`t`t<ChildObjects>"
 	foreach ($ch in $children) {
-		X "`t`t`t<Subsystem>$(Esc-Xml $ch)</Subsystem>"
+		X "`t`t`t<Subsystem>$(Esc-XmlText $ch)</Subsystem>"
 	}
 	X "`t`t</ChildObjects>"
 } else {
@@ -584,9 +669,102 @@ if ($children.Count -gt 0) {
 }
 
 # --- 6. Register in parent ---
+
+# Регистрация объекта в <ChildObjects> родительского XML. Вариант семьи: отступ берётся
+# из самого документа, а запись дописывается в конец блока. Отличие от эталона
+# (meta-compile) осознанное: родителем бывает вложенный Subsystem.xml произвольной
+# глубины, где фиксированные три табуляции неверны, а группировать записи по типу
+# внутри подсистемы нечего — потомок там всегда один и тот же.
+# Реестр семьи: tests/skills/check-inline-drift.mjs.
+# Возвращает исход: added | already | no-childobj | no-config.
+# Канонический порядок видов в <ChildObjects> — эталон в docs/1c-configuration-spec.md,
+# таблица «Порядок типов в ChildObjects». Нужен, чтобы новая группа вида вставала на своё
+# место: иначе платформа переставит её при первой же выгрузке и даст диф на ровном месте.
+# Реестр карт: tests/skills/check-type-maps.mjs.
+$childObjectTypes = @(
+	"Language","Subsystem","StyleItem","Style",
+	"CommonPicture","SessionParameter","Role","CommonTemplate",
+	"FilterCriterion","CommonModule","CommonAttribute","ExchangePlan",
+	"XDTOPackage","WebService","HTTPService","WSReference",
+	"EventSubscription","ScheduledJob","SettingsStorage","FunctionalOption",
+	"FunctionalOptionsParameter","DefinedType","Bot","PaletteColor","CommonCommand","CommandGroup",
+	"Constant","CommonForm","Catalog","Document",
+	"DocumentNumerator","Sequence","DocumentJournal","Enum",
+	"Report","DataProcessor","InformationRegister","AccumulationRegister",
+	"ChartOfCharacteristicTypes","ChartOfAccounts","AccountingRegister",
+	"ChartOfCalculationTypes","CalculationRegister",
+	"BusinessProcess","Task","ExternalDataSource","IntegrationService"
+)
+
+function Register-InChildObjects([string]$ParentXmlPath, [string]$ParentTag, [string]$ChildTag, [string]$ChildName) {
+	if (-not (Test-Path $ParentXmlPath)) { return "no-config" }
+
+	$doc = New-Object System.Xml.XmlDocument
+	$doc.PreserveWhitespace = $true
+	$doc.Load($ParentXmlPath)
+
+	$ns = New-Object System.Xml.XmlNamespaceManager($doc.NameTable)
+	$ns.AddNamespace("md", "http://v8.1c.ru/8.3/MDClasses")
+
+	$childObjects = $doc.SelectSingleNode("//md:$ParentTag/md:ChildObjects", $ns)
+	if (-not $childObjects) { return "no-childobj" }
+
+	foreach ($child in $childObjects.ChildNodes) {
+		if ($child.NodeType -eq 'Element' -and $child.LocalName -eq $ChildTag -and $child.InnerText -eq $ChildName) {
+			return "already"
+		}
+	}
+
+	# Правка по сырому тексту, зеркально py-порту: сериализация DOM переписала бы файл целиком
+	# (регистр encoding, `<a />` вместо `<a/>`), а текстовая вставка хранит его байт-в-байт.
+	# Правим чужой файл, значит наследуем его стиль (#44/#46/#47). DOM выше — только на чтение.
+	$rawText = [System.IO.File]::ReadAllText($ParentXmlPath, (New-Object System.Text.UTF8Encoding($false)))
+	$eol = if ($rawText.Contains("`r`n")) { "`r`n" } else { "`n" }
+	$entry = "<$ChildTag>$(Esc-XmlText $ChildName)</$ChildTag>"
+
+	$empty = [regex]::Match($rawText, '<ChildObjects\s*/>')
+	if ($empty.Success) {
+		$replacement = "<ChildObjects>$eol`t`t`t$entry$eol`t`t</ChildObjects>"
+		$rawText = $rawText.Substring(0, $empty.Index) + $replacement + $rawText.Substring($empty.Index + $empty.Length)
+	} else {
+		# В корне подсистема встаёт перед первой группой вида старше по $childObjectTypes:
+		# так она попадает и в канонический порядок видов, и в конец своей группы, если та уже
+		# есть. Дописать в конец блока нельзя вдвойне: платформа переставит новую группу при
+		# первой же выгрузке, а существующую подсистема покинула бы, уехав за виды ниже.
+		# Во вложенном Subsystem.xml порядок видов неприменим — потомок там всегда один.
+		$anchor = $null
+		if ($ParentTag -eq "Configuration") {
+			$ownIdx = $childObjectTypes.IndexOf($ChildTag)
+			if ($ownIdx -ge 0) {
+				$typeRx = [regex]"(?m)^([ \t]*)<(\w+)>[^<]*</\2>"
+				$tm = $typeRx.Match($rawText)
+				while ($tm.Success) {
+					$otherIdx = $childObjectTypes.IndexOf($tm.Groups[2].Value)
+					if ($otherIdx -gt $ownIdx) { $anchor = $tm; break }
+					$tm = $tm.NextMatch()
+				}
+			}
+		}
+		if ($anchor) {
+			$rawText = $rawText.Substring(0, $anchor.Index) + $anchor.Groups[1].Value + $entry + $eol + $rawText.Substring($anchor.Index)
+		} else {
+			# Отступ вставки берём у закрывающего тега +1 уровень: подстановка по голому
+			# '</ChildObjects>' удваивала бы уже присутствующий отступ строки.
+			$cm = [regex]::Match($rawText, '([ 	]*)</ChildObjects>')
+			if (-not $cm.Success) { return "no-childobj" }
+			$rawText = $rawText.Substring(0, $cm.Index) + $cm.Groups[1].Value + "`t" + $entry + $eol + $cm.Groups[1].Value + "</ChildObjects>" + $rawText.Substring($cm.Index + $cm.Length)
+		}
+	}
+
+	[System.IO.File]::WriteAllText($ParentXmlPath, $rawText, (New-Object System.Text.UTF8Encoding($true)))
+	return "added"
+}
+
 $parentXmlPath = $null
+$parentTag = "Configuration"
 if ($Parent) {
 	$parentXmlPath = $Parent
+	$parentTag = "Subsystem"
 } else {
 	$configXml = Join-Path $OutputDir "Configuration.xml"
 	if (Test-Path $configXml) {
@@ -594,103 +772,12 @@ if ($Parent) {
 	}
 }
 
-if ($parentXmlPath -and (Test-Path $parentXmlPath)) {
-	$doc = New-Object System.Xml.XmlDocument
-	$doc.PreserveWhitespace = $true
-	$doc.Load($parentXmlPath)
-
-	$ns = New-Object System.Xml.XmlNamespaceManager($doc.NameTable)
-	$ns.AddNamespace("md", "http://v8.1c.ru/8.3/MDClasses")
-
-	# Find ChildObjects
-	$childObjects = $null
-	if ($Parent) {
-		$childObjects = $doc.SelectSingleNode("//md:Subsystem/md:ChildObjects", $ns)
-	} else {
-		$childObjects = $doc.SelectSingleNode("//md:Configuration/md:ChildObjects", $ns)
-	}
-
-	if ($childObjects) {
-		# Check for self-closing tag
-		$isSelfClosing = (-not $childObjects.HasChildNodes) -or ($childObjects.IsEmpty)
-
-		# Check if already registered
-		$alreadyExists = $false
-		foreach ($child in $childObjects.ChildNodes) {
-			if ($child.NodeType -eq 'Element' -and $child.LocalName -eq "Subsystem" -and $child.InnerText -eq $objName) {
-				$alreadyExists = $true
-				break
-			}
-		}
-
-		if (-not $alreadyExists) {
-			$newEl = $doc.CreateElement("Subsystem", "http://v8.1c.ru/8.3/MDClasses")
-			$newEl.InnerText = $objName
-
-			if ($isSelfClosing) {
-				# Expand self-closing tag
-				$parentIndent = ""
-				$prev = $childObjects.PreviousSibling
-				if ($prev -and ($prev.NodeType -eq 'Whitespace' -or $prev.NodeType -eq 'SignificantWhitespace')) {
-					if ($prev.Value -match '(\t+)$') { $parentIndent = $Matches[1] }
-				}
-				$childIndent = "$parentIndent`t"
-				$ws1 = $doc.CreateWhitespace("`r`n$childIndent")
-				$ws2 = $doc.CreateWhitespace("`r`n$parentIndent")
-				$childObjects.AppendChild($ws1) | Out-Null
-				$childObjects.AppendChild($newEl) | Out-Null
-				$childObjects.AppendChild($ws2) | Out-Null
-			} else {
-				# Insert before trailing whitespace
-				$childIndent = "`t`t`t"
-				foreach ($child in $childObjects.ChildNodes) {
-					if ($child.NodeType -eq 'Whitespace' -or $child.NodeType -eq 'SignificantWhitespace') {
-						if ($child.Value -match '^\r?\n(\t+)') { $childIndent = $Matches[1]; break }
-					}
-				}
-				$trailing = $childObjects.LastChild
-				$ws = $doc.CreateWhitespace("`r`n$childIndent")
-				if ($trailing -and ($trailing.NodeType -eq 'Whitespace' -or $trailing.NodeType -eq 'SignificantWhitespace')) {
-					$childObjects.InsertBefore($ws, $trailing) | Out-Null
-					$childObjects.InsertBefore($newEl, $trailing) | Out-Null
-				} else {
-					$childObjects.AppendChild($ws) | Out-Null
-					$childObjects.AppendChild($newEl) | Out-Null
-				}
-			}
-
-			# Save parent XML
-			$settings = New-Object System.Xml.XmlWriterSettings
-			$settings.Encoding = New-Object System.Text.UTF8Encoding($true)
-			$settings.Indent = $false
-			$settings.NewLineHandling = [System.Xml.NewLineHandling]::None
-
-			$memStream = New-Object System.IO.MemoryStream
-			$writer = [System.Xml.XmlWriter]::Create($memStream, $settings)
-			$doc.Save($writer)
-			$writer.Flush(); $writer.Close()
-
-			$bytes = $memStream.ToArray()
-			$memStream.Close()
-			$text = [System.Text.Encoding]::UTF8.GetString($bytes)
-			if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
-			$text = $text.Replace('encoding="utf-8"', 'encoding="UTF-8"')
-			# Пустой элемент: XmlWriter отдаёт `<a />`, Конфигуратор пишет `<a/>`. Внутри
-			# CDATA/комментария ` />` может быть содержимым (там `>` не экранируется),
-			# поэтому они идут первыми ветками альтернации и возвращаются как есть.
-			$text = [regex]::Replace($text, '(?s)<!\[CDATA\[.*?\]\]>|<!--.*?-->|(?<=\S) />', { param($m) if ($m.Value -eq ' />') { '/>' } else { $m.Value } })
-			# Целевой перевод строки: стиль файла-назначения — правка наследует его (#44/#46/#47),
-			# новый файл получает канон выгрузки CRLF. Зеркало _detect_xml_style в py-порту.
-			$targetEol = if ((Test-Path -LiteralPath $parentXmlPath) -and ([System.IO.File]::ReadAllText($parentXmlPath) -notmatch "`r`n")) { "`n" } else { "`r`n" }
-			$text = ($text -replace "`r`n", "`n") -replace "`n", $targetEol
-			[System.IO.File]::WriteAllText($parentXmlPath, $text, $utf8Bom)
-
-			Write-Host "[OK] Registered in: $parentXmlPath"
-		} else {
-			Write-Host "[SKIP] Already registered in: $parentXmlPath"
-		}
-	} else {
-		Write-Host "[WARN] ChildObjects not found in: $parentXmlPath"
+if ($parentXmlPath) {
+	switch (Register-InChildObjects $parentXmlPath $parentTag "Subsystem" $objName) {
+		"added"       { Write-Host "[OK] Registered in: $parentXmlPath" }
+		"already"     { Write-Host "[SKIP] Already registered in: $parentXmlPath" }
+		"no-childobj" { Write-Host "[WARN] ChildObjects not found in: $parentXmlPath" }
+		"no-config"   { Write-Host "[INFO] No parent XML to register in" }
 	}
 } else {
 	Write-Host "[INFO] No parent XML to register in"

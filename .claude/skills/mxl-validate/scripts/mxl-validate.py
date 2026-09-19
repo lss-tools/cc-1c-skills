@@ -1,9 +1,31 @@
-#!/usr/bin/env python3
-# mxl-validate v1.1 — Validate 1C spreadsheet document Template.xml
+﻿#!/usr/bin/env python3
+# mxl-validate v1.8 — Validate 1C spreadsheet document Template.xml
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 """Validates spreadsheet Template.xml: height, palette refs, column/row indices, areas, merges."""
 import sys, os, argparse
 from lxml import etree
+
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
 
 NS_D   = 'http://v8.1c.ru/8.2/data/spreadsheet'
 NS_V8  = 'http://v8.1c.ru/8.1/data/core'
@@ -61,7 +83,7 @@ def main():
     parser.add_argument('-SrcDir', dest='SrcDir', default='src')
     parser.add_argument('-Detailed', action='store_true')
     parser.add_argument('-MaxErrors', dest='MaxErrors', type=int, default=20)
-    args = parser.parse_args()
+    args = ci_parse_args(parser)
 
     template_path = args.TemplatePath
     processor_name = args.ProcessorName
@@ -201,7 +223,11 @@ def main():
             r.error(f'Font index {max_font_ref} exceeds palette size ({font_count})')
     elif max_font_ref > 0:
         r.error(f'Font index {max_font_ref} referenced but no fonts defined')
-    # No font references — no check needed
+    else:
+        # Макет без единого шрифта — норма (ячейки-поля ввода, макеты без оформления).
+        # Строку печатаем как ps1-порт: раньше py молчал, и на таком макете число проверок
+        # у портов расходилось.
+        r.ok('No font references')
 
     # --- Check 11: line/border indices in formats ---
     if line_count > 0:
@@ -211,7 +237,8 @@ def main():
             r.error(f'Line index {max_line_ref} exceeds palette size ({line_count})')
     elif max_line_ref > 0:
         r.error(f'Line index {max_line_ref} referenced but no lines defined')
-    # No line/border references — no check needed
+    else:
+        r.ok('No line/border references')
 
     # --- Check 3, 4, 5, 6: row/cell checks ---
     max_cell_format_ref = 0
@@ -276,6 +303,13 @@ def main():
                         max_cell_format_ref = val
                     if val > format_count:
                         r.error(f'Row {row_index}: cell format index {val} > format palette size ({format_count})')
+                # Примечание — четвёртый владелец формата, и его ссылка тоже бывает битой.
+                note = cell.find(f'{{{NS_D}}}note')
+                if note is not None:
+                    nf = note.find(f'{{{NS_D}}}formatIndex')
+                    if nf is not None and nf.text and int(nf.text) > format_count:
+                        r.error(f'Row {row_index}: note format index {nf.text}'
+                                f' > format palette size ({format_count})')
 
         row_index += 1
 
@@ -370,6 +404,134 @@ def main():
                 draw_id_node = drawing.find(f'{{{NS_D}}}id')
                 draw_id = draw_id_node.text if draw_id_node is not None else '?'
                 r.error(f'Drawing id={draw_id}: pictureIndex={pic_idx} > picture count ({picture_count})')
+
+        # Оформление рисунка — такая же запись палитры форматов, как у ячейки, и висячая
+        # ссылка на неё так же валит загрузку макета.
+        fmt_idx_node = drawing.find(f'{{{NS_D}}}formatIndex')
+        if fmt_idx_node is not None and fmt_idx_node.text:
+            fmt_idx = int(fmt_idx_node.text)
+            if fmt_idx > format_count:
+                draw_id_node = drawing.find(f'{{{NS_D}}}id')
+                draw_id = draw_id_node.text if draw_id_node is not None else '?'
+                r.error(f'Drawing id={draw_id}: formatIndex={fmt_idx} > format palette size ({format_count})')
+
+    # --- Check 13: value cells (input fields) ---
+    # Свойства containsValue/valueType/controlType принадлежат ЯЧЕЙКЕ: на корпусе ERP
+    # (370 197 ссылок) на такие записи палитры ссылаются только <f>, ни строка, ни колонка,
+    # ни defaultFormatIndex. Ячейка со значением текста не несёт — ни одна из 370 197.
+    value_format_idx = set()
+    control_guids = ('381ed624-9217-4e63-85db-c4c3cb87daae', '35af3d93-d7c7-4a2e-a8eb-bac87a1a3f26')
+    for i, fmt in enumerate(format_nodes, start=1):
+        contains = fmt.find(f'{{{NS_D}}}containsValue')
+        vt = fmt.find(f'{{{NS_D}}}valueType')
+        if contains is None and vt is None:
+            continue
+        value_format_idx.add(i)
+        if contains is None or (contains.text or '').strip() != 'true':
+            r.error(f'Format {i}: <valueType> without <containsValue>true</containsValue>')
+        elif vt is None:
+            r.error(f'Format {i}: <containsValue> without <valueType>')
+        if vt is not None:
+            for child in vt:
+                tag = child.tag.split('}')[-1]
+                if tag not in ('Type', 'TypeSet') and not tag.endswith('Qualifiers'):
+                    r.error(f'Format {i}: unexpected <{tag}> inside <valueType>')
+        ctl = fmt.find(f'{{{NS_D}}}controlType')
+        if ctl is not None and (ctl.text or '').strip().lower() not in control_guids:
+            r.warn(f'Format {i}: unknown controlType {(ctl.text or "").strip()}')
+        # Флажок Конфигуратор предлагает только для булева и числа. Движок принимает его на
+        # любом типе (проверено сборкой EPF и обратной выгрузкой), поэтому это предупреждение,
+        # а не ошибка: собрать такую ячейку в Конфигураторе нельзя, и почти наверняка это описка.
+        if ctl is not None and (ctl.text or '').strip().lower() == control_guids[1] and vt is not None:
+            kinds = [(t.text or '').strip() for t in vt if t.tag.endswith('}Type')]
+            if kinds != ['xs:boolean'] and kinds != ['xs:decimal']:
+                r.warn(f'Format {i}: checkbox control on a type other than Boolean or Number')
+
+    for ri in root.findall(f'{{{NS_D}}}rowsItem'):
+        if r.stopped:
+            break
+        row = ri.find(f'{{{NS_D}}}row')
+        if row is None:
+            continue
+        idx_node = ri.find(f'{{{NS_D}}}index')
+        rn = idx_node.text if idx_node is not None else '?'
+        row_fmt = row.find(f'{{{NS_D}}}formatIndex')
+        if row_fmt is not None and row_fmt.text and int(row_fmt.text) in value_format_idx:
+            r.warn(f'Row {rn}: formatIndex points to a value format (cell-only property)')
+        for c_group in row.findall(f'{{{NS_D}}}c'):
+            cell = c_group.find(f'{{{NS_D}}}c')
+            if cell is None:
+                continue
+            f_node = cell.find(f'{{{NS_D}}}f')
+            if f_node is None or not f_node.text or int(f_node.text) not in value_format_idx:
+                continue
+            if cell.find(f'{{{NS_D}}}tl') is not None:
+                r.error(f'Row {rn}: cell contains a value and text at the same time')
+    # Значение и настройки элемента управления бывают только у ячейки-поля ввода: на корпусе
+    # ни одного <v> и ни одного <control> в обычной ячейке.
+    for ri in root.findall(f'{{{NS_D}}}rowsItem'):
+        if r.stopped:
+            break
+        row = ri.find(f'{{{NS_D}}}row')
+        if row is None:
+            continue
+        idx_node = ri.find(f'{{{NS_D}}}index')
+        rn = idx_node.text if idx_node is not None else '?'
+        for c_group in row.findall(f'{{{NS_D}}}c'):
+            cell = c_group.find(f'{{{NS_D}}}c')
+            if cell is None:
+                continue
+            f_node = cell.find(f'{{{NS_D}}}f')
+            is_value = f_node is not None and f_node.text and int(f_node.text) in value_format_idx
+            if is_value:
+                continue
+            for tag, what in (('v', 'value'), ('control', 'control settings')):
+                if cell.find(f'{{{NS_D}}}{tag}') is not None:
+                    r.error(f'Row {rn}: cell carries {what} but its format has no containsValue')
+    for cols in root.findall(f'{{{NS_D}}}columns'):
+        for ci in cols.findall(f'{{{NS_D}}}columnsItem'):
+            col = ci.find(f'{{{NS_D}}}column')
+            if col is None:
+                continue
+            fmt_node = col.find(f'{{{NS_D}}}formatIndex')
+            if fmt_node is not None and fmt_node.text and int(fmt_node.text) in value_format_idx:
+                col_idx_node = ci.find(f'{{{NS_D}}}index')
+                col_idx_text = col_idx_node.text if col_idx_node is not None else '?'
+                r.warn(f'Column {col_idx_text}: formatIndex points to a value format (cell-only property)')
+    dfi = root.find(f'{{{NS_D}}}defaultFormatIndex')
+    if dfi is not None and dfi.text and int(dfi.text) in value_format_idx:
+        r.warn('defaultFormatIndex points to a value format (cell-only property)')
+    if value_format_idx:
+        r.ok(f'Value cells: {len(value_format_idx)} value formats')
+
+    # --- Check 14: группировки строк и колонок ---
+    # Диапазоны группировок либо вложены, либо не пересекаются: на корпусе 40 620 886 пар
+    # непересекающихся и 599 958 вложенных, частичных пересечений нет ни одного.
+    for tag in ('vg', 'hg'):
+        ranges = []
+        for g in root.findall(f'{{{NS_D}}}{tag}'):
+            b_node = g.find(f'{{{NS_D}}}b')
+            if b_node is None or not b_node.text:
+                r.error(f'Group <{tag}>: <b> is missing')
+                continue
+            b = int(b_node.text)
+            e_node = g.find(f'{{{NS_D}}}e')
+            e = int(e_node.text) if e_node is not None and e_node.text else b
+            if e < b:
+                r.error(f'Group <{tag}> {b}..{e}: range is reversed')
+            if tag == 'vg' and doc_height > 0 and b >= doc_height:
+                r.warn(f'Group <vg> starts at row {b}, beyond document height ({doc_height})')
+            ranges.append((b, e))
+        for i in range(len(ranges)):
+            for j in range(i + 1, len(ranges)):
+                a, c = ranges[i], ranges[j]
+                if a[1] < c[0] or c[1] < a[0]:
+                    continue
+                if (a[0] <= c[0] and c[1] <= a[1]) or (c[0] <= a[0] and a[1] <= c[1]):
+                    continue
+                r.error(f'Groups <{tag}> {a[0]}..{a[1]} and {c[0]}..{c[1]} overlap partially')
+        if ranges:
+            r.ok(f'Groups <{tag}>: {len(ranges)}')
 
     # --- Finalize ---
     checks = r.ok_count + r.errors + r.warnings

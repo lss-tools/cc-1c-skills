@@ -1,7 +1,8 @@
-﻿# form-info v1.5 — Analyze 1C managed form structure
+﻿# form-info v1.8 — Analyze 1C managed form structure
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
+[CmdletBinding(PositionalBinding=$false)]
 param(
-	[Parameter(Mandatory=$true)]
+	[Parameter(Mandatory=$true, Position=0)]
 	[Alias('Path')]
 	[string]$FormPath,
 	[int]$Limit = 150,

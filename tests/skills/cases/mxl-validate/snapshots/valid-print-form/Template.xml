@@ -47,7 +47,6 @@
 		<row>
 			<formatIndex>3</formatIndex>
 			<c>
-				<i>0</i>
 				<c>
 					<f>4</f>
 					<parameter>Заголовок</parameter>
@@ -58,36 +57,32 @@
 	<rowsItem>
 		<index>1</index>
 		<row>
+			<formatIndex>5</formatIndex>
 			<c>
-				<i>0</i>
 				<c>
 					<f>6</f>
 					<parameter>Номер</parameter>
 				</c>
 			</c>
 			<c>
-				<i>1</i>
 				<c>
 					<f>6</f>
 					<parameter>Товар</parameter>
 				</c>
 			</c>
 			<c>
-				<i>2</i>
 				<c>
 					<f>6</f>
 					<parameter>ЕдИзм</parameter>
 				</c>
 			</c>
 			<c>
-				<i>3</i>
 				<c>
 					<f>7</f>
 					<parameter>Кол</parameter>
 				</c>
 			</c>
 			<c>
-				<i>4</i>
 				<c>
 					<f>7</f>
 					<parameter>Сумма</parameter>
@@ -111,7 +106,6 @@
 				</c>
 			</c>
 			<c>
-				<i>4</i>
 				<c>
 					<f>9</f>
 					<parameter>Всего</parameter>
@@ -139,16 +133,6 @@
 		</area>
 	</namedItem>
 	<namedItem xsi:type="NamedItemCells">
-		<name>Строка</name>
-		<area>
-			<type>Rows</type>
-			<beginRow>1</beginRow>
-			<endRow>1</endRow>
-			<beginColumn>-1</beginColumn>
-			<endColumn>-1</endColumn>
-		</area>
-	</namedItem>
-	<namedItem xsi:type="NamedItemCells">
 		<name>Итого</name>
 		<area>
 			<type>Rows</type>
@@ -158,10 +142,19 @@
 			<endColumn>-1</endColumn>
 		</area>
 	</namedItem>
+	<namedItem xsi:type="NamedItemCells">
+		<name>Строка</name>
+		<area>
+			<type>Rows</type>
+			<beginRow>1</beginRow>
+			<endRow>1</endRow>
+			<beginColumn>-1</beginColumn>
+			<endColumn>-1</endColumn>
+		</area>
+	</namedItem>
 	<line width="1" gap="false">
 		<v8ui:style xsi:type="v8ui:SpreadsheetDocumentCellLineType">Solid</v8ui:style>
 	</line>
-	<font faceName="Arial" height="10" bold="false" italic="false" underline="false" strikeout="false" kind="Absolute" scale="100"/>
 	<font faceName="Arial" height="10" bold="true" italic="false" underline="false" strikeout="false" kind="Absolute" scale="100"/>
 	<font faceName="Arial" height="14" bold="true" italic="false" underline="false" strikeout="false" kind="Absolute" scale="100"/>
 	<format>
@@ -174,42 +167,29 @@
 		<height>20</height>
 	</format>
 	<format>
-		<font>2</font>
+		<font>1</font>
 		<horizontalAlignment>Center</horizontalAlignment>
 		<fillType>Parameter</fillType>
 	</format>
 	<format>
-		<font>0</font>
-		<leftBorder>0</leftBorder>
-		<topBorder>0</topBorder>
-		<rightBorder>0</rightBorder>
-		<bottomBorder>0</bottomBorder>
+		<border>0</border>
 	</format>
 	<format>
-		<font>0</font>
-		<leftBorder>0</leftBorder>
-		<topBorder>0</topBorder>
-		<rightBorder>0</rightBorder>
-		<bottomBorder>0</bottomBorder>
+		<border>0</border>
 		<fillType>Parameter</fillType>
 	</format>
 	<format>
-		<font>0</font>
-		<leftBorder>0</leftBorder>
-		<topBorder>0</topBorder>
-		<rightBorder>0</rightBorder>
-		<bottomBorder>0</bottomBorder>
+		<border>0</border>
 		<horizontalAlignment>Right</horizontalAlignment>
 		<fillType>Parameter</fillType>
 	</format>
 	<format>
-		<font>1</font>
+		<font>0</font>
 		<topBorder>0</topBorder>
 		<horizontalAlignment>Right</horizontalAlignment>
-		<fillType>Text</fillType>
 	</format>
 	<format>
-		<font>1</font>
+		<font>0</font>
 		<topBorder>0</topBorder>
 		<horizontalAlignment>Right</horizontalAlignment>
 		<fillType>Parameter</fillType>

@@ -16,9 +16,8 @@
 		<index>0</index>
 		<row>
 			<c>
-				<i>0</i>
 				<c>
-					<f>2</f>
+					<f>1</f>
 					<tl>
 						<v8:item>
 							<v8:lang>ru</v8:lang>
@@ -31,12 +30,7 @@
 	</rowsItem>
 	<rowsItem>
 		<index>1</index>
-		<row>
-			<empty>true</empty>
-		</row>
-	</rowsItem>
-	<rowsItem>
-		<index>2</index>
+		<indexTo>2</indexTo>
 		<row>
 			<empty>true</empty>
 		</row>
@@ -44,31 +38,29 @@
 	<rowsItem>
 		<index>3</index>
 		<row>
+			<formatIndex>2</formatIndex>
 			<c>
-				<i>0</i>
 				<c>
-					<f>4</f>
+					<f>3</f>
 					<parameter>Код</parameter>
 				</c>
 			</c>
 			<c>
-				<i>1</i>
 				<c>
-					<f>4</f>
+					<f>3</f>
 					<parameter>Имя</parameter>
 				</c>
 			</c>
 			<c>
-				<i>2</i>
 				<c>
-					<f>4</f>
+					<f>3</f>
 					<parameter>Значение</parameter>
 				</c>
 			</c>
 		</row>
 	</rowsItem>
 	<templateMode>true</templateMode>
-	<defaultFormatIndex>1</defaultFormatIndex>
+	<defaultFormatIndex>4</defaultFormatIndex>
 	<height>4</height>
 	<vgRows>4</vgRows>
 	<merge>
@@ -76,16 +68,6 @@
 		<c>0</c>
 		<w>2</w>
 	</merge>
-	<namedItem xsi:type="NamedItemCells">
-		<name>Заголовок</name>
-		<area>
-			<type>Rows</type>
-			<beginRow>0</beginRow>
-			<endRow>2</endRow>
-			<beginColumn>-1</beginColumn>
-			<endColumn>-1</endColumn>
-		</area>
-	</namedItem>
 	<namedItem xsi:type="NamedItemCells">
 		<name>Данные</name>
 		<area>
@@ -96,32 +78,32 @@
 			<endColumn>-1</endColumn>
 		</area>
 	</namedItem>
+	<namedItem xsi:type="NamedItemCells">
+		<name>Заголовок</name>
+		<area>
+			<type>Rows</type>
+			<beginRow>0</beginRow>
+			<endRow>2</endRow>
+			<beginColumn>-1</beginColumn>
+			<endColumn>-1</endColumn>
+		</area>
+	</namedItem>
 	<line width="1" gap="false">
 		<v8ui:style xsi:type="v8ui:SpreadsheetDocumentCellLineType">Solid</v8ui:style>
 	</line>
-	<font faceName="Arial" height="10" bold="false" italic="false" underline="false" strikeout="false" kind="Absolute" scale="100"/>
 	<font faceName="Arial" height="12" bold="true" italic="false" underline="false" strikeout="false" kind="Absolute" scale="100"/>
 	<format>
-		<width>10</width>
-	</format>
-	<format>
-		<font>1</font>
+		<font>0</font>
 		<horizontalAlignment>Center</horizontalAlignment>
-		<fillType>Text</fillType>
 	</format>
 	<format>
-		<font>0</font>
-		<leftBorder>0</leftBorder>
-		<topBorder>0</topBorder>
-		<rightBorder>0</rightBorder>
-		<bottomBorder>0</bottomBorder>
+		<border>0</border>
 	</format>
 	<format>
-		<font>0</font>
-		<leftBorder>0</leftBorder>
-		<topBorder>0</topBorder>
-		<rightBorder>0</rightBorder>
-		<bottomBorder>0</bottomBorder>
+		<border>0</border>
 		<fillType>Parameter</fillType>
+	</format>
+	<format>
+		<width>10</width>
 	</format>
 </document>

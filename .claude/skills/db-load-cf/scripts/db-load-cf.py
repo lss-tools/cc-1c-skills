@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# db-load-cf v1.13 — Load 1C configuration from CF file
+# db-load-cf v1.17 — Load 1C configuration from CF file
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 import argparse
@@ -13,6 +13,28 @@ import shutil
 import subprocess
 import sys
 import tempfile
+
+# Регистронезависимый ввод — паритет с PS1: в PowerShell имена параметров и [ValidateSet]
+# регистр не различают, в argparse совпадение точное.
+def ci_parse_args(parser, argv=None):
+    """parse_args по правилам PS: имена параметров и значения choices регистронезависимы."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    names = {s.lower(): s for a in parser._actions for s in a.option_strings}
+    for i, tok in enumerate(argv):
+        if tok.startswith('-') and tok.lower() in names:
+            argv[i] = names[tok.lower()]
+    # choices — зеркало [ValidateSet]; канонизируем ДО разбора, иначе argparse отвергнет регистр
+    choice_map = {}
+    for a in parser._actions:
+        if a.choices:
+            for s in a.option_strings:
+                choice_map[s] = {str(c).lower(): c for c in a.choices}
+    for i in range(len(argv) - 1):
+        m = choice_map.get(argv[i])
+        if m and argv[i + 1].lower() in m:
+            argv[i + 1] = m[argv[i + 1].lower()]
+    return parser.parse_args(argv)
+
 
 
 def _find_project_v8path():
@@ -45,6 +67,17 @@ V8_OWNED_KEYS = [
     "/DumpConfigToFiles", "/LoadConfigFromFiles", "/UpdateDBCfg",
     "/DumpExternalDataProcessorOrReportToFiles", "/LoadExternalDataProcessorOrReportFromFiles",
 ]
+# Пакетные команды платформы. В одной командной строке DESIGNER выполняет ТОЛЬКО ПОСЛЕДНЮЮ,
+# остальные молча отбрасывает (проверено на 8.3.24: /LoadConfigFromFiles вместе с
+# /CheckCanApplyConfigurationExtensions завершились кодом 0 с пустым логом, и загрузка НЕ
+# состоялась). Такая команда в дополнительных аргументах подменяет собой операцию навыка, а навык
+# отчитывается успехом. Дополнительные аргументы — это опции, а не режимы.
+V8_BATCH_KEYS = [
+    "/CheckConfig", "/CheckModules", "/CheckCanApplyConfigurationExtensions",
+    "/DumpDBCfgList", "/DeleteCfg", "/UpdateCfg", "/CompareCfg", "/MergeCfg",
+    "/ManageCfgSupport", "/RollbackCfg", "/ConvertFiles",
+]
+
 IBCMD_OWNED_KEYS = [
     "--db-path", "--data", "--out", "--file", "--load", "--restore",
     "--import", "--export", "--apply", "--force", "--create-database",
@@ -98,15 +131,21 @@ def assert_extra_args(extra, engine, hints):
             print(
                 f"Error: '{tok}' is a positional token — pass values as --key=value "
                 f"({param} cannot extend the ibcmd command)",
-                file=sys.stderr,
             )
             sys.exit(1)
+        if engine != "ibcmd":
+            for b in V8_BATCH_KEYS:
+                if arg_key_match(tok, b):
+                    print(
+                        f"Error: {b} is a batch command; passed via {param} it would replace "
+                        f"the skill's own operation (a command line runs only its last batch command)",
+                    )
+                    sys.exit(1)
         for k in owned:
             if arg_key_match(tok, k):
                 hint = f" (use {hints[k]})" if hints and k in hints else ""
                 print(
                     f"Error: {k} is controlled by the skill and cannot be passed via {param}{hint}",
-                    file=sys.stderr,
                 )
                 sys.exit(1)
 
@@ -174,14 +213,12 @@ def resolve_extra_args(engine, v8_extra, ibcmd_extra, hints):
         print(
             "Error: -AdditionalV8Arguments applies to 1cv8 only; the selected engine is ibcmd "
             "(use -AdditionalIbcmdArguments)",
-            file=sys.stderr,
         )
         sys.exit(1)
     if engine != "ibcmd" and ibcmd_extra:
         print(
             "Error: -AdditionalIbcmdArguments applies to ibcmd only; the selected engine is 1cv8 "
             "(use -AdditionalV8Arguments)",
-            file=sys.stderr,
         )
         sys.exit(1)
     if engine == "ibcmd":
@@ -223,14 +260,14 @@ def resolve_v8path(v8path):
             v8path = max(candidates, key=_version_key)
             print(f"Auto-selected platform {_version_dir(v8path)}: {v8path}")
         else:
-            print("Error: 1C executable not found. Specify -V8Path", file=sys.stderr)
+            print("Error: 1C executable not found. Specify -V8Path")
             sys.exit(1)
     if os.path.isdir(v8path):
         # PY-only: на *nix исполняемый называется "1cv8" (без .exe); ibcmd — только явным путём.
         exe = "1cv8.exe" if os.name == "nt" else "1cv8"
         v8path = os.path.join(v8path, exe)
     if not os.path.isfile(v8path):
-        print(f"Error: 1C executable not found at {v8path}", file=sys.stderr)
+        print(f"Error: 1C executable not found at {v8path}")
         sys.exit(1)
     return v8path
 
@@ -261,7 +298,7 @@ def assert_infobase_exists(path):
     if not path:
         return
     if not os.path.isfile(os.path.join(path, "1Cv8.1CD")):
-        print(f"Error: information base not found at {path} (no 1Cv8.1CD)", file=sys.stderr)
+        print(f"Error: information base not found at {path} (no 1Cv8.1CD)")
         sys.exit(1)
 
 
@@ -278,7 +315,7 @@ def clean_path(value, param=""):
     if len(v) > 3 and v[-1] in "\\/":
         v = v[:-1]
     if '"' in v:
-        print(f"Error: {param or 'path'} contains a quote character: {value}", file=sys.stderr)
+        print(f"Error: {param or 'path'} contains a quote character: {value}")
         sys.exit(1)
     return v
 
@@ -297,11 +334,31 @@ def run_v8(v8path, arguments):
     The arguments carry their own quotes inside the value (File="C:\\a b") — that is where
     1C's parser expects them, on Windows and on *nix alike. Windows list2cmdline would
     escape those quotes, so there the command line is handed over ready-made.
+
+    На POSIX аргументы уходят СПИСКОМ, и кавычки, нужные для склейки на Windows, стали бы
+    частью значения: путь с пробелом платформа не находит («Неопределена информационная
+    база»), многословный -comment теряет молча. Поэтому здесь снимается ОДИН слой
+    обрамляющих кавычек. Склеенные ключи (/N"user", /ConfigurationRepositoryF"путь",
+    File="…") не задеты: у них кавычки внутри токена, а не по краям.
     """
     if os.name == "nt":
         cmd = '"' + v8path + '" ' + " ".join(arguments)
     else:
-        cmd = [v8path] + arguments
+        def strip_framing_quotes(a):
+            # Кавычки, которыми мы обрамляем значения ради склейки на Windows, на POSIX
+            # становятся ЧАСТЬЮ значения. Проверено на darwin: путь с пробелом отдельным
+            # токеном даёт «Неопределена информационная база», а склеенный
+            # /ConfigurationRepositoryF"путь с пробелом" — «завершилось с ошибкой»;
+            # без кавычек обе формы работают.
+            if len(a) > 1 and a[0] == '"' and a[-1] == '"':
+                return a[1:-1]                       # "значение" отдельным токеном
+            if a[0:1] == "/" and a[-1:] == '"' and '"' in a[:-1]:
+                i = a.index('"')
+                return a[:i] + a[i + 1:-1]           # /N"имя" -> /Nимя
+            return a                                 # File="…" не трогаем: там кавычки —
+                                                     # часть синтаксиса строки соединения,
+                                                     # и с ними на POSIX всё работает
+        cmd = [v8path] + [strip_framing_quotes(a) for a in arguments]
     r = subprocess.run(cmd, input=b"", capture_output=True)
     r.stdout = decode_platform_bytes(r.stdout)
     r.stderr = decode_platform_bytes(r.stderr)
@@ -322,6 +379,91 @@ def print_platform_output(result):
     print("--- End ---")
 
 
+def _sg_find_v8project(start_dir):
+    d = start_dir
+    for _ in range(20):
+        if not d:
+            break
+        pj = os.path.join(d, ".v8-project.json")
+        if os.path.isfile(pj):
+            return pj
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def run_apply_check(exe, conn_args, extension, extra_args):
+    """Постусловие применимости расширения: платформа отчитывается успехом и о расширении,
+    которое не применит — отказ всплывает лениво, при первом вызове метода, записью в журнал
+    регистрации.
+
+    Запуск ОБЯЗАТЕЛЬНО отдельный. Дописать эту команду в строку операции нельзя: в одной
+    командной строке DESIGNER выполняет только ПОСЛЕДНЮЮ пакетную команду, остальные молча
+    отбрасывает — проверено на 8.3.24, /LoadConfigFromFiles вместе с
+    /CheckCanApplyConfigurationExtensions завершились кодом 0 с пустым логом, и загрузка не
+    состоялась.
+
+    Проверку умеет только 1cv8; если навык работал через ibcmd, берём соседний файл.
+    """
+    exe_dir = os.path.dirname(exe)
+    leaf = os.path.basename(exe)
+    if leaf.lower().startswith("ibcmd"):
+        v8 = os.path.join(exe_dir, "1cv8" + os.path.splitext(leaf)[1])
+    else:
+        v8 = exe
+    if not os.path.isfile(v8):
+        return {"skipped": True, "reason": f"1cv8 not found at {v8}", "exit": 0, "lines": []}
+    temp_dir = tempfile.mkdtemp(prefix="apply_check_")
+    try:
+        a = ["DESIGNER"] + list(conn_args) + ["/CheckCanApplyConfigurationExtensions"]
+        if extension:
+            a += ["-Extension", f'"{extension}"']
+        out_file = os.path.join(temp_dir, "check_log.txt")
+        a += ["/Out", f'"{out_file}"', "/DisableStartupDialogs"]
+        a += list(extra_args)
+        r = run_v8(v8, a)
+        lines = []
+        if os.path.isfile(out_file):
+            with open(out_file, encoding="utf-8-sig", errors="replace") as f:
+                lines = [x.strip() for x in f.read().splitlines() if x.strip()]
+        return {"skipped": False, "reason": "", "exit": r.returncode, "lines": lines}
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def apply_check_report(exe, conn_args, extension, extra_args):
+    """Проверить и напечатать. True, если платформа расширение не применит — вызывающий решает,
+    поднимать ли код возврата (строгий режим)."""
+    ac = run_apply_check(exe, conn_args, extension, extra_args)
+    if ac["skipped"]:
+        print(f"[note] applicability check skipped: {ac['reason']}")
+        return False
+    if ac["exit"] != 0 or ac["lines"]:
+        print("[warning] the extension is loaded, but the platform will not apply it:")
+        for line in ac["lines"]:
+            print(f"  {line}")
+        return True
+    return False
+
+
+def apply_check_enabled(disabled):
+    """Проверять ли применимость: -NoApplyCheck сильнее настройки проекта."""
+    if disabled:
+        return False
+    pf = _sg_find_v8project(os.getcwd())
+    if pf:
+        try:
+            with open(pf, encoding="utf-8-sig") as f:
+                proj = json.load(f)
+            if proj.get("extensionApplyCheck") is not None:
+                return bool(proj.get("extensionApplyCheck"))
+        except Exception:
+            pass
+    return True
+
+
 def run_ibcmd(cmd, has_username=False, warn_no_user=True):
     """Run an ibcmd command non-interactively.
 
@@ -330,7 +472,7 @@ def run_ibcmd(cmd, has_username=False, warn_no_user=True):
     that residual case is flagged via IBCMD_NOUSER_HINT (model-facing).
     """
     if warn_no_user and os.name == "nt" and not has_username:
-        sys.stderr.write(IBCMD_NOUSER_HINT)
+        sys.stdout.write(IBCMD_NOUSER_HINT)
         sys.stderr.flush()
     r = subprocess.run(cmd, input=b"", capture_output=True)
     r.stdout = decode_platform_bytes(r.stdout)
@@ -387,13 +529,19 @@ def main():
     parser.add_argument("-InputFile", required=True)
     parser.add_argument("-Extension", default="")
     parser.add_argument("-AllExtensions", action="store_true")
+    # Ключ для регрессов и верификации снапшотов, не для повседневного вызова: в SKILL.md
+    # намеренно не выносится. Поднимает код возврата, если платформа отчиталась об успехе,
+    # но расширение при этом неприменимо.
+    parser.add_argument("-StrictLog", action="store_true")
+    # Пропустить проверку применимости расширения после загрузки.
+    parser.add_argument("-NoApplyCheck", action="store_true")
     parser.add_argument("-AdditionalV8Arguments", nargs="*", default=[],
                         help="Extra 1cv8 arguments, e.g. /UseHwLicenses+")
     parser.add_argument("-AdditionalIbcmdArguments", nargs="*", default=[],
                         help="Extra ibcmd arguments in --key=value form")
     known_opts = {s.lower() for a in parser._actions for s in a.option_strings}
     argv, v8_extra, ibcmd_extra = extract_extra_args(sys.argv[1:], known_opts)
-    args = parser.parse_args(argv)
+    args = ci_parse_args(parser, argv)
 
     args.V8Path = clean_path(args.V8Path, "-V8Path")
     args.InfoBasePath = clean_path(args.InfoBasePath, "-InfoBasePath")
@@ -418,21 +566,21 @@ def main():
     # --- Validate connection ---
     if engine == "ibcmd":
         if not args.InfoBasePath:
-            print("Error: ibcmd supports file infobases only (use -InfoBasePath)", file=sys.stderr)
+            print("Error: ibcmd supports file infobases only (use -InfoBasePath)")
             sys.exit(1)
     elif not args.InfoBasePath and (not args.InfoBaseServer or not args.InfoBaseRef):
-        print("Error: specify -InfoBasePath or -InfoBaseServer + -InfoBaseRef", file=sys.stderr)
+        print("Error: specify -InfoBasePath or -InfoBaseServer + -InfoBaseRef")
         sys.exit(1)
 
     # --- Validate input file ---
     if not os.path.isfile(args.InputFile):
-        print(f"Error: input file not found: {args.InputFile}", file=sys.stderr)
+        print(f"Error: input file not found: {args.InputFile}")
         sys.exit(1)
 
     # --- ibcmd branch (file infobase only) ---
     if engine == "ibcmd":
         if args.AllExtensions:
-            print("Error: ibcmd config load does not support -AllExtensions (use -Extension)", file=sys.stderr)
+            print("Error: ibcmd config load does not support -AllExtensions (use -Extension)")
             sys.exit(1)
         arguments = ["infobase", "config", "load", f"--db-path={args.InfoBasePath}"]
         if args.Extension:
@@ -451,7 +599,19 @@ def main():
         if result.returncode == 0:
             print(f"Configuration loaded successfully from: {args.InputFile}")
         else:
-            print(f"Error loading configuration (code: {result.returncode}){describe_exit(result.returncode)}", file=sys.stderr)
+            print(f"Error loading configuration (code: {result.returncode}){describe_exit(result.returncode)}")
+        # Проверку применимости умеет только 1cv8 — соединение для неё собираем в его форме.
+        exit_code = result.returncode
+        if (exit_code == 0 and (args.Extension or args.AllExtensions)
+                and apply_check_enabled(args.NoApplyCheck)):
+            ac_conn = ["/F", f'"{args.InfoBasePath}"']
+            if args.UserName:
+                ac_conn.append(f'/N"{args.UserName}"')
+            if args.Password:
+                ac_conn.append(f'/P"{args.Password}"')
+            if apply_check_report(v8path, ac_conn, args.Extension, []) and args.StrictLog:
+                exit_code = 1
+
         sys.exit(result.returncode)
 
     # --- Temp dir ---
@@ -460,17 +620,20 @@ def main():
 
     try:
         # --- Build arguments ---
-        arguments = ["DESIGNER"]
+        # Аргументы соединения собираем отдельно: тем же набором пойдёт проверка применимости.
+        conn_args = []
 
         if args.InfoBaseServer and args.InfoBaseRef:
-            arguments.extend(["/S", f'"{args.InfoBaseServer}/{args.InfoBaseRef}"'])
+            conn_args.extend(["/S", f'"{args.InfoBaseServer}/{args.InfoBaseRef}"'])
         else:
-            arguments.extend(["/F", f'"{args.InfoBasePath}"'])
+            conn_args.extend(["/F", f'"{args.InfoBasePath}"'])
 
         if args.UserName:
-            arguments.append(f'/N"{args.UserName}"')
+            conn_args.append(f'/N"{args.UserName}"')
         if args.Password:
-            arguments.append(f'/P"{args.Password}"')
+            conn_args.append(f'/P"{args.Password}"')
+
+        arguments = ["DESIGNER"] + conn_args
 
         arguments.extend(["/LoadCfg", f'"{args.InputFile}"'])
 
@@ -495,7 +658,7 @@ def main():
         if exit_code == 0:
             print(f"Configuration loaded successfully from: {args.InputFile}")
         else:
-            print(f"Error loading configuration (code: {exit_code}){describe_exit(exit_code)}", file=sys.stderr)
+            print(f"Error loading configuration (code: {exit_code}){describe_exit(exit_code)}")
 
         if os.path.isfile(out_file):
             try:
@@ -507,6 +670,12 @@ def main():
                     print("--- End ---")
             except Exception:
                 pass
+
+        # Расширение могло загрузиться «успешно» и остаться неприменимым — спрашиваем платформу.
+        if (exit_code == 0 and (args.Extension or args.AllExtensions)
+                and apply_check_enabled(args.NoApplyCheck)):
+            if apply_check_report(v8path, conn_args, args.Extension, extra_args) and args.StrictLog:
+                exit_code = 1
 
         print_platform_output(result)
         sys.exit(exit_code)

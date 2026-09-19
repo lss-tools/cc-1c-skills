@@ -71,7 +71,7 @@ python tools/cc-1c-skills/scripts/switch.py
 | Подсистемы (Subsystem) | 4 навыка `/subsystem-*` | Анализ, создание, редактирование, валидация подсистем конфигурации | [Подробнее](docs/subsystem-guide.md) |
 | Командный интерфейс (CI) | 2 навыка `/interface-*` | Редактирование и валидация CommandInterface.xml подсистем | [Подробнее](docs/subsystem-guide.md) |
 | Пакеты XDTO | 5 навыков `/xdto-*` | Анализ, создание из XML-схемы, выгрузка в схему, точечное редактирование, валидация пакетов XDTO | [Подробнее](docs/xdto-guide.md) |
-| Базы данных (DB) | 9 навыков `/db-*` | Создание баз, загрузка/выгрузка конфигураций, обновление БД, загрузка из Git | [Подробнее](docs/db-guide.md) |
+| Базы данных (DB) | 13 навыков `/db-*` | Создание баз, загрузка/выгрузка конфигураций, обновление БД, загрузка из Git, хранилище конфигурации, управление расширениями в базе | [Подробнее](docs/db-guide.md) |
 | Веб-публикация (Web) | 4 навыка `/web-*` | Публикация баз через Apache, статус, остановка, удаление публикаций | [Подробнее](docs/web-guide.md) |
 | Тестирование (Web) | `/web-test` | Взаимодействие с веб-клиентом 1С — навигация, формы, таблицы, отчёты, тестирование | [Подробнее](docs/web-test-guide.md) |
 | Запись видео (Web) | `/web-test` | Запись видеоинструкций с субтитрами, подсветкой и TTS-озвучкой | [Подробнее](docs/web-test-recording-guide.md) |
@@ -160,7 +160,7 @@ python scripts/switch.py --runtime powershell  # вернуть на PowerShell
 - [Встроенная справка](docs/1c-help-spec.md) — Help.xml, HTML-страницы, кнопка справки на форме
 - [Пакетный режим конфигуратора 1С](docs/build-spec.md) — команды `1cv8.exe`, DESIGNER, ENTERPRISE, CREATEINFOBASE
 - [Табличный документ (MXL)](docs/1c-spreadsheet-spec.md) — XML-формат SpreadsheetDocument, совместимость версий
-- [MXL DSL](docs/mxl-dsl-spec.md) — JSON-формат описания макета для `/mxl-compile` и `/mxl-decompile`
+- [MXL DSL](docs/mxl-dsl-spec.md) — JSON-формат описания макета для `/mxl-compile` и `/mxl-decompile`: структура, оформление, полный перечень свойств стиля
 - [Form DSL](docs/form-dsl-spec.md) — JSON-формат описания формы для `/form-compile`
 - [Роли (Rights.xml)](docs/1c-role-spec.md) — XML-формат прав роли, типы объектов, RLS
 - [Role DSL](docs/role-dsl-spec.md) — JSON-формат описания ролей для `/role-compile`
@@ -202,6 +202,7 @@ python scripts/switch.py --runtime powershell  # вернуть на PowerShell
 ├── form-patterns/       # Справочник паттернов компоновки форм
 ├── role-info/           # Анализ прав роли
 ├── role-compile/        # Создание роли из JSON DSL
+├── role-edit/           # Точечная правка прав существующей роли
 ├── role-validate/       # Валидация роли
 ├── skd-info/            # Анализ схемы компоновки данных
 ├── skd-compile/         # Компиляция СКД из JSON DSL
@@ -233,9 +234,13 @@ python scripts/switch.py --runtime powershell  # вернуть на PowerShell
 ├── db-load-cf/          # Загрузка конфигурации из CF
 ├── db-dump-xml/         # Выгрузка конфигурации в XML
 ├── db-load-xml/         # Загрузка конфигурации из XML
+├── db-dump-dt/          # Выгрузка информационной базы в DT
+├── db-load-dt/          # Загрузка информационной базы из DT
 ├── db-update/           # Обновление конфигурации БД
 ├── db-run/              # Запуск 1С:Предприятие
 ├── db-load-git/         # Загрузка изменений из Git
+├── db-repo/             # Хранилище конфигурации
+├── db-cfe-admin/        # Расширения в базе: состав, проверки, свойства, удаление
 ├── web-publish/         # Публикация базы через Apache
 ├── web-info/            # Статус Apache и публикаций
 ├── web-stop/            # Остановка Apache

@@ -1,0 +1,20 @@
+{
+  "name": "Ошибка: список объектов с -Mode UpdateInfo — это другая операция",
+  "fakePlatform": {
+    "log": ""
+  },
+  "args_extra": [
+    "-V8Path",
+    "{fakePlatform}",
+    "-InfoBasePath",
+    "{workDir}/ib",
+    "-ConfigDir",
+    "{workDir}/out",
+    "-Objects",
+    "Справочник.Номенклатура",
+    "-Mode",
+    "UpdateInfo"
+  ],
+  "expectError": true,
+  "noSnapshot": "текст ошибки не сверяем: PS пишет её в stdout, py — в stderr; это общее для группы расхождение портов, поэтому соседний error-partial-no-objects тоже проверяет только код возврата"
+}

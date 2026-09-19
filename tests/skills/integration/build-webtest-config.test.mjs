@@ -81,31 +81,6 @@ export const steps = [
     validate: { script: 'meta-validate/scripts/meta-validate', flag: '-ObjectPath', path: 'Catalogs/КонтактныеЛица' },
   },
 
-  // Справочник Номенклатура — иерархический, все типы полей
-  {
-    name: 'meta-compile: Справочник Номенклатура',
-    script: 'meta-compile/scripts/meta-compile',
-    input: {
-      type: 'Catalog', name: 'Номенклатура',
-      codeLength: 11, descriptionLength: 150,
-      hierarchical: true,
-      attributes: [
-        { name: 'Артикул', type: 'String', length: 25 },
-        { name: 'Цена', type: 'Number', length: 15, precision: 2 },
-        { name: 'Активен', type: 'Boolean' },
-        { name: 'ДатаПоступления', type: 'Date' },
-        { name: 'Комментарий', type: 'String' },
-        { name: 'ЕдиницаИзмерения', type: 'String', length: 10 },
-        { name: 'ВидНоменклатуры', type: 'EnumRef.ВидыНоменклатуры' },
-        { name: 'КатегорияЦены', type: 'EnumRef.КатегорииЦен' },
-        { name: 'СпособУчёта', type: 'EnumRef.СпособыУчёта' },
-      ],
-      fillChecking: { 'Description': 'ShowError' },
-    },
-    args: { '-JsonPath': '{inputFile}', '-OutputDir': '{workDir}' },
-    validate: { script: 'meta-validate/scripts/meta-validate', flag: '-ObjectPath', path: 'Catalogs/Номенклатура' },
-  },
-
   // Перечисление ВидыНоменклатуры
   {
     name: 'meta-compile: Перечисление ВидыНоменклатуры',
@@ -152,6 +127,31 @@ export const steps = [
     },
     args: { '-JsonPath': '{inputFile}', '-OutputDir': '{workDir}' },
     validate: { script: 'meta-validate/scripts/meta-validate', flag: '-ObjectPath', path: 'Enums/СтавкиНДС' },
+  },
+
+  // Справочник Номенклатура — иерархический, все типы полей
+  {
+    name: 'meta-compile: Справочник Номенклатура',
+    script: 'meta-compile/scripts/meta-compile',
+    input: {
+      type: 'Catalog', name: 'Номенклатура',
+      codeLength: 11, descriptionLength: 150,
+      hierarchical: true,
+      attributes: [
+        { name: 'Артикул', type: 'String', length: 25 },
+        { name: 'Цена', type: 'Number', length: 15, precision: 2 },
+        { name: 'Активен', type: 'Boolean' },
+        { name: 'ДатаПоступления', type: 'Date' },
+        { name: 'Комментарий', type: 'String' },
+        { name: 'ЕдиницаИзмерения', type: 'String', length: 10 },
+        { name: 'ВидНоменклатуры', type: 'EnumRef.ВидыНоменклатуры' },
+        { name: 'КатегорияЦены', type: 'EnumRef.КатегорииЦен' },
+        { name: 'СпособУчёта', type: 'EnumRef.СпособыУчёта' },
+      ],
+      fillChecking: { 'Description': 'ShowError' },
+    },
+    args: { '-JsonPath': '{inputFile}', '-OutputDir': '{workDir}' },
+    validate: { script: 'meta-validate/scripts/meta-validate', flag: '-ObjectPath', path: 'Catalogs/Номенклатура' },
   },
 
   // Документ ПриходнаяНакладная — шапка + ТЧ
@@ -2027,20 +2027,20 @@ export const steps = [
     input: {
       name: 'Администратор',
       objects: [
-        'Catalog.Организации: Read View Add Update Delete',
-        'Catalog.Контрагенты: Read View Add Update Delete',
-        'Catalog.КонтактныеЛица: Read View Add Update Delete',
-        'Catalog.Номенклатура: Read View Add Update Delete',
-        'Document.ПриходнаяНакладная: Read View Add Update Delete Posting UnPosting',
-        'InformationRegister.КурсыВалют: Read View Add Update Delete',
-        'Report.ОстаткиТоваров: Use View',
-        'DataProcessor.ДеревоНоменклатуры: Use View',
-        'DataProcessor.МножественныйВыбор: Use View',
-        'DataProcessor.БезшапочнаяТаблица: Use View',
-        'DataProcessor.МногострочнаяШапка: Use View',
-        'DataProcessor.ГруппыКолонок: Use View',
-        'DataProcessor.ПроверкаДоступности: Use View',
-        'DataProcessor.СтраницаНастроек: Use View',
+        'Catalog.Организации: Read, View, Insert, Update, Delete',
+        'Catalog.Контрагенты: Read, View, Insert, Update, Delete',
+        'Catalog.КонтактныеЛица: Read, View, Insert, Update, Delete',
+        'Catalog.Номенклатура: Read, View, Insert, Update, Delete',
+        'Document.ПриходнаяНакладная: Read, View, Insert, Update, Delete, Posting, UndoPosting',
+        'InformationRegister.КурсыВалют: Read, View, Update, Edit',
+        'Report.ОстаткиТоваров: Use, View',
+        'DataProcessor.ДеревоНоменклатуры: Use, View',
+        'DataProcessor.МножественныйВыбор: Use, View',
+        'DataProcessor.БезшапочнаяТаблица: Use, View',
+        'DataProcessor.МногострочнаяШапка: Use, View',
+        'DataProcessor.ГруппыКолонок: Use, View',
+        'DataProcessor.ПроверкаДоступности: Use, View',
+        'DataProcessor.СтраницаНастроек: Use, View',
       ],
     },
     args: { '-JsonPath': '{inputFile}', '-OutputDir': '{workDir}' },

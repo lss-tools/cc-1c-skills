@@ -1,5 +1,6 @@
-﻿# form-edit v1.9 — Edit 1C managed form elements
+﻿# form-edit v1.18 — Edit 1C managed form elements (+esc_xml/esc_xml_text: разное экранирование атрибута и текста)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
+[CmdletBinding(PositionalBinding=$false)]
 param(
 	[Parameter(Mandatory)]
 	[Alias('Path')]
@@ -10,6 +11,70 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# --- Разбор пользовательского JSON ---
+# Одна строка в stderr вместо дампа исключения ConvertFrom-Json (issue #80): агент по стектрейсу
+# идёт чинить скрипт, а не свой вызов. $source — файл или параметр. $expected заполняем только
+# для полиморфного входа: у файла подсказка была бы наполнителем. -Inline печатает ещё и то,
+# что доехало: у файла такого вопроса нет — путь назван, позицию дал парсер, файл на диске.
+# Возврат через -NoEnumerate: без него одноэлементный
+# JSON-массив разворачивался бы в скаляр вторым анруллингом.
+function ConvertFrom-JsonInput([string]$text, [string]$source, [string]$expected, [switch]$Inline) {
+	try {
+		# PS 5.1 на пустой строке отдаёт $null, а не ошибку — навык уходил дальше с $null,
+		# тогда как py-порт падал. Проверяем сами, чтобы порты вели себя одинаково.
+		if ([string]::IsNullOrWhiteSpace($text)) { throw 'input is empty' }
+		$parsed = $text | ConvertFrom-Json
+	} catch {
+		$what = if ($expected) { "$source expects $expected" } else { "Invalid JSON in $source" }
+		if ($Inline) {
+			$got = ($text -replace '\s+', ' ').Trim()
+			$label = 'got'
+			if (-not $got) { $got = '(empty)' }
+			elseif ($got.Length -gt 60) { $label = 'got (first 60 chars)'; $got = $got.Substring(0, 60) }
+			$what = "${what}, ${label}: ${got}"
+		}
+		[Console]::Error.WriteLine("[ERROR] ${what} ($($_.Exception.Message))")
+		exit 1
+	}
+	Write-Output -NoEnumerate $parsed
+}
+
+# --- Чтение входного JSON-файла ---
+# Кодировку берём из BOM — это объявление самого файла, а не догадка. Без BOM ждём строгий UTF-8:
+# Get-Content -Encoding UTF8 на файле в cp1251 тихо меняет кириллицу на U+FFFD, JSON после этого
+# разбирается успешно, и в конфигурацию уезжает имя из «замен». Кодовую страницу не подбираем:
+# угаданное имя уйдёт в метаданные так же молча.
+function Read-JsonInputFile([string]$path) {
+	# Проверка здесь, а не по навыкам: часть навыков проверяла путь сама, часть — нет, и один и тот
+	# же промах давал то внятную строку, то дамп MethodInvocationException. Навыки со своей
+	# проверкой срабатывают раньше и сохраняют свой текст.
+	if (-not (Test-Path -LiteralPath $path)) {
+		[Console]::Error.WriteLine("[ERROR] File not found: $path")
+		exit 1
+	}
+	if (Test-Path -LiteralPath $path -PathType Container) {
+		[Console]::Error.WriteLine("[ERROR] Expected a JSON file, got a directory: $path")
+		exit 1
+	}
+	$bytes = [System.IO.File]::ReadAllBytes($path)
+	if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+		return [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+	}
+	if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+		return [System.Text.Encoding]::Unicode.GetString($bytes, 2, $bytes.Length - 2)
+	}
+	if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+		return [System.Text.Encoding]::BigEndianUnicode.GetString($bytes, 2, $bytes.Length - 2)
+	}
+	try {
+		return (New-Object System.Text.UTF8Encoding($false, $true)).GetString($bytes)
+	} catch {
+		$detail = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+		[Console]::Error.WriteLine("[ERROR] ${path} is not valid UTF-8: ${detail} - save the file as UTF-8, or add a BOM if it is UTF-16")
+		exit 1
+	}
+}
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 # --- Support guard (Ext/ParentConfigurations.bin) ---
@@ -175,7 +240,7 @@ $root = $xmlDoc.DocumentElement
 
 # === 2. Load JSON ===
 
-$def = Get-Content -Raw -Encoding UTF8 $JsonPath | ConvertFrom-Json
+$def = ConvertFrom-JsonInput (Read-JsonInputFile $JsonPath) $JsonPath
 
 # === 3. Form name + header ===
 
@@ -270,6 +335,12 @@ function X {
 }
 
 function Esc-Xml {
+	param([string]$s)
+	# Эскейп ЗНАЧЕНИЯ АТРИБУТА: & < > и кавычка — внутри "..." литеральная " невалидна.
+	return $s.Replace('&','&amp;').Replace('<','&lt;').Replace('>','&gt;').Replace('"','&quot;')
+}
+
+function Esc-XmlText {
 	# Экранирование ТЕКСТА элемента: только & < > . Кавычки в тексте платформа НЕ экранирует —
 	# пишет литерально (проверено: 92142 сырых кавычки на корпус, ни одной &quot;). &quot; платформа
 	# принимает, но при выгрузке нормализует обратно в кавычку → лишний шум в роундтрипе.
@@ -282,7 +353,7 @@ function Emit-MLText {
 	X "$indent<$tag>"
 	X "$indent`t<v8:item>"
 	X "$indent`t`t<v8:lang>ru</v8:lang>"
-	X "$indent`t`t<v8:content>$(Esc-Xml $text)</v8:content>"
+	X "$indent`t`t<v8:content>$(Esc-XmlText $text)</v8:content>"
 	X "$indent`t</v8:item>"
 	X "$indent</$tag>"
 }
@@ -311,24 +382,49 @@ $script:formTypeSynonyms["бизнеспроцессссылка"]           = "
 $script:formTypeSynonyms["задачассылка"]                  = "TaskRef"
 $script:formTypeSynonyms["определяемыйтип"]             = "DefinedType"
 
+# Алиас на локальный словарь: тело Resolve-TypeStr ниже — общая реализация,
+# одинаковая во всех навыках (реестр в tests/skills/check-inline-drift.mjs).
+$script:typeSynonyms = $script:formTypeSynonyms
+
 function Resolve-TypeStr {
 	param([string]$typeStr)
 	if (-not $typeStr) { return $typeStr }
+
+	# Прощающий ввод: ведущий префикс приходит копипастой из выгрузки. Без срезания он ломает
+	# поиск в словаре — русское имя типа остаётся непереведённым, и платформа отвечает
+	# «Неизвестное имя типа». cfg: снимаем всегда — он однозначно означает текущую конфигурацию.
+	# Сгенерированный dNpM: (в корпусе на этом URI встречаются d4p1, d5p1, d6p1 — имя префикса
+	# платформа выдаёт по порядку объявления) снимаем ТОЛЬКО у ссылочных типов, с точкой:
+	# сам по себе префикс многозначен — в формах d5p1:Chart, d5p1:TextDocument,
+	# d5p1:GeographicalSchema адресуют чужие пространства имён, и там он часть значения.
+	if ($typeStr.StartsWith('cfg:')) {
+		$typeStr = $typeStr.Substring(4)
+	} elseif ($typeStr.Contains('.') -and $typeStr -match '^d\d+p\d+:') {
+		$typeStr = $typeStr.Substring($typeStr.IndexOf(':') + 1)
+	}
+
+	# Параметризованные типы: Number(15,2), Строка(100)
 	if ($typeStr -match '^([^(]+)\((.+)\)$') {
-		$base = $Matches[1].Trim(); $params = $Matches[2]
-		$r = $script:formTypeSynonyms[$base.ToLower()]
-		if ($r) { return "$r($params)" }
+		$baseName = $Matches[1].Trim()
+		$params = $Matches[2]
+		$resolved = $script:typeSynonyms[$baseName.ToLower()]
+		if ($resolved) { return "$resolved($params)" }
 		return $typeStr
 	}
+
+	# Ссылочные типы: СправочникСсылка.Организации → CatalogRef.Организации
 	if ($typeStr.Contains('.')) {
-		$i = $typeStr.IndexOf('.')
-		$prefix = $typeStr.Substring(0, $i); $suffix = $typeStr.Substring($i)
-		$r = $script:formTypeSynonyms[$prefix.ToLower()]
-		if ($r) { return "$r$suffix" }
+		$dotIdx = $typeStr.IndexOf('.')
+		$prefix = $typeStr.Substring(0, $dotIdx)
+		$suffix = $typeStr.Substring($dotIdx)  # includes the dot
+		$resolved = $script:typeSynonyms[$prefix.ToLower()]
+		if ($resolved) { return "$resolved$suffix" }
 		return $typeStr
 	}
-	$r = $script:formTypeSynonyms[$typeStr.ToLower()]
-	if ($r) { return $r }
+
+	# Простое имя
+	$resolved = $script:typeSynonyms[$typeStr.ToLower()]
+	if ($resolved) { return $resolved }
 	return $typeStr
 }
 
@@ -592,7 +688,7 @@ function Emit-Label {
 		X "$inner<Title formatted=`"$formatted`">"
 		X "$inner`t<v8:item>"
 		X "$inner`t`t<v8:lang>ru</v8:lang>"
-		X "$inner`t`t<v8:content>$(Esc-Xml "$($el.title)")</v8:content>"
+		X "$inner`t`t<v8:content>$(Esc-XmlText "$($el.title)")</v8:content>"
 		X "$inner`t</v8:item>"
 		X "$inner</Title>"
 	}

@@ -1,0 +1,17 @@
+{
+  "name": "Ошибка: подкоманда не указана",
+  "fakePlatform": {
+    "log": ""
+  },
+  "args_extra": [
+    "-V8Path",
+    "{fakePlatform}",
+    "-InfoBasePath",
+    "{workDir}/ib"
+  ],
+  "expectError": true,
+  "expect": {
+    "stdoutContains": "-Command is required"
+  },
+  "noSnapshot": "разбор аргументов, платформа не запускается"
+}
