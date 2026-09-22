@@ -28,6 +28,11 @@ MCP-сервер [1c-testpilot](https://github.com/ROCTUP/1c-testpilot) подк
 Каждый инструмент сам печатает список действий с параметрами — спроси его схему,
 прежде чем гадать.
 
+Полная актуальная матрица действий и параметров хранится в [references/tools.md](references/tools.md).
+Для повторяемых прогонов доступны [именованные профили](references/profiles.example.yaml) и
+необязательный [Python/pytest API](references/python-testing.md). Эти reference-файлы синхронизированы
+с текущим `1c-testpilot`; список действий в них важнее сокращённой таблицы выше.
+
 ## Порядок работы
 
 ### 1. Убедиться, что сервер поднят
@@ -41,6 +46,17 @@ MCP-сервер [1c-testpilot](https://github.com/ROCTUP/1c-testpilot) подк
 Без `--env-file` файл `.env` не читается. За MetaMCP сервер заведён как
 `http://host.docker.internal:6014/mcp`.
 
+Порт `6014` — порт нашего локального стенда. В других установках проверь фактические
+`TC1C_HTTP_PORT`, `TC1C_HTTP_HOST`, `TC1C_HTTP_PATH` и `TC1C_TRANSPORT` в окружении процесса,
+а не подставляй порт из примера вслепую.
+
+Для диагностики и повторяемости также фиксируй нужные переключатели сервера:
+`TC1C_PROFILES_FILE` (профили), `TC1C_RESPONSE_FORMAT=toon|json`,
+`TC1C_COMPACT_REFS=id|prefix|off`, `TC1C_READBACK=true|false`,
+`TC1C_VERIFY_TARGET=true|false`, `TC1C_SNAPSHOT_LIMIT` и `TC1C_LOGGING`.
+Значения задаются процессу TestPilot до его запуска; `.env` MCP-клиента сам по себе их не
+подхватывает.
+
 ### 2. Клиент: запустить свой или подключиться к чужому
 
 ```
@@ -49,6 +65,8 @@ tc_session(action="launch_client", base="C:/Base/Demo", user="…", password="�
            version="8.3.27.1936", wait=300)    # файловая база
 tc_session(action="launch_client", base="Сервер\\База", server=true, user="…", password="…")
 tc_session(action="connect", port=<порт>)      # к уже запущенному /TESTCLIENT -TPort
+tc_session(action="list_profiles")             # доступные именованные профили
+tc_session(action="launch_client", profile="<имя>")
 ```
 
 - **Логин обязателен параметрами.** Если база спрашивает пользователя, клиент встанет на
@@ -61,6 +79,8 @@ tc_session(action="connect", port=<порт>)      # к уже запущенн�
   оставляет висеть клиент 1С. **Закрывай за собой:** `tc_session(action="stop_client",
   connection_id=…)`, потом `list_connections` для проверки.
 - `desktop="isolated"` уводит окна клиента с рабочего стола пользователя.
+- Для уже запущенного чужого/владельческого клиента используй `disconnect`, а не
+  `stop_client`; остановка допустима только для своего тестового клиента.
 
 ### 3. Пройти стартовые окна
 
@@ -103,6 +123,16 @@ tc_table(action="find_rows", ref=<таблица>,
 tc_doc(action="read_document", ref=<поле табличного документа>, max_cells=1000)
 tc_doc(action="find_text", ref=<поле>, text="Итого")
 ```
+
+Для регрессионного сравнения формы можно сохранить состояние и сравнить его после действия:
+
+```
+tc_form(action="create_snapshot", include_tables=true, max_rows=500)
+tc_form(action="compare_snapshot", snapshot_id="<id>")
+```
+
+Снимки живут в памяти сервера до удаления, вытеснения или его остановки; для долгого
+прогона сохраняй внешний артефакт, а не полагайся только на `snapshot_id`.
 
 - `get_context` на типовой форме — это 150+ элементов; когда нужен один реквизит, дешевле
   `find_objects` по имени и `read_fields`.
@@ -166,7 +196,11 @@ tc_window(action="get_user_message_texts")                    # после де�
 и клиент на одном компьютере.
 
 Сложный разбор: `tc_session(action="start_logging")` → действия →
-`stop_logging` вернёт JSONL и HTML-отчёт со снимками.
+`get_logging_status` → `stop_logging` вернёт JSONL и HTML-отчёт со снимками.
+
+Альтернативный путь для автоматизированной регрессии — Python API и pytest. Он обращается
+к клиенту тестирования напрямую и не требует MCP-сервера; минимальный запуск и fixture-паттерны
+см. в [references/python-testing.md](references/python-testing.md).
 
 ## Безопасность
 
