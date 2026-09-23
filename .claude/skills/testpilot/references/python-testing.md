@@ -186,6 +186,66 @@ assert result["code"] == "no_selected_rows"
 `TC1C_SCREENSHOTS`, `TC1C_LOGGING` и `TC1C_LOG_SCREENSHOTS` должны разрешать захват.
 Это не запрещает самому тесту явно вызвать `get_screenshot`, если функция разрешена.
 
+## Останов клиента
+
+После теста запущенный клиент завершается штатно с подтверждением известных вопросов
+выхода; если за 15 секунд он не завершился, процесс останавливается принудительно.
+Это также действует для `Client.close()`. Для явной остановки —
+`client.stop_client(graceful_timeout=30)`; допустимо 0–120 секунд, 0 — сразу
+принудительно. Ответ содержит `shutdown`: `graceful`, `forced` или `already_exited`;
+при `forced` поле `shutdown_reason` объясняет причину. Несохранённые изменения могут
+быть потеряны.
+
+## Форматы отчётов
+
+`--tc-reports` выбирает `html`, `allure`, `html,allure` или `none` (только JSONL);
+по умолчанию берётся `TC1C_LOG_REPORTS`, без неё — `html`. Журнал и скриншоты собираются
+один раз, HTML и Allure используют одни события. При Allure результаты пишутся в
+`<tc-artifacts>/allure-results` (переопределяется `--alluredir`); сборка и просмотр —
+`allure generate <каталог>/allure-results -o allure-report && allure open allure-report`.
+Каждый тест имеет собственный результат; действия Testpilot отображаются шагами
+с параметрами, ответами и скриншотами, `wait_until` группирует проверки ожидания.
+Смысловые этапы можно объединять стандартным `with allure.step("…")`.
+
+## Код и запросы в текущем сеансе 1С
+
+Запусти клиент с обработкой Testpilot — в профиле (`code_epf:`), аргументом
+`launch_client(..., code_epf=...)` или через `TC1C_CODE_EPF`. Приоритет: аргумент,
+профиль, окружение; `code_epf=""` запускает клиент без обработки. Настройки публикации
+MCP (`TC1C_CODE_EXECUTION` и остальные) для Python-тестов не требуются:
+
+```python
+with Client() as client:
+    client.launch_client(base="D:/Bases/Demo", code_epf="D:/Tools/Testpilot.epf")
+    assert client.execute_query(query="ВЫБРАТЬ 1 КАК Число")["rows"] == [{"Число": 1}]
+```
+
+Пример теста со стандартной фикстурой и профилем с `code_epf`:
+
+```python
+def test_document_was_saved(testpilot):
+    # Тест перед этим создаёт документ через обычные действия над формой.
+    rows = testpilot.execute_query(
+        query="ВЫБРАТЬ Номер, Проведен ИЗ Документ.ЗаказКлиента ГДЕ Номер = &Номер",
+        parameters={"Номер": "ТД00-000001"},
+        limit=2,
+    )
+    assert rows["returned_rows"] == 1
+    assert rows["rows"][0]["Проведен"] is True
+
+    value = testpilot.execute_code(
+        context="client",
+        code='Результат = Параметры["текст"] + "!";',
+        parameters={"текст": "Проверка"},
+    )
+    assert value["result"] == "Проверка!"
+```
+
+Подключение к работающему клиенту использует уже открытую обработку; если её нет,
+выполнение сообщает `helper_not_ready`. Запросы учитывают текущие права пользователя;
+даты, ссылки и перечисления возвращаются в типизированном JSON-представлении
+([epf.md](epf.md), «Типы значений»). Ошибки — через `ActionError`.
+
 Запись XML-сценариев и `run_scenario` доступны через тот же Python API. Для новых
 pytest-тестов действия и проверки можно писать непосредственно на Python.
 
