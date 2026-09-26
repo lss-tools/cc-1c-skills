@@ -67,7 +67,7 @@
 | `deselect_row` | `ТестируемаяТаблицаФормы` · `DeselectRow` | `ТестируемаяТаблицаФормы` | `ref*` |
 | `end_edit_row` | `ТестируемаяТаблицаФормы` · ЗакончитьРедактированиеСтроки (`EndEditRow`) | `ТестируемаяТаблицаФормы` | `ref*, cancel=False` |
 | `expand` | `ТестируемаяТаблицаФормы` · Развернуть (`Expand`) | `ТестируемаяГруппаФормы`, `ТестируемаяТаблицаФормы` | `ref*, row_column=None, row_value=None, subordinates=False` |
-| `find_rows` | Составное действие MCP: чтение строк текущей таблицы и сравнение текста | `ТестируемаяТаблицаФормы` | `ref*, conditions*, columns=None, case_sensitive=False, max_rows=500, max_matches=50` |
+| `find_rows` | Составное действие MCP: чтение строк текущей таблицы и сравнение текста. Условие — `{column*, text*, match='exact'}`, где `match` — `exact` (по умолчанию), `contains`, `starts_with` или `ends_with`; подстановки `*` и `?` не поддерживаются | `ТестируемаяТаблицаФормы` | `ref*, conditions*, columns=None, case_sensitive=False, max_rows=500, max_matches=50` |
 | `get_cell_text` | `ТестируемаяТаблицаФормы` · ПолучитьТекстЯчейки (`GetCellText`) | `ТестируемаяТаблицаФормы` | `ref*, column*` |
 | `get_current_item` | `ТестируемаяТаблицаФормы` · ПолучитьТекущийЭлемент (`GetCurrentItem`) | `ТестируемаяТаблицаФормы` | `ref*` |
 | `get_current_row` | `ТестируемаяТаблицаФормы` · `GetCurrentRow` | `ТестируемаяТаблицаФормы` | `ref*` |
