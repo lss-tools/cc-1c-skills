@@ -1,4 +1,4 @@
-# cfe-init v1.12 — Create 1C configuration extension scaffold (CFE) (+write_xml_file/write_utf8_bom: общий эталон записи)
+﻿# cfe-init v1.12 — Create 1C configuration extension scaffold (CFE) (+write_xml_file/write_utf8_bom: общий эталон записи)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 [CmdletBinding(PositionalBinding=$false)]
 param(
