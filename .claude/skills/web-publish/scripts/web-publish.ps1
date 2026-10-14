@@ -1,4 +1,4 @@
-﻿# web-publish v1.9 — Publish 1C infobase via Apache (+_version_dir/_version_key: общий эталон db-семейства)
+﻿# web-publish v1.12 — Publish 1C infobase via Apache (+_version_dir/_version_key: общий эталон db-семейства)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 <#
 .SYNOPSIS
@@ -86,8 +86,52 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+# --- Запись базы в .v8-project.json ---
+# Модель не передаёт ни путь к платформе конкретной базы, ни реквизиты хранилища: скрипт
+# сопоставляет параметры соединения с записью в databases[] и берёт их оттуда. Тот же приём,
+# что в cf-edit.ps1 (сопоставление по configSrc).
+function Find-V8Project([string]$startDir) {
+	$d = $startDir
+	for ($i = 0; $i -lt 20 -and $d; $i++) {
+		$pj = Join-Path $d ".v8-project.json"
+		if (Test-Path $pj) { return $pj }
+		$parent = [System.IO.Path]::GetDirectoryName($d)
+		if ($parent -eq $d) { break }
+		$d = $parent
+	}
+	return $null
+}
+function Test-SamePath {
+    param([string]$A, [string]$B)
+    if (-not $A -or -not $B) { return $false }
+    try {
+        $na = [System.IO.Path]::GetFullPath($A).TrimEnd('\', '/')
+        $nb = [System.IO.Path]::GetFullPath($B).TrimEnd('\', '/')
+        return $na.Equals($nb, [System.StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+function Find-ProjectDatabase {
+    # Запись базы в реестре, соответствующая переданному соединению. $null, если не найдена.
+    $pf = Find-V8Project (Get-Location).Path
+    if (-not $pf) { return $null }
+    try { $proj = Get-Content $pf -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
+    if (-not $proj.databases) { return $null }
+    foreach ($db in $proj.databases) {
+        if ($InfoBasePath -and $db.path -and (Test-SamePath $db.path $InfoBasePath)) { return $db }
+        if ($InfoBaseServer -and $InfoBaseRef -and $db.server -and $db.ref) {
+            if ($db.server.Equals($InfoBaseServer, [System.StringComparison]::OrdinalIgnoreCase) -and
+                $db.ref.Equals($InfoBaseRef, [System.StringComparison]::OrdinalIgnoreCase)) { return $db }
+        }
+    }
+    return $null
+}
+
 # --- Resolve V8Path ---
 function Find-ProjectV8Path {
+    # v8path записи базы сильнее корневого: в одном проекте базы живут на разных версиях
+    # платформы, а версию формата выгрузки задаёт та платформа, которая выгружает.
+    $dbRec = Find-ProjectDatabase
+    if ($dbRec -and $dbRec.v8path) { return [string]$dbRec.v8path }
     $dir = (Get-Location).Path
     while ($dir) {
         $pf = Join-Path $dir ".v8-project.json"
@@ -161,8 +205,8 @@ if (-not (Test-Path $httpdExe)) {
     }
 
     Write-Host "Apache не найден. Скачиваю..." -ForegroundColor Cyan
-    $tmpZip = Join-Path $env:TEMP "apache24.zip"
-    $tmpDir = Join-Path $env:TEMP "apache24_extract"
+    $tmpZip = Join-Path ([IO.Path]::GetTempPath()) "apache24.zip"
+    $tmpDir = Join-Path ([IO.Path]::GetTempPath()) "apache24_extract"
 
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -305,9 +349,24 @@ $vrdPathFwd = $vrdPath -replace '\\','/'
 # --- Global block (Listen + LoadModule) ---
 $globalMarkerStart = "# --- 1C: global ---"
 $globalMarkerEnd = "# --- End: global ---"
+# Адреса привязки, вписанные в наш блок руками (Listen 127.0.0.1:port + Listen [::1]:port),
+# при перезаписи сохраняем все — меняется только порт
+$listenHosts = @()
+$globalPattern = [regex]::Escape($globalMarkerStart) + '([\s\S]*?)' + [regex]::Escape($globalMarkerEnd)
+if ($confContent -match $globalPattern) {
+    foreach ($lm in [regex]::Matches($Matches[1], '(?mi)^[ \t]*Listen[ \t]+(?:(\[[^\]]+\]|[^\s:\[\]]+):)?(\d+)\b')) {
+        $h = $lm.Groups[1].Value
+        if ($listenHosts -cnotcontains $h) { $listenHosts += $h }
+    }
+}
+if ($listenHosts.Count -eq 0) { $listenHosts = @("") }
+$listenLines = ($listenHosts | ForEach-Object { if ($_) { "Listen ${_}:$Port" } else { "Listen $Port" } }) -join "`n"
+# URL — по первому адресу; «все интерфейсы» → localhost
+$firstHost = $listenHosts[0]
+$urlHost = if ($firstHost -and @('0.0.0.0', '*', '[::]') -notcontains $firstHost) { $firstHost } else { "localhost" }
 $globalBlock = @"
 $globalMarkerStart
-Listen $Port
+$listenLines
 LoadModule _1cws_module "$wsapDllFwd"
 $globalMarkerEnd
 "@
@@ -318,7 +377,7 @@ if ($confContent -match [regex]::Escape($globalMarkerStart)) {
     $confContent = [regex]::Replace($confContent, $pattern, $globalBlock)
 } else {
     # Comment out default Listen to avoid port conflict
-    $confContent = $confContent -replace '(?m)^(Listen\s+\d+)', '#$1  # commented by web-publish'
+    $confContent = $confContent -replace '(?m)^([ \t]*Listen\b[^\r\n]*)', '#$1  # commented by web-publish'
     # Append global block
     $confContent = $confContent.TrimEnd() + "`n`n" + $globalBlock + "`n"
 }
@@ -416,7 +475,7 @@ if ($httpdCheck) {
 # --- Result ---
 Write-Host ""
 Write-Host "=== Публикация готова ===" -ForegroundColor Green
-Write-Host "URL:          http://localhost:$Port/$AppName" -ForegroundColor Cyan
-Write-Host "OData:        http://localhost:$Port/$AppName/odata/standard.odata" -ForegroundColor Cyan
-Write-Host "HTTP-сервисы: http://localhost:$Port/$AppName/hs/<RootUrl>/..." -ForegroundColor Cyan
-Write-Host "Web-сервисы:  http://localhost:$Port/$AppName/ws/<Имя>?wsdl" -ForegroundColor Cyan
+Write-Host "URL:          http://${urlHost}:$Port/$AppName" -ForegroundColor Cyan
+Write-Host "OData:        http://${urlHost}:$Port/$AppName/odata/standard.odata" -ForegroundColor Cyan
+Write-Host "HTTP-сервисы: http://${urlHost}:$Port/$AppName/hs/<RootUrl>/..." -ForegroundColor Cyan
+Write-Host "Web-сервисы:  http://${urlHost}:$Port/$AppName/ws/<Имя>?wsdl" -ForegroundColor Cyan

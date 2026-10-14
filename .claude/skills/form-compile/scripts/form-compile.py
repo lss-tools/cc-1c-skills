@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# form-compile v1.198 — Compile 1C managed form from JSON or object metadata (гвард на группу additionalColumns без ключа columns)
+# form-compile v1.206 — Compile 1C managed form from JSON or object metadata
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 import argparse
 import copy
@@ -2268,10 +2268,10 @@ def new_id():
 _seen_element_names = set()  # пул имён элементов (глобально по всей форме)
 
 def _ensure_unique(name, seen, kind):
-    if name in seen:
+    if name.lower() in seen:
         print(f"[ERROR] Duplicate {kind} name '{name}' — names must be unique within their collection in a 1C form (set a unique 'name')", file=sys.stderr)
         sys.exit(1)
-    seen.add(name)
+    seen.add(name.lower())
 
 
 # --- Event handler name generator ---
@@ -2289,7 +2289,7 @@ EVENT_SUFFIX_MAP = {
     "BeforeDeleteRow": "\u041f\u0435\u0440\u0435\u0434\u0423\u0434\u0430\u043b\u0435\u043d\u0438\u0435\u043c",
     "BeforeRowChange": "\u041f\u0435\u0440\u0435\u0434\u041d\u0430\u0447\u0430\u043b\u043e\u043c\u0418\u0437\u043c\u0435\u043d\u0435\u043d\u0438\u044f",
     "OnStartEdit": "\u041f\u0440\u0438\u041d\u0430\u0447\u0430\u043b\u0435\u0420\u0435\u0434\u0430\u043a\u0442\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u044f",
-    "OnEndEdit": "\u041f\u0440\u0438\u041e\u043a\u043e\u043d\u0447\u0430\u043d\u0438\u0438\u0420\u0435\u0434\u0430\u043a\u0442\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u044f",
+    "OnEditEnd": "\u041f\u0440\u0438\u041e\u043a\u043e\u043d\u0447\u0430\u043d\u0438\u0438\u0420\u0435\u0434\u0430\u043a\u0442\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u044f",
     "Selection": "\u0412\u044b\u0431\u043e\u0440\u0421\u0442\u0440\u043e\u043a\u0438",
     "OnCurrentPageChange": "\u041f\u0440\u0438\u0421\u043c\u0435\u043d\u0435\u0421\u0442\u0440\u0430\u043d\u0438\u0446\u044b",
     "TextEditEnd": "\u041e\u043a\u043e\u043d\u0447\u0430\u043d\u0438\u0435\u0412\u0432\u043e\u0434\u0430\u0422\u0435\u043a\u0441\u0442\u0430",
@@ -2859,20 +2859,42 @@ def get_event_pairs(el, element_name):
     events = el.get('events')
     if events:
         for ev_name, val in events.items():
-            handler = '' if val is None else str(val)
-            if not handler:
-                handler = get_handler_name(element_name, ev_name)
-            pairs.append((ev_name, handler))
+            # Значение — имя обработчика; null — имя по шаблону; объект { handler, callType } или массив
+            # таких объектов (в расширении на одно событие вешают и Before, и After)
+            for v in (val if isinstance(val, list) else [val]):
+                if isinstance(v, dict):
+                    handler = '' if v.get('handler') is None else str(v.get('handler'))
+                    call_type = normalize_call_type(v.get('callType'), element_name, ev_name)
+                else:
+                    handler = '' if v is None else str(v)
+                    call_type = ''
+                if not handler:
+                    handler = get_handler_name(element_name, ev_name)
+                pairs.append((ev_name, handler, call_type))
     elif el.get('on'):
         handlers = el.get('handlers') or {}
-        for evt in el['on']:
-            evt_name = str(evt)
-            if handlers.get(evt_name):
-                handler = str(handlers[evt_name])
+        for evt in (el['on'] if isinstance(el['on'], list) else [el['on']]):
+            if isinstance(evt, dict):
+                evt_name = str(evt.get('event', ''))
+                handler = '' if evt.get('handler') is None else str(evt.get('handler'))
+                call_type = normalize_call_type(evt.get('callType'), element_name, evt_name)
             else:
-                handler = get_handler_name(element_name, evt_name)
-            pairs.append((evt_name, handler))
+                evt_name, handler, call_type = str(evt), '', ''
+            if not handler:
+                handler = str(handlers[evt_name]) if handlers.get(evt_name) else get_handler_name(element_name, evt_name)
+            pairs.append((evt_name, handler, call_type))
     return pairs
+
+
+# Вид вызова обработчика в расширении: Before / After / Override (регистр не важен); пусто — не указан.
+def normalize_call_type(raw, element_name, event_name):
+    if raw is None or str(raw) == '':
+        return ''
+    for v in ('Before', 'After', 'Override'):
+        if str(raw).lower() == v.lower():
+            return v
+    print(f"[ERROR] Element '{element_name}', event '{event_name}': callType '{raw}' — expected Before, After or Override", file=sys.stderr)
+    sys.exit(1)
 
 
 # Проверить, подключено ли событие к элементу (в любом из форматов).
@@ -2880,7 +2902,11 @@ def test_element_event(el, event_name):
     events = el.get('events')
     if events and event_name in events:
         return True
-    return event_name in (el.get('on') or [])
+    on = el.get('on') or []
+    for evt in (on if isinstance(on, list) else [on]):
+        if (str(evt.get('event', '')) if isinstance(evt, dict) else str(evt)) == event_name:
+            return True
+    return False
 
 
 def emit_events(lines, el, element_name, indent, type_key):
@@ -2891,13 +2917,14 @@ def emit_events(lines, el, element_name, indent, type_key):
     # Validate event names
     if type_key and type_key in KNOWN_EVENTS:
         allowed = KNOWN_EVENTS[type_key]
-        for ev_name, _ in pairs:
+        for ev_name, _, _ in pairs:
             if allowed and str(ev_name) not in allowed:
                 print(f"[WARN] Unknown event '{ev_name}' for {type_key} '{element_name}'. Known: {', '.join(allowed)}")
 
     lines.append(f"{indent}<Events>")
-    for ev_name, handler in pairs:
-        lines.append(f'{indent}\t<Event name="{ev_name}">{handler}</Event>')
+    for ev_name, handler, call_type in pairs:
+        ct_attr = f' callType="{call_type}"' if call_type else ''
+        lines.append(f'{indent}\t<Event name="{ev_name}"{ct_attr}>{handler}</Event>')
     lines.append(f"{indent}</Events>")
 
 
@@ -3708,6 +3735,8 @@ GENERIC_SCALARS = [
     ('AllowInputEmptyMultipleValues', 'allowInputEmptyMultipleValues', 'bool'),
     ('BehaviorOnHorizontalCompression', 'behaviorOnHorizontalCompression', 'value'),
 ]
+# Простые скаляры (pass-through) известны валидатору ключей — компилятор их выводит
+GENERIC_SCALAR_KEYS = {k for _, k, _ in GENERIC_SCALARS}
 
 
 def emit_generic_scalars(lines, el, indent):
@@ -3908,6 +3937,13 @@ def resolve_type_str(type_str):
         type_str = type_str[4:]
     elif '.' in type_str and re.match(r'^d\d+p\d+:', type_str):
         type_str = type_str[type_str.index(':') + 1:]
+    # Хвосты, которые дописывает вывод meta-info к множествам типов: суффикс обобщённого метатипа
+    # и счётчик состава. Копипаста строки оттуда — обычный путь, поэтому хвост снимаем молча.
+    # Срезаем ТОЛЬКО эти известные формы: круглые скобки заняты параметризованными типами
+    # (Число(15,2)), слепой срез скобок сломал бы их.
+    type_str = re.sub(r'\s*\((?:все|all)\)\s*$', '', type_str, flags=re.IGNORECASE).strip()
+    type_str = re.sub(r'\s*[—-]\s*(?:типов|types):\s*\d+\s*$', '', type_str, flags=re.IGNORECASE).strip()
+    type_str = re.sub(r'\s*\((?:типов|types):\s*\d+\)\s*$', '', type_str, flags=re.IGNORECASE).strip()
     # Параметризованные типы: Number(15,2), Строка(100)
     m = re.match(r'^([^(]+)\((.+)\)$', type_str)
     if m:
@@ -4071,10 +4107,7 @@ def emit_type(lines, type_str, indent, tag="Type", tag_attrs=""):
 
 # --- Element emitters ---
 
-def emit_element(lines, el, indent, in_cmd_bar=False):
-    # Companion-панели (объект/массив-значение) → commandBar/contextMenu, до тип-синонимов.
-    normalize_panel_synonyms(el)
-
+def normalize_element_type_synonyms(el):
     # Silent synonyms: model often writes XML name or Russian (ПолеПереключателя/RadioButtonField → radio).
     # commandBar/autoCommandBar/КоманднаяПанель → тип-элемент ТОЛЬКО при строковом значении (имя).
     for src, dst in ELEMENT_TYPE_SYNONYMS.items():
@@ -4082,6 +4115,840 @@ def emit_element(lines, el, indent, in_cmd_bar=False):
             if src in STR_ONLY_TYPE_SYNONYMS and not isinstance(el[src], str):
                 continue
             el[dst] = el.pop(src)
+
+
+# --- Перечисления свойств формы (генерируется) ---
+# Значения свойств-перечислений элементов формы и корня (ключ «Тип.Свойство» или общий «Свойство»).
+# Источник — XSD xcf-logform 2.10–2.21, сверено с корпусом БП/ERP 8.3.24 (17036 форм, расхождений нет)
+# и загрузкой в 8.3.24. Перегенерировать: python debug/form-dsl-revision/gen_enum_table.py
+valid_enum_values = {
+    "AppearanceInCard": ["Auto", "Extended"],
+    "AppearanceMode": ["Auto", "CommandBar", "UsualGroup"],
+    "AutoAddIncomplete": ["true", "false", "auto"],
+    "AutoCapitalizationOnTextInput": ["Auto", "None", "Words", "Sentences", "AllCharacters"],
+    "AutoChoiceIncomplete": ["true", "false", "auto"],
+    "AutoCorrectionOnTextInput": ["Auto", "Use", "DontUse"],
+    "AutoMarkIncomplete": ["true", "false", "auto"],
+    "AutoSaveDataInSettings": ["DontUse", "Use"],
+    "AutoShowClearButtonMode": ["Auto", "Always", "FilledOnly"],
+    "AutoShowOpenButtonMode": ["Auto", "Always", "FilledOnly"],
+    "AutoShowState": ["Auto", "DontShow", "Show", "ShowOnComposition"],
+    "AutoTime": ["DontUse", "Last", "First", "CurrentOrLast", "CurrentOrFirst"],
+    "AutoWidthInTable": ["Auto", "ByData", "None", "ByDataAndTitle"],
+    "AutofillHint": ["DontUse", "FullName", "GivenName", "FamilyName", "MiddleName", "NamePrefix", "NameSuffix", "Street", "City", "Region", "Country", "PostalCode", "UserName", "Password", "NewPassword", "OneTimeCode", "Email", "PhoneNumber", "CreditCardNumber"],
+    "BackPictureEffect": ["Auto", "None", "Semitransparency", "SemitransparencyAndBlur"],
+    "BackgroundShowMode": ["Auto", "DontShow", "ShowAndIncreaseSize", "ShowAndDontIncreaseSize"],
+    "Behavior": ["Usual", "Collapsible", "PopUp", "Auto"],
+    "BehaviorOnHorizontalCompression": ["Auto", "HideItemsByImportance", "MoveItemsByImportance"],
+    "ButtonImportance": ["Main", "Normal", "Supplementary"],
+    "CardBehaviorOnVerticalCompression": ["Auto", "MoveItemsToSwipeablePages", "HideItems"],
+    "CardPictureAndTitleAlign": ["Auto", "LeftHorizontallySidesVertically", "CenterHorizontallySidesVertically", "CenterHorizontallyCenterVertically"],
+    "CardRepresentationType": ["Usual", "Group"],
+    "CellActionsButtonViewMode": ["Auto", "DontShow", "ShowOnHover"],
+    "CellHyperlinkDisplayVariant": ["Auto", "Always", "OnRowHover"],
+    "CellHyperlinkRepresentation": ["Auto", "Show", "DontShow"],
+    "CellHyperlinksRepresentation": ["Auto", "AutoForSingle", "ForAll", "DontShow"],
+    "CellMark": ["None", "ShapeUnderTextOval", "IconCircle"],
+    "CheckBoxType": ["Auto", "CheckBox", "Tumbler", "Switcher"],
+    "ChildItemsTitleLocation": ["Auto", "Left", "LeftIfPossible", "Top"],
+    "ChildItemsWidth": ["Auto", "Equal", "LeftWide", "LeftWidest", "LeftNarrow", "LeftNarrowest"],
+    "ChildrenAlign": ["Auto", "None", "ItemsLeftTitlesLeft", "ItemsRightTitlesLeft", "ItemsLeftTitlesRight", "ItemsRightTitlesRight", "TitlesLeftDataLeft", "TitlesLeftDataRight", "TitlesRightDataLeft", "TitlesRightDataRight", "TitlesLeftDataAuto"],
+    "ChoiceButton": ["true", "false", "auto"],
+    "ChoiceButtonRepresentation": ["Auto", "ShowInDropList", "ShowInDropListAndInInputField", "ShowInInputField"],
+    "InputField.ChoiceFoldersAndItems": ["Items", "Folders", "FoldersAndItems", "Auto"],
+    "Table.ChoiceFoldersAndItems": ["Items", "Folders", "FoldersAndItems"],
+    "ChoiceHistoryOnInput": ["Auto", "DontUse"],
+    "ChoiceListButton": ["true", "false", "auto"],
+    "ClearButton": ["true", "false", "auto"],
+    "CollapseItemsByImportanceVariant": ["Auto", "Use", "DontUse"],
+    "CommandBarLocation": ["None", "Auto", "Top", "Bottom"],
+    "ComplexSettingsViewMode": ["Show", "DontShow"],
+    "ControlRepresentation": ["TitleHyperlink", "Picture", "Button", "ButtonInParentElement"],
+    "ConversationsRepresentation": ["Auto", "Show", "DontShow"],
+    "CreateButton": ["true", "false", "auto"],
+    "Pages.CurrentRowUse": ["Use", "DontUse", "Auto"],
+    "Table.CurrentRowUse": ["Auto", "Choice", "SelectionPresentation", "SelectionPresentationAndChoice"],
+    "UsualGroup.CurrentRowUse": ["Use", "DontUse", "Auto"],
+    "DisplayImportance": ["Auto", "VeryHigh", "High", "Usual", "Low", "VeryLow"],
+    "DrawingSelectionShowMode": ["Show", "DontShow", "Auto"],
+    "DropListButton": ["true", "false", "auto"],
+    "EditMode": ["Directly", "Enter", "EnterOnInput", "Auto"],
+    "EditTextUpdate": ["Auto", "DontUse", "OnValueChange", "Always"],
+    "EnterKeyBehavior": ["ControlNavigation", "DefaultButton"],
+    "EqualColumnsWidth": ["true", "false", "auto"],
+    "EqualItemsWidth": ["true", "false", "auto"],
+    "ExtendedEdit": ["true", "false", "auto"],
+    "FileDragMode": ["AsFile", "AsFileRef"],
+    "FixInCard": ["true", "false", "auto"],
+    "FixingInTable": ["None", "Left", "Right"],
+    "FooterHorizontalAlign": ["Left", "Center", "Right", "Auto"],
+    "ColumnGroup.Group": ["Horizontal", "Vertical", "InCell"],
+    "Form.Group": ["Horizontal", "Vertical", "HorizontalIfPossible", "AlwaysHorizontal", "Auto", "AutoScreenTypeSensitive"],
+    "Page.Group": ["Horizontal", "Vertical", "HorizontalIfPossible", "AlwaysHorizontal", "Auto", "AutoScreenTypeSensitive"],
+    "UsualGroup.Group": ["Horizontal", "Vertical", "HorizontalIfPossible", "AlwaysHorizontal", "Auto", "AutoScreenTypeSensitive"],
+    "GroupHorizontalAlign": ["Left", "Center", "Right", "Auto"],
+    "GroupVerticalAlign": ["Top", "Center", "Bottom", "Auto"],
+    "HeaderHorizontalAlign": ["Left", "Center", "Right", "Auto"],
+    "InputField.HeightControlVariant": ["Auto", "UseHeightInFormRows", "UseContentHeight"],
+    "Table.HeightControlVariant": ["Auto", "UseHeightInFormRows", "UseHeightInTableRows", "UseContentHeight"],
+    "HierarchyPanelLocation": ["Auto", "None"],
+    "HorizontalAlign": ["Left", "Center", "Right", "Auto"],
+    "HorizontalLinesBWA": ["true", "false", "auto"],
+    "HorizontalLocation": ["Left", "Center", "Right", "Auto"],
+    "Table.HorizontalScrollBar": ["DontUse", "UseAlways", "AutoUse"],
+    "HorizontalSpacing": ["Auto", "None", "Half", "Single", "OneAndHalf", "Double"],
+    "AutoCommandBar.HorizontalStretch": ["true", "false", "auto"],
+    "ButtonGroup.HorizontalStretch": ["true", "false", "auto"],
+    "CheckBoxField.HorizontalStretch": ["true", "false", "auto"],
+    "ColumnGroup.HorizontalStretch": ["true", "false", "auto"],
+    "CommandBar.HorizontalStretch": ["true", "false", "auto"],
+    "ContextMenu.HorizontalStretch": ["true", "false", "auto"],
+    "InputField.HorizontalStretch": ["true", "false", "auto"],
+    "LabelDecoration.HorizontalStretch": ["true", "false", "auto"],
+    "LabelField.HorizontalStretch": ["true", "false", "auto"],
+    "Page.HorizontalStretch": ["true", "false", "auto"],
+    "Pages.HorizontalStretch": ["true", "false", "auto"],
+    "PictureDecoration.HorizontalStretch": ["true", "false", "auto"],
+    "Popup.HorizontalStretch": ["true", "false", "auto"],
+    "RadioButtonField.HorizontalStretch": ["true", "false", "auto"],
+    "UsualGroup.HorizontalStretch": ["true", "false", "auto"],
+    "Importance": ["Main", "Normal", "Supplementary"],
+    "IncompleteChoiceMode": ["OnEnterPressed", "OnActivate"],
+    "InitialListView": ["Beginning", "End", "Auto"],
+    "InitialRowActivation": ["Auto", "Activate", "NoActivate"],
+    "InitialTreeView": ["NoExpand", "ExpandTopLevel", "ExpandAllLevels"],
+    "IntervalsSelectionMode": ["Auto", "Multiple", "Single", "None"],
+    "LocationInCommandBar": ["Auto", "InAdditionalSubmenu", "InCommandBar", "InCommandBarAndInAdditionalSubmenu"],
+    "MarkNegatives": ["true", "false", "auto"],
+    "MarkRequiredComplete": ["true", "false", "auto"],
+    "MarkingAppearance": ["DontShow", "TopLeft", "BottomRight", "BothSides"],
+    "MobileDeviceTableType": ["Auto", "List", "Cards"],
+    "MultiLine": ["true", "false", "auto"],
+    "MultipleValuePictureShape": ["Auto", "Rect", "Circle", "Square"],
+    "MultipleValuePictureSize": ["Auto", "Small", "Medium", "Large"],
+    "MultipleValuesHyperlink": ["true", "false", "auto"],
+    "OnMainServerUnavalableBehavior": ["Auto", "MakeDisable", "DontChangeBehavior"],
+    "OnScreenKeyboardReturnKeyText": ["Auto", "Return", "Go", "Join", "Next", "Search", "Send", "Done", "Continue"],
+    "OnlyInAllActions": ["true", "false", "auto"],
+    "OpenButton": ["true", "false", "auto"],
+    "Orientation": ["Horizontal", "Vertical", "HorizontalIfPossible"],
+    "Output": ["Auto", "Enable", "Disable"],
+    "PagesRepresentation": ["None", "TabsOnTop", "TabsOnBottom", "TabsOnLeftHorizontal", "TabsOnRightHorizontal", "Swipe", "Auto"],
+    "PasswordMode": ["true", "false", "auto"],
+    "PictureLocation": ["Auto", "Left", "Right", "Top", "Bottom"],
+    "PictureSize": ["RealSize", "Stretch", "Proportionally", "Tile", "AutoSize", "RealSizeIgnoreScale", "AutoSizeIgnoreScale", "ByFontSize"],
+    "PlacementArea": ["mainCmdsLeft", "autoCmds", "userCmds", "mainCmdsRight"],
+    "PointerType": ["Special", "Regular"],
+    "QuickChoice": ["true", "false", "auto"],
+    "RadioButtonType": ["Auto", "RadioButtons", "Tumbler"],
+    "RefreshRequest": ["None", "PullFromTop", "PullFromBottom", "PullFromTopOrBottom"],
+    "ReportFormType": ["Main", "Settings", "Variant"],
+    "ReportResultViewMode": ["Auto", "Default", "Compact"],
+    "Button.Representation": ["Text", "Picture", "PictureAndText", "Auto"],
+    "ButtonGroup.Representation": ["Auto", "Usual", "Compact"],
+    "Popup.Representation": ["Text", "Picture", "PictureAndText", "Auto"],
+    "ProgressBarField.Representation": ["Smooth", "Broken", "BrokenTilt"],
+    "Table.Representation": ["List", "HierarchicalList", "Tree"],
+    "UsualGroup.Representation": ["Auto", "None", "StrongSeparation", "WeakSeparation", "NormalSeparation", "GroupBox", "Line", "Margin"],
+    "RepresentationInContextMenu": ["None", "AdditionalInContextMenu", "OnlyInContextMenu", "Auto"],
+    "RowActionsShowType": ["Auto", "DontShow", "ShowOnHover", "ShowAlways"],
+    "RowInputMode": ["EndOfList", "EndOfWindow", "AfterCurrentRow", "BeforeCurrentRow"],
+    "RowSelectionMode": ["Auto", "Cell", "Row"],
+    "SaveColors": ["Auto", "ForUser", "ByKeyForUser", "DontUse"],
+    "SaveDataInSettings": ["DontUse", "UseList"],
+    "ScaleVariant": ["Auto", "Normal", "Compact", "NormalIfPossible"],
+    "ScalingMode": ["Auto", "Normal", "Compact"],
+    "Page.ScrollOnCompress": ["true", "false", "auto"],
+    "UsualGroup.ScrollOnCompress": ["true", "false", "auto"],
+    "SearchControlLocation": ["Auto", "None", "CommandBar"],
+    "SearchOnInput": ["Use", "DontUse", "Auto"],
+    "SearchStringLocation": ["Auto", "None", "CommandBar", "Top", "Bottom", "FormCaption", "PullFromTop"],
+    "CalendarField.SelectionMode": ["Single", "Multiple", "Interval"],
+    "Table.SelectionMode": ["SingleRow", "MultiRow"],
+    "SelectionShowMode": ["WhenActive", "Always", "DontShow", "WhenMultipleCellsSelected", "WhenMultipleCellsSelectedWhenActive"],
+    "Shape": ["Auto", "Usual", "Oval"],
+    "ShapeRepresentation": ["Auto", "Always", "WhenActive", "None"],
+    "ShowCheckBoxesInDropList": ["true", "false", "auto"],
+    "ShowCommandBar": ["true", "false", "auto"],
+    "ShowHorizontalLinesFlag": ["true", "false", "auto"],
+    "ColumnGroup.ShowTitle": ["true", "false", "auto"],
+    "Form.ShowTitle": ["true", "false", "auto"],
+    "Page.ShowTitle": ["true", "false", "auto"],
+    "UsualGroup.ShowTitle": ["true", "false", "auto"],
+    "ShowTitleInCard": ["true", "false", "auto"],
+    "ShowVerticalLinesFlag": ["true", "false", "auto"],
+    "SkipOnInput": ["true", "false", "auto"],
+    "SpecialTextInputMode": ["Auto", "None", "DigitsAndPunctuation", "URL", "Email", "PhoneNumber", "Digits"],
+    "SpellCheckingOnTextInput": ["Auto", "Use", "DontUse"],
+    "SpinButton": ["true", "false", "auto"],
+    "SpreadsheetDocumentMultipleSelectionPanelViewMode": ["Auto", "DontShow", "ShowOnMultipleSelection", "ShowAlways"],
+    "TableLocation": ["Auto", "Left", "Right", "None"],
+    "TextSize": ["Enlarged", "Normal", "Reduced"],
+    "ThroughAlign": ["Use", "DontUse", "Auto"],
+    "TimeChoiceMode": ["Auto", "DontChoose", "CustomTime", "Interval1Minute", "Interval5Minutes", "Interval10Minutes", "Interval15Minutes", "Interval15And20Minutes", "Interval20Minutes", "Interval30Minutes", "Interval60Minutes"],
+    "TitleLocation": ["None", "Auto", "Left", "Top", "Right", "Bottom"],
+    "ToolTipRepresentation": ["Auto", "None", "Balloon", "Button", "ShowAuto", "ShowTop", "ShowLeft", "ShowBottom", "ShowRight"],
+    "TumblerRepresentation": ["Text", "Picture", "Auto"],
+    "Type": ["CommandBarButton", "UsualButton", "Hyperlink", "CommandBarHyperlink"],
+    "UpdateOnDataChange": ["Auto", "DontUpdate"],
+    "UseAlternationRowColorBWA": ["true", "false", "auto"],
+    "UseCopy": ["true", "false", "auto"],
+    "UseForFoldersAndItems": ["Items", "Folders", "FoldersAndItems"],
+    "UsePostingMode": ["Regular", "RealTime", "Ask", "Auto"],
+    "ValuesSelectionMode": ["Auto", "Multiple", "Single", "None"],
+    "VerticalAlign": ["Top", "Center", "Bottom", "Auto"],
+    "VerticalLinesBWA": ["true", "false", "auto"],
+    "VerticalScroll": ["auto", "use", "useIfNecessary", "useWithoutStretch"],
+    "Table.VerticalScrollBar": ["DontUse", "UseAlways", "AutoUse"],
+    "VerticalSpacing": ["Auto", "None", "Half", "Single", "OneAndHalf", "Double"],
+    "AutoCommandBar.VerticalStretch": ["true", "false", "auto"],
+    "ButtonGroup.VerticalStretch": ["true", "false", "auto"],
+    "ColumnGroup.VerticalStretch": ["true", "false", "auto"],
+    "CommandBar.VerticalStretch": ["true", "false", "auto"],
+    "ContextMenu.VerticalStretch": ["true", "false", "auto"],
+    "InputField.VerticalStretch": ["true", "false", "auto"],
+    "LabelDecoration.VerticalStretch": ["true", "false", "auto"],
+    "LabelField.VerticalStretch": ["true", "false", "auto"],
+    "Page.VerticalStretch": ["true", "false", "auto"],
+    "Pages.VerticalStretch": ["true", "false", "auto"],
+    "PictureDecoration.VerticalStretch": ["true", "false", "auto"],
+    "Popup.VerticalStretch": ["true", "false", "auto"],
+    "UsualGroup.VerticalStretch": ["true", "false", "auto"],
+    "ViewMode": ["All", "QuickAccess"],
+    "ViewModeApplicationOnSetReportResult": ["Auto", "Apply", "DontApply"],
+    "ViewScalingMode": ["Auto", "Normal", "Large"],
+    "ViewStatusLocation": ["Auto", "None", "Top", "Bottom"],
+    "WarningOnEditRepresentation": ["Show", "DontShow", "Auto"],
+    "WidthInCard": ["Auto", "Full", "Half"],
+    "WindowOpeningMode": ["Auto", "DontBlock", "LockOwner", "LockWholeInterface", "Independent", "LockOwnerWindow"],
+}
+# Старые имена значений, которые платформа принимает и переводит в современные (замер выгрузки 8.3.24)
+enum_value_aliases = {
+    "TitlesLeftDataLeft": "ItemsLeftTitlesLeft",
+    "TitlesLeftDataRight": "ItemsRightTitlesLeft",
+    "TitlesRightDataLeft": "ItemsLeftTitlesRight",
+    "TitlesRightDataRight": "ItemsRightTitlesRight",
+    "GroupBox": "StrongSeparation",
+    "Margin": "NormalSeparation",
+    "Square": "Rect",
+}
+# Умолчания: значение, которое платформа у этого типа не пишет (выброшено при загрузке-выгрузке 8.3.24
+# и ни разу не встречается в корпусе) — тег с ним не пишется
+enum_default_values = {
+    "AutoCommandBar.GroupHorizontalAlign": "Auto",
+    "AutoCommandBar.GroupVerticalAlign": "Auto",
+    "AutoCommandBar.HorizontalAlign": "Left",
+    "AutoCommandBar.HorizontalStretch": "auto",
+    "AutoCommandBar.ToolTipRepresentation": "Auto",
+    "AutoCommandBar.VerticalStretch": "auto",
+    "Button.GroupHorizontalAlign": "Auto",
+    "Button.GroupVerticalAlign": "Auto",
+    "Button.LocationInCommandBar": "Auto",
+    "Button.OnMainServerUnavalableBehavior": "Auto",
+    "Button.PictureLocation": "Auto",
+    "Button.PlacementArea": "userCmds",
+    "Button.Representation": "Auto",
+    "Button.RepresentationInContextMenu": "Auto",
+    "Button.Shape": "Auto",
+    "Button.ShapeRepresentation": "Auto",
+    "Button.SkipOnInput": "auto",
+    "Button.ToolTipRepresentation": "Auto",
+    "ButtonGroup.GroupHorizontalAlign": "Auto",
+    "ButtonGroup.GroupVerticalAlign": "Auto",
+    "ButtonGroup.HorizontalStretch": "auto",
+    "ButtonGroup.PlacementArea": "userCmds",
+    "ButtonGroup.Representation": "Auto",
+    "ButtonGroup.ToolTipRepresentation": "Auto",
+    "ButtonGroup.VerticalStretch": "auto",
+    "CalendarField.EditMode": "Enter",
+    "CalendarField.FixingInTable": "None",
+    "CalendarField.FooterHorizontalAlign": "Auto",
+    "CalendarField.GroupHorizontalAlign": "Auto",
+    "CalendarField.GroupVerticalAlign": "Auto",
+    "CalendarField.HeaderHorizontalAlign": "Left",
+    "CalendarField.HorizontalAlign": "Auto",
+    "CalendarField.OnMainServerUnavalableBehavior": "Auto",
+    "CalendarField.SelectionMode": "Single",
+    "CalendarField.SkipOnInput": "auto",
+    "CalendarField.TitleLocation": "Auto",
+    "CalendarField.ToolTipRepresentation": "Auto",
+    "CalendarField.VerticalAlign": "Auto",
+    "CalendarField.WarningOnEditRepresentation": "Auto",
+    "ChartField.EditMode": "Enter",
+    "ChartField.FixingInTable": "None",
+    "ChartField.FooterHorizontalAlign": "Auto",
+    "ChartField.GroupHorizontalAlign": "Auto",
+    "ChartField.GroupVerticalAlign": "Auto",
+    "ChartField.HeaderHorizontalAlign": "Left",
+    "ChartField.HorizontalAlign": "Auto",
+    "ChartField.OnMainServerUnavalableBehavior": "Auto",
+    "ChartField.SkipOnInput": "auto",
+    "ChartField.TitleLocation": "Auto",
+    "ChartField.ToolTipRepresentation": "Auto",
+    "ChartField.VerticalAlign": "Auto",
+    "ChartField.WarningOnEditRepresentation": "Auto",
+    "CheckBoxField.EditMode": "Enter",
+    "CheckBoxField.EqualItemsWidth": "auto",
+    "CheckBoxField.FixingInTable": "None",
+    "CheckBoxField.FooterHorizontalAlign": "Auto",
+    "CheckBoxField.GroupHorizontalAlign": "Auto",
+    "CheckBoxField.GroupVerticalAlign": "Auto",
+    "CheckBoxField.HeaderHorizontalAlign": "Left",
+    "CheckBoxField.HorizontalAlign": "Auto",
+    "CheckBoxField.OnMainServerUnavalableBehavior": "Auto",
+    "CheckBoxField.SkipOnInput": "auto",
+    "CheckBoxField.TitleLocation": "Auto",
+    "CheckBoxField.ToolTipRepresentation": "Auto",
+    "CheckBoxField.VerticalAlign": "Auto",
+    "CheckBoxField.WarningOnEditRepresentation": "Auto",
+    "ColumnGroup.FixingInTable": "None",
+    "ColumnGroup.Group": "Vertical",
+    "ColumnGroup.GroupHorizontalAlign": "Auto",
+    "ColumnGroup.GroupVerticalAlign": "Auto",
+    "ColumnGroup.HeaderHorizontalAlign": "Auto",
+    "ColumnGroup.HorizontalStretch": "auto",
+    "ColumnGroup.ToolTipRepresentation": "Auto",
+    "ColumnGroup.VerticalStretch": "auto",
+    "CommandBar.GroupHorizontalAlign": "Auto",
+    "CommandBar.GroupVerticalAlign": "Auto",
+    "CommandBar.HorizontalLocation": "Left",
+    "CommandBar.HorizontalStretch": "auto",
+    "CommandBar.ToolTipRepresentation": "Auto",
+    "CommandBar.VerticalStretch": "auto",
+    "ContextMenu.GroupHorizontalAlign": "Auto",
+    "ContextMenu.GroupVerticalAlign": "Auto",
+    "ContextMenu.HorizontalStretch": "auto",
+    "ContextMenu.ToolTipRepresentation": "Auto",
+    "ContextMenu.VerticalStretch": "auto",
+    "Form.AutoSaveDataInSettings": "DontUse",
+    "Form.ChildItemsWidth": "Auto",
+    "Form.ChildrenAlign": "Auto",
+    "Form.CollapseItemsByImportanceVariant": "Auto",
+    "Form.CommandBarLocation": "Auto",
+    "Form.ConversationsRepresentation": "Auto",
+    "Form.EnterKeyBehavior": "ControlNavigation",
+    "Form.Group": "Vertical",
+    "Form.HorizontalAlign": "Auto",
+    "Form.HorizontalSpacing": "Auto",
+    "Form.SaveDataInSettings": "DontUse",
+    "Form.ScalingMode": "Auto",
+    "Form.VerticalAlign": "Auto",
+    "Form.VerticalScroll": "auto",
+    "Form.VerticalSpacing": "Auto",
+    "Form.WindowOpeningMode": "Independent",
+    "FormattedDocumentField.EditMode": "Enter",
+    "FormattedDocumentField.FixingInTable": "None",
+    "FormattedDocumentField.FooterHorizontalAlign": "Auto",
+    "FormattedDocumentField.GroupHorizontalAlign": "Auto",
+    "FormattedDocumentField.GroupVerticalAlign": "Auto",
+    "FormattedDocumentField.HeaderHorizontalAlign": "Left",
+    "FormattedDocumentField.HorizontalAlign": "Auto",
+    "FormattedDocumentField.OnMainServerUnavalableBehavior": "Auto",
+    "FormattedDocumentField.Output": "Auto",
+    "FormattedDocumentField.SkipOnInput": "auto",
+    "FormattedDocumentField.TitleLocation": "Auto",
+    "FormattedDocumentField.ToolTipRepresentation": "Auto",
+    "FormattedDocumentField.VerticalAlign": "Auto",
+    "FormattedDocumentField.WarningOnEditRepresentation": "Auto",
+    "GraphicalSchemaField.EditMode": "Enter",
+    "GraphicalSchemaField.FixingInTable": "None",
+    "GraphicalSchemaField.FooterHorizontalAlign": "Auto",
+    "GraphicalSchemaField.GroupHorizontalAlign": "Auto",
+    "GraphicalSchemaField.GroupVerticalAlign": "Auto",
+    "GraphicalSchemaField.HeaderHorizontalAlign": "Left",
+    "GraphicalSchemaField.HorizontalAlign": "Auto",
+    "GraphicalSchemaField.OnMainServerUnavalableBehavior": "Auto",
+    "GraphicalSchemaField.Output": "Auto",
+    "GraphicalSchemaField.SkipOnInput": "auto",
+    "GraphicalSchemaField.TitleLocation": "Auto",
+    "GraphicalSchemaField.ToolTipRepresentation": "Auto",
+    "GraphicalSchemaField.VerticalAlign": "Auto",
+    "GraphicalSchemaField.WarningOnEditRepresentation": "Auto",
+    "HTMLDocumentField.EditMode": "Enter",
+    "HTMLDocumentField.FixingInTable": "None",
+    "HTMLDocumentField.FooterHorizontalAlign": "Auto",
+    "HTMLDocumentField.GroupHorizontalAlign": "Auto",
+    "HTMLDocumentField.GroupVerticalAlign": "Auto",
+    "HTMLDocumentField.HeaderHorizontalAlign": "Left",
+    "HTMLDocumentField.HorizontalAlign": "Auto",
+    "HTMLDocumentField.OnMainServerUnavalableBehavior": "Auto",
+    "HTMLDocumentField.Output": "Auto",
+    "HTMLDocumentField.SkipOnInput": "auto",
+    "HTMLDocumentField.TitleLocation": "Auto",
+    "HTMLDocumentField.ToolTipRepresentation": "Auto",
+    "HTMLDocumentField.VerticalAlign": "Auto",
+    "HTMLDocumentField.WarningOnEditRepresentation": "Auto",
+    "InputField.AutoCapitalizationOnTextInput": "Auto",
+    "InputField.AutoChoiceIncomplete": "auto",
+    "InputField.AutoCorrectionOnTextInput": "Auto",
+    "InputField.AutoMarkIncomplete": "auto",
+    "InputField.AutoShowClearButtonMode": "Auto",
+    "InputField.AutoShowOpenButtonMode": "Auto",
+    "InputField.AutofillHint": "DontUse",
+    "InputField.ChoiceButton": "auto",
+    "InputField.ChoiceButtonRepresentation": "Auto",
+    "InputField.ChoiceFoldersAndItems": "Auto",
+    "InputField.ChoiceHistoryOnInput": "Auto",
+    "InputField.ChoiceListButton": "auto",
+    "InputField.ClearButton": "auto",
+    "InputField.CreateButton": "auto",
+    "InputField.DropListButton": "auto",
+    "InputField.EditMode": "Enter",
+    "InputField.EditTextUpdate": "Auto",
+    "InputField.ExtendedEdit": "auto",
+    "InputField.FixingInTable": "None",
+    "InputField.FooterHorizontalAlign": "Auto",
+    "InputField.GroupHorizontalAlign": "Auto",
+    "InputField.GroupVerticalAlign": "Auto",
+    "InputField.HeaderHorizontalAlign": "Left",
+    "InputField.HeightControlVariant": "Auto",
+    "InputField.HorizontalAlign": "Auto",
+    "InputField.HorizontalStretch": "auto",
+    "InputField.IncompleteChoiceMode": "OnEnterPressed",
+    "InputField.MarkNegatives": "auto",
+    "InputField.MultiLine": "auto",
+    "InputField.MultipleValuePictureShape": "Auto",
+    "InputField.MultipleValuePictureSize": "Auto",
+    "InputField.MultipleValuesHyperlink": "auto",
+    "InputField.OnMainServerUnavalableBehavior": "Auto",
+    "InputField.OnScreenKeyboardReturnKeyText": "Auto",
+    "InputField.OpenButton": "auto",
+    "InputField.PasswordMode": "auto",
+    "InputField.QuickChoice": "auto",
+    "InputField.ShowCheckBoxesInDropList": "auto",
+    "InputField.SkipOnInput": "auto",
+    "InputField.SpecialTextInputMode": "Auto",
+    "InputField.SpellCheckingOnTextInput": "Auto",
+    "InputField.SpinButton": "auto",
+    "InputField.TitleLocation": "Auto",
+    "InputField.ToolTipRepresentation": "Auto",
+    "InputField.VerticalAlign": "Auto",
+    "InputField.VerticalStretch": "auto",
+    "InputField.WarningOnEditRepresentation": "Auto",
+    "LabelDecoration.GroupHorizontalAlign": "Auto",
+    "LabelDecoration.GroupVerticalAlign": "Auto",
+    "LabelDecoration.HorizontalAlign": "Left",
+    "LabelDecoration.HorizontalStretch": "auto",
+    "LabelDecoration.OnMainServerUnavalableBehavior": "Auto",
+    "LabelDecoration.SkipOnInput": "auto",
+    "LabelDecoration.ToolTipRepresentation": "Auto",
+    "LabelDecoration.VerticalAlign": "Auto",
+    "LabelDecoration.VerticalStretch": "auto",
+    "LabelField.EditMode": "Enter",
+    "LabelField.FixingInTable": "None",
+    "LabelField.FooterHorizontalAlign": "Auto",
+    "LabelField.GroupHorizontalAlign": "Auto",
+    "LabelField.GroupVerticalAlign": "Auto",
+    "LabelField.HeaderHorizontalAlign": "Left",
+    "LabelField.HorizontalAlign": "Auto",
+    "LabelField.HorizontalStretch": "auto",
+    "LabelField.MarkNegatives": "auto",
+    "LabelField.OnMainServerUnavalableBehavior": "Auto",
+    "LabelField.PasswordMode": "auto",
+    "LabelField.SkipOnInput": "auto",
+    "LabelField.TitleLocation": "Auto",
+    "LabelField.ToolTipRepresentation": "Auto",
+    "LabelField.VerticalAlign": "Auto",
+    "LabelField.VerticalStretch": "auto",
+    "LabelField.WarningOnEditRepresentation": "Auto",
+    "Page.ChildItemsWidth": "Auto",
+    "Page.ChildrenAlign": "Auto",
+    "Page.Group": "Vertical",
+    "Page.GroupHorizontalAlign": "Auto",
+    "Page.GroupVerticalAlign": "Auto",
+    "Page.HorizontalAlign": "Auto",
+    "Page.HorizontalSpacing": "Auto",
+    "Page.HorizontalStretch": "auto",
+    "Page.ToolTipRepresentation": "Auto",
+    "Page.VerticalAlign": "Auto",
+    "Page.VerticalSpacing": "Auto",
+    "Page.VerticalStretch": "auto",
+    "Pages.CurrentRowUse": "Auto",
+    "Pages.GroupHorizontalAlign": "Auto",
+    "Pages.GroupVerticalAlign": "Auto",
+    "Pages.HorizontalStretch": "auto",
+    "Pages.PagesRepresentation": "Auto",
+    "Pages.ToolTipRepresentation": "Auto",
+    "Pages.VerticalStretch": "auto",
+    "PeriodField.EditMode": "Enter",
+    "PeriodField.FixingInTable": "None",
+    "PeriodField.FooterHorizontalAlign": "Auto",
+    "PeriodField.GroupHorizontalAlign": "Auto",
+    "PeriodField.GroupVerticalAlign": "Auto",
+    "PeriodField.HeaderHorizontalAlign": "Left",
+    "PeriodField.HorizontalAlign": "Auto",
+    "PeriodField.OnMainServerUnavalableBehavior": "Auto",
+    "PeriodField.SkipOnInput": "auto",
+    "PeriodField.TitleLocation": "Auto",
+    "PeriodField.ToolTipRepresentation": "Auto",
+    "PeriodField.VerticalAlign": "Auto",
+    "PeriodField.WarningOnEditRepresentation": "Auto",
+    "PictureDecoration.FileDragMode": "AsFileRef",
+    "PictureDecoration.GroupHorizontalAlign": "Auto",
+    "PictureDecoration.GroupVerticalAlign": "Auto",
+    "PictureDecoration.HorizontalStretch": "auto",
+    "PictureDecoration.OnMainServerUnavalableBehavior": "Auto",
+    "PictureDecoration.PictureSize": "RealSize",
+    "PictureDecoration.SkipOnInput": "auto",
+    "PictureDecoration.ToolTipRepresentation": "Auto",
+    "PictureDecoration.VerticalStretch": "auto",
+    "PictureField.EditMode": "Enter",
+    "PictureField.FileDragMode": "AsFileRef",
+    "PictureField.FixingInTable": "None",
+    "PictureField.FooterHorizontalAlign": "Auto",
+    "PictureField.GroupHorizontalAlign": "Auto",
+    "PictureField.GroupVerticalAlign": "Auto",
+    "PictureField.HeaderHorizontalAlign": "Left",
+    "PictureField.HorizontalAlign": "Auto",
+    "PictureField.OnMainServerUnavalableBehavior": "Auto",
+    "PictureField.PictureSize": "RealSize",
+    "PictureField.SkipOnInput": "auto",
+    "PictureField.TitleLocation": "Auto",
+    "PictureField.ToolTipRepresentation": "Auto",
+    "PictureField.VerticalAlign": "Auto",
+    "PictureField.WarningOnEditRepresentation": "Auto",
+    "PlannerField.EditMode": "Enter",
+    "PlannerField.FixingInTable": "None",
+    "PlannerField.FooterHorizontalAlign": "Auto",
+    "PlannerField.GroupHorizontalAlign": "Auto",
+    "PlannerField.GroupVerticalAlign": "Auto",
+    "PlannerField.HeaderHorizontalAlign": "Left",
+    "PlannerField.HorizontalAlign": "Auto",
+    "PlannerField.OnMainServerUnavalableBehavior": "Auto",
+    "PlannerField.SkipOnInput": "auto",
+    "PlannerField.TitleLocation": "Auto",
+    "PlannerField.ToolTipRepresentation": "Auto",
+    "PlannerField.VerticalAlign": "Auto",
+    "PlannerField.WarningOnEditRepresentation": "Auto",
+    "Popup.GroupHorizontalAlign": "Auto",
+    "Popup.GroupVerticalAlign": "Auto",
+    "Popup.HorizontalStretch": "auto",
+    "Popup.PlacementArea": "userCmds",
+    "Popup.Representation": "Auto",
+    "Popup.Shape": "Auto",
+    "Popup.ShapeRepresentation": "Auto",
+    "Popup.ToolTipRepresentation": "Auto",
+    "Popup.VerticalStretch": "auto",
+    "ProgressBarField.EditMode": "Enter",
+    "ProgressBarField.FixingInTable": "None",
+    "ProgressBarField.FooterHorizontalAlign": "Auto",
+    "ProgressBarField.GroupHorizontalAlign": "Auto",
+    "ProgressBarField.GroupVerticalAlign": "Auto",
+    "ProgressBarField.HeaderHorizontalAlign": "Left",
+    "ProgressBarField.HorizontalAlign": "Auto",
+    "ProgressBarField.OnMainServerUnavalableBehavior": "Auto",
+    "ProgressBarField.Orientation": "Horizontal",
+    "ProgressBarField.Representation": "Smooth",
+    "ProgressBarField.SkipOnInput": "auto",
+    "ProgressBarField.TitleLocation": "Auto",
+    "ProgressBarField.ToolTipRepresentation": "Auto",
+    "ProgressBarField.VerticalAlign": "Auto",
+    "ProgressBarField.WarningOnEditRepresentation": "Auto",
+    "RadioButtonField.EditMode": "Enter",
+    "RadioButtonField.EqualColumnsWidth": "auto",
+    "RadioButtonField.FixingInTable": "None",
+    "RadioButtonField.FooterHorizontalAlign": "Auto",
+    "RadioButtonField.GroupHorizontalAlign": "Auto",
+    "RadioButtonField.GroupVerticalAlign": "Auto",
+    "RadioButtonField.HeaderHorizontalAlign": "Left",
+    "RadioButtonField.HorizontalAlign": "Auto",
+    "RadioButtonField.OnMainServerUnavalableBehavior": "Auto",
+    "RadioButtonField.SkipOnInput": "auto",
+    "RadioButtonField.TitleLocation": "Auto",
+    "RadioButtonField.ToolTipRepresentation": "Auto",
+    "RadioButtonField.VerticalAlign": "Auto",
+    "RadioButtonField.WarningOnEditRepresentation": "Auto",
+    "SpreadSheetDocumentField.DrawingSelectionShowMode": "Auto",
+    "SpreadSheetDocumentField.EditMode": "Enter",
+    "SpreadSheetDocumentField.FixingInTable": "None",
+    "SpreadSheetDocumentField.FooterHorizontalAlign": "Auto",
+    "SpreadSheetDocumentField.GroupHorizontalAlign": "Auto",
+    "SpreadSheetDocumentField.GroupVerticalAlign": "Auto",
+    "SpreadSheetDocumentField.HeaderHorizontalAlign": "Left",
+    "SpreadSheetDocumentField.HorizontalAlign": "Auto",
+    "SpreadSheetDocumentField.OnMainServerUnavalableBehavior": "Auto",
+    "SpreadSheetDocumentField.Output": "Auto",
+    "SpreadSheetDocumentField.PointerType": "Special",
+    "SpreadSheetDocumentField.SelectionShowMode": "Always",
+    "SpreadSheetDocumentField.SkipOnInput": "auto",
+    "SpreadSheetDocumentField.TitleLocation": "Auto",
+    "SpreadSheetDocumentField.ToolTipRepresentation": "Auto",
+    "SpreadSheetDocumentField.VerticalAlign": "Auto",
+    "SpreadSheetDocumentField.ViewScalingMode": "Auto",
+    "SpreadSheetDocumentField.WarningOnEditRepresentation": "Auto",
+    "Table.AutoAddIncomplete": "auto",
+    "Table.AutoMarkIncomplete": "auto",
+    "Table.BehaviorOnHorizontalCompression": "Auto",
+    "Table.CommandBarLocation": "Auto",
+    "Table.CurrentRowUse": "Auto",
+    "Table.FileDragMode": "AsFileRef",
+    "Table.GroupHorizontalAlign": "Auto",
+    "Table.GroupVerticalAlign": "Auto",
+    "Table.HeightControlVariant": "Auto",
+    "Table.HorizontalScrollBar": "AutoUse",
+    "Table.InitialListView": "Auto",
+    "Table.InitialTreeView": "NoExpand",
+    "Table.OnMainServerUnavalableBehavior": "Auto",
+    "Table.Output": "Auto",
+    "Table.RefreshRequest": "None",
+    "Table.Representation": "HierarchicalList",
+    "Table.RowInputMode": "EndOfList",
+    "Table.RowSelectionMode": "Cell",
+    "Table.SearchControlLocation": "Auto",
+    "Table.SearchOnInput": "Auto",
+    "Table.SearchStringLocation": "Auto",
+    "Table.SelectionMode": "MultiRow",
+    "Table.SkipOnInput": "auto",
+    "Table.TitleLocation": "None",
+    "Table.ToolTipRepresentation": "Auto",
+    "Table.VerticalScrollBar": "AutoUse",
+    "Table.ViewStatusLocation": "Auto",
+    "TextDocumentField.EditMode": "Enter",
+    "TextDocumentField.FixingInTable": "None",
+    "TextDocumentField.FooterHorizontalAlign": "Auto",
+    "TextDocumentField.GroupHorizontalAlign": "Auto",
+    "TextDocumentField.GroupVerticalAlign": "Auto",
+    "TextDocumentField.HeaderHorizontalAlign": "Left",
+    "TextDocumentField.HorizontalAlign": "Auto",
+    "TextDocumentField.OnMainServerUnavalableBehavior": "Auto",
+    "TextDocumentField.Output": "Auto",
+    "TextDocumentField.SkipOnInput": "auto",
+    "TextDocumentField.TitleLocation": "Auto",
+    "TextDocumentField.ToolTipRepresentation": "Auto",
+    "TextDocumentField.VerticalAlign": "Auto",
+    "TextDocumentField.WarningOnEditRepresentation": "Auto",
+    "TrackBarField.EditMode": "Enter",
+    "TrackBarField.FixingInTable": "None",
+    "TrackBarField.FooterHorizontalAlign": "Auto",
+    "TrackBarField.GroupHorizontalAlign": "Auto",
+    "TrackBarField.GroupVerticalAlign": "Auto",
+    "TrackBarField.HeaderHorizontalAlign": "Left",
+    "TrackBarField.HorizontalAlign": "Auto",
+    "TrackBarField.MarkingAppearance": "BottomRight",
+    "TrackBarField.OnMainServerUnavalableBehavior": "Auto",
+    "TrackBarField.Orientation": "Horizontal",
+    "TrackBarField.SkipOnInput": "auto",
+    "TrackBarField.TitleLocation": "Auto",
+    "TrackBarField.ToolTipRepresentation": "Auto",
+    "TrackBarField.VerticalAlign": "Auto",
+    "TrackBarField.WarningOnEditRepresentation": "Auto",
+    "UsualGroup.Behavior": "Auto",
+    "UsualGroup.ChildItemsWidth": "Auto",
+    "UsualGroup.ChildrenAlign": "Auto",
+    "UsualGroup.ControlRepresentation": "TitleHyperlink",
+    "UsualGroup.CurrentRowUse": "Auto",
+    "UsualGroup.Group": "HorizontalIfPossible",
+    "UsualGroup.GroupHorizontalAlign": "Auto",
+    "UsualGroup.GroupVerticalAlign": "Auto",
+    "UsualGroup.HorizontalAlign": "Auto",
+    "UsualGroup.HorizontalSpacing": "Auto",
+    "UsualGroup.HorizontalStretch": "auto",
+    "UsualGroup.Representation": "WeakSeparation",
+    "UsualGroup.ThroughAlign": "Auto",
+    "UsualGroup.ToolTipRepresentation": "Auto",
+    "UsualGroup.VerticalAlign": "Auto",
+    "UsualGroup.VerticalSpacing": "Auto",
+    "UsualGroup.VerticalStretch": "auto",
+}
+# --- /Перечисления свойств формы ---
+obj_type = None
+
+
+def normalize_enum_value(prop_name, value):
+    valid = valid_enum_values.get(f"{obj_type}.{prop_name}") or valid_enum_values.get(prop_name)
+    # 1. Check alias dictionary — silent auto-correct. Словарь общий для всех свойств: у свойства со
+    # списком алиас берётся, только если его результат в списке (иначе «None» дало бы Nonperiodical везде)
+    alias_key = next((k for k in enum_value_aliases if k.lower() == value.lower()), None)
+    if alias_key is not None:
+        aliased = enum_value_aliases[alias_key]
+        if not valid or aliased in valid:
+            return aliased
+    # 2. Case-insensitive match against valid values — silent. Список вида объекта — раньше общего.
+    if valid:
+        for v in valid:
+            if v.lower() == value.lower():
+                return v
+        # 3. Known property, unknown value — error with hint
+        print(f"Invalid value '{value}' for property '{prop_name}'. Valid values: {', '.join(valid)}", file=sys.stderr)
+        sys.exit(1)
+    # 4. Unknown property — pass-through (no validation data)
+    return value
+
+# Значения перечислений в выводе эмиттера — к каноническому виду (normalize_enum_value): простой тег
+# элемента формы известного типа или корня формы. Регистр и старые имена исправляются молча,
+# неизвестное значение — ошибка с перечнем допустимых. root_type — тип для тегов прямо под корнем
+# фрагмента (свойства формы во фрагменте form-edit). Значение-умолчание типа (enum_default_values) — тег
+# не пишется, как не пишет его платформа; keep_defaults оставляет такие теги (проба set в form-edit).
+def normalize_enum_tags(text, root_type='', keep_defaults=False):
+    global obj_type
+    crlf = '\r\n' in text
+    lines = text.replace('\r\n', '\n').split('\n')
+    stack = []
+    for i, line in enumerate(lines):
+        m = re.fullmatch(r'\t*</([A-Za-z_][\w.:-]*)>', line)
+        if m:
+            if stack and stack[-1][0] == m.group(1):
+                stack.pop()
+            continue
+        m = re.fullmatch(r'(\t*)<([A-Za-z_][\w.:-]*)(\s[^>]*)?>', line)
+        if m and not line.endswith('/>'):
+            stack.append((m.group(2), len(m.group(1))))
+            continue
+        if not stack:
+            continue
+        m = re.fullmatch(r'(\t*)<([A-Za-z]\w*)>([^<]+)</([A-Za-z]\w*)>', line)
+        if not m or m.group(2) != m.group(4):
+            continue
+        name, ind = stack[-1]
+        if len(m.group(1)) != ind + 1:
+            continue
+        if len(stack) == 1:
+            ptype = 'Form' if name == 'Form' else root_type
+        else:
+            ptype = name
+        if not ptype or (ptype != 'Form' and ptype not in CHILD_TAG_ORDER):
+            continue
+        obj_type = ptype
+        tag = m.group(2)
+        v = normalize_enum_value(tag, m.group(3))
+        if not keep_defaults and enum_default_values.get(f'{ptype}.{tag}') == v:
+            lines[i] = None
+            continue
+        if v != m.group(3):
+            lines[i] = f'{m.group(1)}<{tag}>{v}</{tag}>'
+    out = '\n'.join(l for l in lines if l is not None)
+    return out.replace('\n', '\r\n') if crlf else out
+
+
+# --- Канонический порядок дочерних тегов элемента ---
+# В каком порядке платформа пишет свойства и вложенные узлы элемента формы. Построено по корпусу
+# выгрузок (БП и ERP, 8.3.24, 17036 форм): для каждого типа элемента — граф «тег A раньше тега B»,
+# противоречий нет. Эмиттер пишет теги в этом порядке — иначе первая же выгрузка из базы их переставит.
+CHILD_TAG_ORDER = {
+    "AutoCommandBar": "HorizontalAlign Autofill ChildItems",
+    "Button": "Type Visible TitleHeight UserVisible Representation DefaultButton SkipOnInput Enabled DefaultItem Width AutoMaxWidth MaxWidth Height AutoMaxHeight HorizontalStretch MaxHeight VerticalStretch GroupHorizontalAlign Check GroupVerticalAlign CommandName Parameter DataPath TextColor BackColor BorderColor Font Picture Title Shape ToolTipRepresentation RepresentationInContextMenu ShapeRepresentation PictureLocation LocationInCommandBar CommandUniqueness ExtendedTooltip",
+    "ButtonGroup": "EnableContentChange Visible Title GroupVerticalAlign ToolTip HorizontalStretch GroupHorizontalAlign ToolTipRepresentation CommandSource Representation VerticalStretch ExtendedTooltip ChildItems",
+    "CalendarField": "DataPath SkipOnInput Title TitleLocation ToolTip ToolTipRepresentation Width AutoMaxWidth Height HorizontalStretch SelectionMode ShowCurrentDate ShowMonthsPanel WidthInMonths HeightInMonths ContextMenu ExtendedTooltip Events",
+    "ChartField": "DataPath Enabled Title TitleFont Visible TitleLocation GroupHorizontalAlign Width AutoMaxWidth MaxHeight MaxWidth Height AutoMaxHeight HorizontalStretch VerticalStretch ContextMenu ExtendedTooltip Events",
+    "CheckBoxField": "DataPath Visible Enabled UserVisible DefaultItem ReadOnly SkipOnInput Title TitleTextColor TitleFont TitleLocation TitleHeight ToolTip FooterHorizontalAlign HorizontalAlign ToolTipRepresentation Shortcut GroupHorizontalAlign VerticalAlign GroupVerticalAlign WarningOnEditRepresentation WarningOnEdit EditMode AutoCellHeight CellHyperlink FixingInTable ShowInHeader FooterDataPath HeaderPicture HeaderHorizontalAlign ShowInFooter CheckBoxType EditFormat ItemHeight ItemTitleHeight ItemWidth EqualItemsWidth ThreeState ContextMenu ExtendedTooltip Events",
+    "ColumnGroup": "Visible Enabled ReadOnly UserVisible EnableContentChange Title GroupVerticalAlign TitleFont TitleTextColor ToolTip ToolTipRepresentation Width Height HorizontalStretch GroupHorizontalAlign VerticalStretch Group ShowTitle ShowInHeader HeaderDataPath HeaderHorizontalAlign HeaderFormat HeaderPicture FixingInTable ExtendedTooltip ChildItems",
+    "CommandBar": "Enabled Visible EnableContentChange Title ToolTip ToolTipRepresentation Width Height HorizontalStretch VerticalStretch GroupHorizontalAlign GroupVerticalAlign HorizontalLocation CommandSource ExtendedTooltip ChildItems",
+    "FormattedDocumentField": "DataPath DefaultItem Enabled ReadOnly SkipOnInput Title TitleLocation CommandSet Font ToolTip EditMode Width AutoMaxWidth Height AutoMaxHeight BorderColor HorizontalStretch MaxWidth ContextMenu ExtendedTooltip Events",
+    "GanttChartField": "DataPath DefaultItem TitleLocation Width Height HorizontalStretch VerticalStretch ContextMenu ExtendedTooltip Table Events",
+    "GraphicalSchemaField": "DataPath DefaultItem ReadOnly Title TitleLocation WarningOnEditRepresentation Width Height Edit ContextMenu ExtendedTooltip Events",
+    "HTMLDocumentField": "DataPath DefaultItem Enabled ReadOnly SkipOnInput Title TitleTextColor TitleFont TitleLocation ToolTipRepresentation Visible WarningOnEditRepresentation Width AutoMaxWidth MaxWidth Height AutoMaxHeight MaxHeight HorizontalStretch VerticalStretch Output BorderColor ContextMenu ExtendedTooltip Events",
+    "InputField": "DataPath Visible UserVisible DefaultItem Enabled ReadOnly SkipOnInput Title TitleBackColor TitleTextColor TitleFont TitleLocation TitleHeight ToolTip ToolTipRepresentation WarningOnEditRepresentation WarningOnEdit Shortcut HorizontalAlign VerticalAlign GroupHorizontalAlign GroupVerticalAlign EditMode CellHyperlink FixingInTable AutoCellHeight ShowInHeader HeaderHorizontalAlign HeaderPicture ShowInFooter FooterDataPath FooterText FooterTextColor FooterFont FooterHorizontalAlign FooterPicture Width AutoMaxWidth MaxWidth Height AutoMaxHeight MaxHeight HorizontalStretch AllowInputEmptyMultipleValues MultipleValuesFont MultipleValuesTextColor MultipleValuesBackColor VerticalStretch Wrap MarkNegatives PasswordMode MultiLine ExtendedEdit DropListButton ChoiceButton ChoiceButtonRepresentation ClearButton SpinButton OpenButton CreateButton Mask ListChoiceMode ExtendedEditMultipleValues AutoChoiceIncomplete Format MultipleValuePictureShape QuickChoice ChoiceFoldersAndItems EditFormat AutoMarkIncomplete ChooseType AutoShowOpenButtonMode IncompleteChoiceMode ShowCheckBoxesInDropList MultipleValueDataPath MultipleValuePictureDataPath MultipleValuePresentDataPath SpellCheckingOnTextInput TypeDomainEnabled TextEdit AvailableTypes ChoiceForm ChoiceParameterLinks ChoiceParameters EditTextUpdate MinValue ChoiceButtonPicture MaxValue ChoiceList AutoCorrectionOnTextInput AutoShowClearButtonMode ChoiceListButton ChoiceListHeight DropListWidth TextColor BackColor BorderColor Font HeightControlVariant SpecialTextInputMode InputHint ChoiceHistoryOnInput TypeLink ContextMenu ExtendedTooltip Events",
+    "LabelDecoration": "UserVisible Visible Enabled Width AutoMaxWidth MaxWidth Height AutoMaxHeight MaxHeight HorizontalStretch VerticalStretch SkipOnInput TextColor Font Shortcut Title ToolTip ToolTipRepresentation GroupHorizontalAlign GroupVerticalAlign Hyperlink HorizontalAlign VerticalAlign BackColor BorderColor Border TitleHeight ContextMenu ExtendedTooltip Events",
+    "LabelField": "DataPath Visible Enabled UserVisible DefaultItem ReadOnly SkipOnInput Title TitleTextColor TitleFont TitleLocation TitleHeight ToolTip ToolTipRepresentation HorizontalAlign VerticalAlign GroupHorizontalAlign GroupVerticalAlign WarningOnEditRepresentation WarningOnEdit EditMode FixingInTable CellHyperlink AutoCellHeight FooterText ShowInHeader HeaderHorizontalAlign FooterDataPath HeaderPicture ShowInFooter FooterHorizontalAlign Width AutoMaxWidth MaxWidth Height AutoMaxHeight MaxHeight HorizontalStretch MarkNegatives VerticalStretch Format Border BorderColor Hiperlink PasswordMode TextColor BackColor Font ContextMenu ExtendedTooltip Events",
+    "Page": "Visible Enabled ReadOnly EnableContentChange UserVisible Title GroupVerticalAlign Shortcut TitleTextColor TitleFont ToolTip ToolTipRepresentation Width Height HorizontalStretch VerticalStretch ChildrenAlign Picture Format Group ChildItemsWidth HorizontalSpacing VerticalSpacing HorizontalAlign VerticalAlign ShowTitle BackColor TitleDataPath ScrollOnCompress ExtendedTooltip ChildItems",
+    "Pages": "Enabled ReadOnly EnableContentChange UserVisible Visible Title TitleFont ToolTip ToolTipRepresentation Width Height HorizontalStretch VerticalStretch GroupHorizontalAlign GroupVerticalAlign PagesRepresentation CurrentRowUse ExtendedTooltip Events ChildItems",
+    "PeriodField": "DataPath TitleLocation ContextMenu ExtendedTooltip",
+    "PictureDecoration": "Enabled Visible Width AutoMaxWidth MaxWidth Height AutoMaxHeight MaxHeight HorizontalStretch VerticalStretch SkipOnInput TextColor Font Title ToolTip ToolTipRepresentation GroupHorizontalAlign GroupVerticalAlign Hyperlink PictureSize Zoomable ImageScale NonselectedPictureText EnableStartDrag EnableDrag Picture BorderColor Border FileDragMode ContextMenu ExtendedTooltip Events",
+    "PictureField": "DataPath TitleBackColor UserVisible Visible Enabled ReadOnly SkipOnInput Title TitleTextColor TitleLocation TitleHeight ToolTip GroupHorizontalAlign GroupVerticalAlign Shortcut ToolTipRepresentation HorizontalAlign WarningOnEditRepresentation EditMode AutoCellHeight FixingInTable CellHyperlink ShowInHeader FooterDataPath HeaderPicture FooterText HeaderHorizontalAlign ShowInFooter FooterHorizontalAlign Width AutoMaxWidth MaxWidth Height AutoMaxHeight MaxHeight HorizontalStretch VerticalStretch PictureSize Zoomable Hyperlink NonselectedPictureText EnableDrag TextColor ValuesPicture BorderColor Border Font FileDragMode ContextMenu ExtendedTooltip Events",
+    "PlannerField": "DataPath TitleLocation ContextMenu ExtendedTooltip Events",
+    "Popup": "UserVisible Visible EnableContentChange Title Shape TitleTextColor TitleFont ToolTip ToolTipRepresentation VerticalStretch Width HorizontalStretch Picture CommandSource Representation BackColor ShapeRepresentation BorderColor ExtendedTooltip ChildItems",
+    "ProgressBarField": "DataPath Title Visible ReadOnly TitleLocation ToolTip ToolTipRepresentation Width AutoMaxHeight AutoMaxWidth HorizontalStretch MaxValue ShowPercent ContextMenu ExtendedTooltip",
+    "RadioButtonField": "DataPath DefaultItem Enabled SkipOnInput UserVisible Visible ReadOnly Title TitleTextColor TitleFont TitleLocation FooterHorizontalAlign TitleHeight ToolTip ToolTipRepresentation EditMode GroupHorizontalAlign Shortcut VerticalAlign GroupVerticalAlign WarningOnEditRepresentation WarningOnEdit RadioButtonType ItemHeight ItemTitleHeight ItemWidth ColumnsCount EqualColumnsWidth ChoiceList Font TextColor ContextMenu ExtendedTooltip Events",
+    "SpreadSheetDocumentField": "DataPath Enabled ReadOnly SkipOnInput UserVisible Visible DefaultItem Title TitleLocation DrawingSelectionShowMode FooterHorizontalAlign GroupHorizontalAlign ToolTip ToolTipRepresentation CommandSet Width AutoMaxWidth MaxWidth Height AutoMaxHeight MaxHeight HorizontalStretch VerticalStretch ShowGrid ShowHeaders VerticalScrollBar HorizontalScrollBar Protection SelectionShowMode Edit Output PointerType ShowGroups EnableStartDrag EnableDrag BorderColor ShowCellNames ShowRowAndColumnNames ViewScalingMode ContextMenu ExtendedTooltip Events",
+    "Table": "Representation Visible UserVisible TitleLocation CommandBarLocation Autofill Enabled TitleHeight ReadOnly SkipOnInput DefaultItem ChangeRowSet ChangeRowOrder Width AutoMaxWidth MaxWidth Height AutoMaxHeight MaxHeight HeightInTableRows HeightControlVariant AutoMaxRowsCount MaxRowsCount ChoiceMode MultipleChoice RowInputMode SelectionMode RowSelectionMode Header FooterHeight HeaderHeight Footer HorizontalScrollBar VerticalScrollBar HorizontalLines VerticalLines UseAlternationRowColor AutoInsertNewRow AutoAddIncomplete AutoMarkIncomplete SearchOnInput InitialListView InitialTreeView HorizontalStretch Output VerticalStretch EnableStartDrag EnableDrag FileDragMode DataPath Font RowPictureDataPath RowsPicture BackColor BorderColor TextColor Title BehaviorOnHorizontalCompression GroupVerticalAlign Shortcut TitleTextColor TitleFont CommandSet ToolTip ToolTipRepresentation SearchStringLocation ViewStatusLocation SearchControlLocation GroupHorizontalAlign CurrentRowUse RefreshRequest AutoRefresh AutoRefreshPeriod Period ChoiceFoldersAndItems RestoreCurrentRow RowFilter TopLevelParent ShowRoot AllowRootChoice UpdateOnDataChange UserSettingsGroup AllowGettingCurrentRowURL ViewMode SettingsNamedItemDetailedRepresentation ContextMenu AutoCommandBar ExtendedTooltip SearchStringAddition ViewStatusAddition SearchControlAddition Events ChildItems",
+    "TextDocumentField": "DataPath DefaultItem ReadOnly Title TitleFont TitleLocation EditMode ToolTip Width AutoMaxWidth Font MaxWidth Height AutoMaxHeight ContextMenu ExtendedTooltip Events",
+    "TrackBarField": "DataPath Title TitleLocation HorizontalAlign ToolTip ToolTipRepresentation Width AutoMaxWidth HorizontalStretch MaxWidth Height AutoMaxHeight MinValue MarkingAppearance MaxValue LargeStep Step MarkingStep ContextMenu ExtendedTooltip Events",
+    "UsualGroup": "UserVisible Visible Enabled ReadOnly EnableContentChange Title TitleTextColor TitleFont ToolTip ToolTipRepresentation Shortcut Width Height HorizontalStretch VerticalStretch GroupHorizontalAlign GroupVerticalAlign Group ChildrenAlign HorizontalSpacing VerticalSpacing HorizontalAlign VerticalAlign Behavior CollapsedRepresentationTitle Collapsed ControlRepresentation Representation CurrentRowUse Format ShowLeftMargin United ChildItemsWidth ShowTitle BackColor ThroughAlign TitleDataPath ExtendedTooltip ChildItems",
+}
+CHILD_RANK = {t: {c: i for i, c in enumerate(v.split(" "))} for t, v in CHILD_TAG_ORDER.items()}
+
+
+def get_child_rank(parent_tag, child_tag):
+    return CHILD_RANK.get(parent_tag, {}).get(child_tag, -1)
+
+
+_TAG_OPEN_RE = re.compile(r'^(\t*)<([A-Za-z_][\w.:-]*)(?=[\s/>])')
+
+
+# Вывод эмиттера (тег на строке, вложенность — табами) — в порядок корпуса: дети каждого элемента
+# переставляются целыми блоками строк, содержимое блоков не меняется. Незнакомый тег идёт за
+# предыдущим знакомым.
+def sort_element_tag_order(text):
+    crlf = '\r\n' in text
+    lines = text.replace('\r\n', '\n').split('\n')
+    _sort_tag_blocks(lines, 0, len(lines), '')
+    out = '\n'.join(lines)
+    return out.replace('\n', '\r\n') if crlf else out
+
+
+def _tag_block_end(lines, i, ind, name):
+    line = lines[i]
+    if line.endswith('/>') and '</' not in line:
+        return i + 1
+    if line.endswith('</' + name + '>'):
+        return i + 1
+    if re.fullmatch(r'\t*<' + re.escape(name) + r'(\s[^>]*)?>', line):
+        close = ind + '</' + name + '>'
+        j = i + 1
+        while j < len(lines) and lines[j] != close:
+            j += 1
+        return j + 1
+    # многострочный текст — до строки, которая кончается закрывающим тегом
+    j = i + 1
+    while j < len(lines) and not lines[j - 1].endswith('</' + name + '>'):
+        j += 1
+    return j
+
+
+def _sort_tag_blocks(lines, lo, hi, parent):
+    ind = None
+    for i in range(lo, hi):
+        m = re.match(r'^(\t*)<[A-Za-z_]', lines[i])
+        if m:
+            ind = m.group(1)
+            break
+    if ind is None:
+        return
+    blocks = []
+    i = lo
+    while i < hi:
+        m = _TAG_OPEN_RE.match(lines[i])
+        if m and m.group(1) == ind:
+            e = _tag_block_end(lines, i, ind, m.group(2))
+            blocks.append((m.group(2), i, e))
+            i = e
+        else:
+            i += 1
+    for name, s, e in blocks:
+        if e - s > 2 and re.fullmatch(r'\t*<' + re.escape(name) + r'(\s[^>]*)?>', lines[s]):
+            _sort_tag_blocks(lines, s + 1, e - 1, name)
+    if len(blocks) < 2 or not parent:
+        return
+    ptag = parent.split(':')[-1]
+    if ptag not in CHILD_TAG_ORDER:
+        return
+    a, z = blocks[0][1], blocks[-1][2]
+    if sum(e - s for _, s, e in blocks) != z - a:
+        return   # между детьми есть посторонние строки — не трогаем
+    last = -1
+    keyed = []
+    for k, (name, s, e) in enumerate(blocks):
+        r = get_child_rank(ptag, name.split(':')[-1])
+        if r < 0:
+            r = last
+        last = r
+        keyed.append(((r + 1) * 100000 + k, k))
+    srt = sorted(keyed)
+    if [k for _, k in srt] == list(range(len(srt))):
+        return
+    seq = []
+    for _, k in srt:
+        _, s, e = blocks[k]
+        seq += lines[s:e]
+    lines[a:z] = seq
+
+
+def emit_element(lines, el, indent, in_cmd_bar=False):
+    # Companion-панели (объект/массив-значение) → commandBar/contextMenu, до тип-синонимов.
+    normalize_panel_synonyms(el)
+
+    # Синонимы типа (XML-имя, русское имя) → канонический ключ DSL
+    normalize_element_type_synonyms(el)
 
     # Синонимы ключей-свойств (русские имена 1С → канон. англ.). Case/space-insensitive.
     # Канон побеждает: если задан и русский, и англ. ключ — англ. остаётся, русский отбрасываем.
@@ -4109,7 +4976,8 @@ def emit_element(lines, el, indent, in_cmd_bar=False):
     for p_name in el.keys():
         if p_name.startswith('_'):
             continue
-        if p_name not in KNOWN_KEYS and p_name not in APPEARANCE_SPEC and p_name not in APPEARANCE_SYNONYMS:
+        if p_name not in KNOWN_KEYS and p_name not in APPEARANCE_SPEC and p_name not in APPEARANCE_SYNONYMS \
+                and p_name not in GENERIC_SCALAR_KEYS:
             print(f"WARNING: Element '{el.get(type_key, '')}': unknown key '{p_name}' -- ignored. Check SKILL.md for valid keys.", file=sys.stderr)
 
     name = get_element_name(el, type_key)
@@ -4177,7 +5045,7 @@ def emit_group(lines, el, name, eid, indent):
         'horizontal': 'Horizontal',
         'vertical': 'Vertical',
         'alwayshorizontal': 'AlwaysHorizontal',
-        'alwaysvertical': 'AlwaysVertical',
+        'alwaysvertical': 'Vertical',  # старое написание; у группы такого значения нет
         'horizontalifpossible': 'HorizontalIfPossible',
         'collapsible': 'Vertical',
     }
@@ -4214,8 +5082,9 @@ def emit_group(lines, el, name, eid, indent):
         lines.append(f'{inner}<CurrentRowUse>{el["currentRowUse"]}</CurrentRowUse>')
 
     # ShowTitle
-    if el.get('showTitle') is not None:
-        lines.append(f'{inner}<ShowTitle>{"true" if el["showTitle"] else "false"}</ShowTitle>')
+    # ShowTitle=true — умолчание платформы (в корпусе только false): пишем лишь false
+    if el.get('showTitle') is not None and not el['showTitle']:
+        lines.append(f'{inner}<ShowTitle>false</ShowTitle>')
     # Заголовок свёрнутого представления (collapsible/popup) — мультиязычный текст
     if el.get('collapsedTitle'):
         emit_mltext(lines, inner, 'CollapsedRepresentationTitle', el['collapsedTitle'])
@@ -4267,8 +5136,9 @@ def emit_column_group(lines, el, name, eid, indent):
     elif group_val:
         _warn_unrecognized('columnGroup orientation', el.get('columnGroup'), ('vertical', 'horizontal', 'inCell'), name)
 
-    if el.get('showTitle') is not None:
-        lines.append(f'{inner}<ShowTitle>{"true" if el["showTitle"] else "false"}</ShowTitle>')
+    # ShowTitle=true — умолчание платформы (в корпусе только false): пишем лишь false
+    if el.get('showTitle') is not None and not el['showTitle']:
+        lines.append(f'{inner}<ShowTitle>false</ShowTitle>')
     # showInHeader эмитится общим emit_common_element_props (через emit_layout)
 
     emit_common_flags(lines, el, inner)
@@ -4302,8 +5172,7 @@ def emit_input(lines, el, name, eid, indent):
     emit_common_flags(lines, el, inner)
 
     if el.get('titleLocation'):
-        loc_map = {'none': 'None', 'left': 'Left', 'right': 'Right', 'top': 'Top', 'bottom': 'Bottom'}
-        loc = loc_map.get(str(el['titleLocation']), str(el['titleLocation']))
+        loc = map_title_loc(el['titleLocation'])
         lines.append(f'{inner}<TitleLocation>{loc}</TitleLocation>')
 
     if el.get('multiLine') is not None:
@@ -4772,7 +5641,7 @@ def emit_page(lines, el, name, eid, indent):
             'horizontal': 'Horizontal',
             'vertical': 'Vertical',
             'alwayshorizontal': 'AlwaysHorizontal',
-            'alwaysvertical': 'AlwaysVertical',
+            'alwaysvertical': 'Vertical',  # старое написание; у страницы такого значения нет
             'horizontalifpossible': 'HorizontalIfPossible',
         }
         orientation = orientation_map.get(str(el['group']).lower())
@@ -4780,8 +5649,9 @@ def emit_page(lines, el, name, eid, indent):
             lines.append(f'{inner}<Group>{orientation}</Group>')
         else:
             _warn_unrecognized('page group orientation', el['group'], ('vertical', 'horizontalIfPossible', 'alwaysHorizontal'), name)
-    if el.get('showTitle') is not None:
-        lines.append(f'{inner}<ShowTitle>{"true" if el["showTitle"] else "false"}</ShowTitle>')
+    # ShowTitle=true — умолчание платформы (в корпусе только false): пишем лишь false
+    if el.get('showTitle') is not None and not el['showTitle']:
+        lines.append(f'{inner}<ShowTitle>false</ShowTitle>')
     # Формат значения пути к данным заголовка (<Format>; парный к titleDataPath страницы)
     if el.get('format'):
         emit_mltext(lines, inner, 'Format', el['format'])
@@ -5066,8 +5936,7 @@ def emit_calendar(lines, el, name, eid, indent):
     emit_common_flags(lines, el, inner)
 
     if el.get('titleLocation'):
-        loc_map = {'none': 'None', 'left': 'Left', 'right': 'Right', 'top': 'Top', 'bottom': 'Bottom', 'auto': 'Auto'}
-        loc = loc_map.get(str(el['titleLocation']), str(el['titleLocation']))
+        loc = map_title_loc(el['titleLocation'])
         lines.append(f'{inner}<TitleLocation>{loc}</TitleLocation>')
 
     emit_layout(lines, el, inner)
@@ -6061,8 +6930,17 @@ def emit_commands(lines, cmds, indent):
         if cmd.get('use') is not None:
             emit_xr_flag(lines, 'Use', cmd.get('use'), inner)
 
-        if cmd.get('action'):
-            lines.append(f'{inner}<Action>{cmd["action"]}</Action>')
+        # Обработчик; в расширении — с видом вызова (callType), или несколько: actions [{handler, callType}]
+        if cmd.get('actions'):
+            acts = cmd['actions'] if isinstance(cmd['actions'], list) else [cmd['actions']]
+            for act in acts:
+                ct = normalize_call_type(act.get('callType'), str(cmd.get('name', '')), 'Action')
+                ct_attr = f' callType="{ct}"' if ct else ''
+                lines.append(f'{inner}<Action{ct_attr}>{act.get("handler") if act.get("handler") is not None else ""}</Action>')
+        elif cmd.get('action'):
+            ct = normalize_call_type(cmd.get('callType'), str(cmd.get('name', '')), 'Action')
+            ct_attr = f' callType="{ct}"' if ct else ''
+            lines.append(f'{inner}<Action{ct_attr}>{cmd["action"]}</Action>')
 
         if cmd.get('modifiesSavedData') is True:
             lines.append(f'{inner}<ModifiesSavedData>true</ModifiesSavedData>')
@@ -6113,8 +6991,9 @@ def emit_command_interface(lines, ci, indent):
         return
     inner = f'{indent}\t'
     panels = [
-        ('CommandBar', ('commandBar', 'команднаяПанель', 'КоманднаяПанель')),
+        # Порядок панелей — как в выгрузке: панель навигации раньше командной (607 из 607 форм корпуса)
         ('NavigationPanel', ('navigationPanel', 'панельНавигации', 'ПанельНавигации')),
+        ('CommandBar', ('commandBar', 'команднаяПанель', 'КоманднаяПанель')),
     ]
     present = []
     for tag, syns in panels:
@@ -6200,6 +7079,25 @@ PROP_MAP = {
 }
 
 
+# Порядок дочерних тегов корня формы — по корпусу (БП и ERP, 8.3.24, 17036 форм, противоречий нет).
+# Свойства формы пишутся в этом порядке, а не в порядке ввода, — иначе выгрузка из базы их переставит.
+FORM_ROOT_TAG_ORDER = 'Title Width Height WindowOpeningMode EnterKeyBehavior AutoSaveDataInSettings SaveDataInSettings SaveWindowSettings SettingsStorage AutoTitle AutoURL Group HorizontalAlign ChildItemsWidth VerticalAlign HorizontalSpacing VerticalSpacing AutoFillCheck Customizable Enabled ChildrenAlign CommandBarLocation VerticalScroll ScalingMode ConversationsRepresentation MobileDeviceCommandBarContent CommandSet AutoTime UsePostingMode RepostOnWrite ReportResult DetailsData ReportFormType ShowTitle ShowCloseButton GroupList CollapseItemsByImportanceVariant UseForFoldersAndItems VariantAppearance AutoShowState CustomSettingsFolder ReportResultViewMode ViewModeApplicationOnSetReportResult Scale AutoCommandBar Events ChildItems Attributes Commands Parameters CommandInterface BaseForm'
+
+
+# Ранг тега корня формы; незнакомый тег — после всех знакомых свойств (перед AutoCommandBar).
+def get_form_root_rank(tag):
+    order = FORM_ROOT_TAG_ORDER.split(' ')
+    if tag not in order:
+        return order.index('AutoCommandBar') - 0.5
+    return order.index(tag)
+
+
+# Незнакомое событие формы — предупреждение (опечатка в имени события не даёт ошибки платформы).
+def warn_unknown_form_event(name):
+    if name not in KNOWN_FORM_EVENTS:
+        print(f"[WARN] Unknown form event '{name}'. Known: {', '.join(KNOWN_FORM_EVENTS)}")
+
+
 def emit_properties(lines, props, indent):
     if not props:
         return
@@ -6218,7 +7116,7 @@ def emit_properties(lines, props, indent):
             val = 'true' if p_value else 'false'
         else:
             val = str(p_value)
-        lines.append(f'{indent}<{xml_name}>{val}</{xml_name}>')
+        lines.append(f'{indent}<{xml_name}>{esc_xml_text(val)}</{xml_name}>')
 
 
 
@@ -6569,7 +7467,7 @@ def main():
     def _apply_dlist_table_heuristic(el, list_name, has_main_table):
         if not isinstance(el, dict):
             return
-        if el.get('table') is not None and str(el.get('path', '')) == list_name:
+        if el.get('table') is not None and str(el.get('path', '')).lower() == list_name.lower():
             # Маркер дин-список-таблицы → emit_table эмитит блок свойств
             el['_dynList'] = True
             if 'tableAutofill' not in el:
@@ -6691,6 +7589,10 @@ def main():
     for k, v in props_src.items():
         if k != 'title':
             props_clone[k] = v
+    # Шапка корня (свойства, CommandSet, MobileDeviceCommandBarContent) собирается блоками и пишется
+    # в порядке корпуса: свойства из ввода идут вперемешку с CommandSet
+    main_lines = lines
+    lines = []
     emit_properties(lines, props_clone, '\t')
 
     # CommandSet (excluded commands)
@@ -6716,6 +7618,18 @@ def main():
                 lines.append(f'\t\t\t<xr:Value xsi:type="xs:string">{esc_xml_text(str(nm))}</xr:Value>')
             lines.append('\t\t</xr:Item>')
         lines.append('\t</MobileDeviceCommandBarContent>')
+    hdr_blocks = []
+    for ln in '\n'.join(lines).split('\n'):
+        if ln == '':
+            continue
+        m = re.match(r'^\t<([A-Za-z]+)', ln)
+        if m:
+            hdr_blocks.append({'Tag': m.group(1), 'Lines': [ln]})
+        else:
+            hdr_blocks[-1]['Lines'].append(ln)
+    lines = main_lines
+    for b in sorted(hdr_blocks, key=lambda b: get_form_root_rank(b['Tag'])):
+        lines.extend(b['Lines'])
 
     # AutoCommandBar (always present, id=-1)
     acb_autofill = _compute_main_acb_autofill()
@@ -6751,8 +7665,7 @@ def main():
     # Events
     if defn.get('events'):
         for evt_name in defn['events']:
-            if evt_name not in KNOWN_FORM_EVENTS:
-                print(f"[WARN] Unknown form event '{evt_name}'. Known: {', '.join(KNOWN_FORM_EVENTS)}")
+            warn_unknown_form_event(evt_name)
         lines.append('\t<Events>')
         for evt_name, evt_handler in defn['events'].items():
             lines.append(f'\t\t<Event name="{evt_name}">{evt_handler}</Event>')
@@ -6768,11 +7681,11 @@ def main():
     # Attributes
     emit_attributes(lines, defn.get('attributes'), '\t', conditional_appearance=defn.get('conditionalAppearance'))
 
+    # Commands (по корпусу — раньше Parameters)
+    emit_commands(lines, defn.get('commands'), '\t')
+
     # Parameters
     emit_parameters(lines, defn.get('parameters'), '\t')
-
-    # Commands
-    emit_commands(lines, defn.get('commands'), '\t')
 
     # CommandInterface (командный интерфейс формы — последний дочерний Form)
     emit_command_interface(lines, defn.get('commandInterface'), '\t')
@@ -6788,7 +7701,7 @@ def main():
     if out_dir and not os.path.exists(out_dir):
         os.makedirs(out_dir, exist_ok=True)
 
-    content = '\r\n'.join(lines)
+    content = sort_element_tag_order(normalize_enum_tags('\r\n'.join(lines)))
     write_utf8_bom(out_path, content)
 
     # --- 4. Auto-register form in parent object XML ---

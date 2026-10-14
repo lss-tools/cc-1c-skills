@@ -1,4 +1,4 @@
-﻿# db-dump-xml v1.21 — Dump 1C configuration to XML files
+﻿# db-dump-xml v1.24 — Dump 1C configuration to XML files
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 # NB: *nix-раскладку платформы (/opt/1cv8/<ver>/1cv8, без .exe) знает только .py-порт — PS на *nix не исполняется.
 <#
@@ -8,7 +8,7 @@
 .DESCRIPTION
     Выполняет выгрузку конфигурации 1С в файлы в четырёх режимах:
     - Full: полная выгрузка всей конфигурации
-    - Changes: инкрементальная выгрузка изменённых объектов
+    - Changes: инкрементальная выгрузка изменённых объектов (в пустой каталог — полная)
     - Partial: выгрузка конкретных объектов из списка
     - UpdateInfo: обновление только ConfigDumpInfo.xml
 
@@ -122,12 +122,18 @@ param(
     [string[]]$AdditionalIbcmdArguments = @()
 )
 
+# Необработанная ошибка (напр. привязка параметра) внутри try/finally без catch завершала
+# скрипт с кодом 0 — ложный успех без запуска платформы. Любая такая ошибка — код 1.
+# py-порт: необработанное исключение и так даёт код 1.
+trap { Write-Host "Error: $($_.Exception.Message) ($($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber))" -ForegroundColor Red; exit 1 }
+
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# --- Реквизиты хранилища из .v8-project.json ---
-# Модель их не передаёт: скрипт сопоставляет параметры соединения с записью в databases[]
-# и берёт repository оттуда. Тот же приём, что в cf-edit.ps1 (сопоставление по configSrc).
+# --- Запись базы в .v8-project.json ---
+# Модель не передаёт ни путь к платформе конкретной базы, ни реквизиты хранилища: скрипт
+# сопоставляет параметры соединения с записью в databases[] и берёт их оттуда. Тот же приём,
+# что в cf-edit.ps1 (сопоставление по configSrc).
 function Find-V8Project([string]$startDir) {
 	$d = $startDir
 	for ($i = 0; $i -lt 20 -and $d; $i++) {
@@ -395,6 +401,10 @@ Assert-InfoBaseExists $InfoBasePath
 
 # --- Resolve V8Path ---
 function Find-ProjectV8Path {
+    # v8path записи базы сильнее корневого: в одном проекте базы живут на разных версиях
+    # платформы, а версию формата выгрузки задаёт та платформа, которая выгружает.
+    $dbRec = Find-ProjectDatabase
+    if ($dbRec -and $dbRec.v8path) { return [string]$dbRec.v8path }
     $dir = (Get-Location).Path
     while ($dir) {
         $pf = Join-Path $dir ".v8-project.json"
@@ -514,6 +524,32 @@ function Test-DirNonEmpty {
     return (Test-Path $Path -PathType Container) -and ([bool](Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue | Select-Object -First 1))
 }
 
+function Copy-TreeOver {
+    # Скопировать дерево поверх каталога: файлы заменяются, лишнее в приёмнике остаётся —
+    # так пишет полную выгрузку конфигуратор (устаревшие объекты, .git и прочее не трогает).
+    # Через .NET: исключение на первой же ошибке (а не пропуск файла с продолжением), и без
+    # накладных расходов командлетов на десятках тысяч файлов. Пустые каталоги не переносятся.
+    param([string]$From, [string]$To)
+    $root = [System.IO.Path]::GetFullPath($From).TrimEnd('\')
+    $dest = (Resolve-Path -LiteralPath $To).ProviderPath
+    foreach ($f in [System.IO.Directory]::EnumerateFiles($root, '*', [System.IO.SearchOption]::AllDirectories)) {
+        $dst = [System.IO.Path]::Combine($dest, $f.Substring($root.Length + 1))
+        [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($dst))
+        [System.IO.File]::Copy($f, $dst, $true)
+    }
+}
+
+function Write-FormatMismatchHint {
+    # Отказ инкрементальной выгрузки из-за версии формата: каталог выгружен другой платформой.
+    # Тексты: 1cv8 — «версия формата платформы отличается от версии формата выгрузки»,
+    # ibcmd — «Версия формат выгрузки и платформы не совпадают».
+    param([string]$Text)
+    if ($Text -match 'верси\S* формат\S* .{0,40}(отличается|не совпадают)') {
+        Write-Host "[подсказка] Каталог выгружен в другой версии формата. -Mode Full перевыгрузит конфигурацию" -ForegroundColor Yellow
+        Write-Host "  целиком в формате текущей платформы — изменятся все файлы каталога." -ForegroundColor Yellow
+    }
+}
+
 $engine = if ((Split-Path $V8Path -Leaf) -match '^ibcmd') { "ibcmd" } else { "1cv8" }
 
 # --- Resolve additional arguments for the selected engine ---
@@ -562,6 +598,26 @@ if ($Mode -eq "Partial" -and -not $Objects) {
     exit 1
 }
 
+# --- Changes: инкремент ведётся от файла версий прошлой выгрузки ---
+# Без ConfigDumpInfo.xml платформа инкремент отвергает. Выгрузки в каталоге ещё нет (пусто или
+# только .git, README и т.п.) — первая выгрузка, она полная. Выгрузка есть, а файла версий нет —
+# не трогаем: полная выгрузка перепишет её целиком, и это решение пользователя. У -AllExtensions
+# файлы версий лежат в подкаталогах расширений — их проверяет платформа.
+if ($Mode -eq "Changes") {
+    $firstDump = if ($AllExtensions) { -not (Test-DirNonEmpty $ConfigDir) } else {
+        -not (Test-Path -LiteralPath (Join-Path $ConfigDir "ConfigDumpInfo.xml")) -and
+        -not (Test-Path -LiteralPath (Join-Path $ConfigDir "Configuration.xml"))
+    }
+    if ($firstDump) {
+        Write-Host "[note] выгрузки в каталоге ещё нет — первая выгрузка выполняется полностью" -ForegroundColor Yellow
+        $Mode = "Full"
+    } elseif (-not $AllExtensions -and -not (Test-Path -LiteralPath (Join-Path $ConfigDir "ConfigDumpInfo.xml"))) {
+        Write-Host "Error: no ConfigDumpInfo.xml in $ConfigDir — incremental dump (Changes) is impossible" -ForegroundColor Red
+        Write-Host "  -Mode Full выгрузит конфигурацию целиком поверх каталога." -ForegroundColor Yellow
+        exit 1
+    }
+}
+
 # --- Create output dir if needed ---
 if (-not (Test-Path $ConfigDir)) {
     New-Item -ItemType Directory -Path $ConfigDir -Force | Out-Null
@@ -569,7 +625,7 @@ if (-not (Test-Path $ConfigDir)) {
 }
 
 # --- Temp dir ---
-$tempDir = Join-Path $env:TEMP "db_dump_xml_$(Get-Random)"
+$tempDir = Join-Path ([IO.Path]::GetTempPath()) "db_dump_xml_$(Get-Random)"
 New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
 try {
@@ -579,11 +635,23 @@ try {
             Write-Host "Error: ibcmd config export supports hierarchical format only (use -Format Hierarchical or 1cv8)" -ForegroundColor Red
             exit 1
         }
-        if ($AllExtensions) {
-            $arguments = @("infobase", "config", "export", "all-extensions", "$ConfigDir", "--db-path=$InfoBasePath")
-        } elseif ($Mode -eq "UpdateInfo") {
+        # Полный экспорт ibcmd в непустой каталог отказывает («Каталог не пуст»), а конфигуратор
+        # пишет поверх. Чтобы движки вели себя одинаково, такой экспорт идёт во временный каталог
+        # и копируется поверх ConfigDir.
+        if ($AllExtensions -and $Mode -eq "Changes") {
+            Write-Host "[note] ibcmd выгружает все расширения только полностью" -ForegroundColor Yellow
+        }
+        $overlay = ($Mode -ne "Partial") -and ($AllExtensions -or $Mode -eq "Full") -and (Test-DirNonEmpty $ConfigDir)
+        $outDir = if ($overlay) { Join-Path $tempDir "export" } else { $ConfigDir }
+        $dataDir = Join-Path $tempDir "data"
+        New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
+        if ($Mode -eq "UpdateInfo") {
+            # Раньше развилки по -AllExtensions: иначе вместо обновления файла версий ушла бы
+            # полная выгрузка всех расширений.
             Write-Host "Error: ibcmd config export does not support Mode UpdateInfo; use 1cv8" -ForegroundColor Red
             exit 1
+        } elseif ($AllExtensions) {
+            $arguments = @("infobase", "config", "export", "all-extensions", "$outDir", "--db-path=$InfoBasePath")
         } elseif ($Mode -eq "Partial") {
             $objList = @($Objects -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
             $arguments = @("infobase", "config", "export", "objects") + $objList
@@ -592,26 +660,36 @@ try {
         } else {
             $arguments = @("infobase", "config", "export", "--db-path=$InfoBasePath")
             if ($Extension) { $arguments += "--extension=$Extension" }
-            $arguments += "$ConfigDir"
+            # Инкремент — --sync; без --force: при другой версии формата ibcmd честно отказывает.
+            if ($Mode -eq "Changes") { $arguments += "--sync" }
+            $arguments += "$outDir"
         }
         if ($UserName) { $arguments += "--user=$UserName" }
         if ($Password) { $arguments += "--password=$Password" }
-        $arguments += "--data=$tempDir"
+        $arguments += "--data=$dataDir"
         $arguments += $extraArgs
         Write-Host "Running: ibcmd $(Protect-Secrets ((Format-ArgsForDisplay $arguments $engine) -join ' ') @($Password, $UserName))"
         $__ib = Invoke-PlatformProcess $V8Path $arguments
         $output = $__ib.Output
         $exitCode = $__ib.ExitCode
-        $outMissing = ($exitCode -eq 0) -and -not (Test-DirNonEmpty $ConfigDir)
+        $outMissing = ($exitCode -eq 0) -and -not (Test-DirNonEmpty $outDir)
         if ($outMissing) { $exitCode = 1 }
+        $copyError = $null
+        if ($exitCode -eq 0 -and $overlay) {
+            try { Copy-TreeOver $outDir $ConfigDir } catch { $copyError = $_.Exception.Message; $exitCode = 1 }
+        }
         if ($exitCode -eq 0) {
             Write-Host "Configuration exported successfully to: $ConfigDir" -ForegroundColor Green
+        } elseif ($copyError) {
+            Write-Host "Error: export succeeded, but copying it over $ConfigDir failed: $copyError" -ForegroundColor Red
+            Write-Host "  Каталог мог остаться частично обновлённым — повторите выгрузку." -ForegroundColor Yellow
         } elseif ($outMissing) {
             Write-Host "Error: exit code 0 but no files under $ConfigDir — configuration was not exported" -ForegroundColor Red
         } else {
             Write-Host "Error exporting configuration (code: $exitCode)" -ForegroundColor Red
         }
         Write-PlatformOutput $output
+        if ($exitCode -ne 0) { Write-FormatMismatchHint $output }
         exit $exitCode
     }
 
@@ -642,8 +720,8 @@ try {
         }
         "Changes" {
             Write-Host "Executing incremental configuration dump..."
+            # Без -force: с ним при другой версии формата платформа молча выгружает всё заново.
             $arguments += "-update"
-            $arguments += "-force"
         }
         "Partial" {
             Write-Host "Executing partial configuration dump..."
@@ -694,6 +772,7 @@ try {
         Write-Host "Error dumping configuration (code: $exitCode)" -ForegroundColor Red
     }
 
+    $logContent = $null
     if (Test-Path $outFile) {
         $logContent = Get-Content $outFile -Raw -ErrorAction SilentlyContinue
         if ($logContent) {
@@ -703,11 +782,12 @@ try {
         }
     }
     Write-PlatformOutput $__v8.Output
+    if ($exitCode -ne 0) { Write-FormatMismatchHint "$logContent`n$($__v8.Output)" }
 
     exit $exitCode
 
 } finally {
-    if (Test-Path $tempDir) {
+    if ($tempDir -and (Test-Path $tempDir)) {
         Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

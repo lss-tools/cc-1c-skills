@@ -1,4 +1,4 @@
-﻿# skd-compile v1.122 — Compile 1C DCS from JSON (+write_xml_file/write_utf8_bom: общий эталон записи)
+﻿# skd-compile v1.128 — Compile 1C DCS from JSON
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 [CmdletBinding(PositionalBinding=$false)]
 param(
@@ -436,6 +436,14 @@ function Resolve-TypeStr {
 		$typeStr = $typeStr.Substring($typeStr.IndexOf(':') + 1)
 	}
 
+	# Хвосты, которые дописывает вывод meta-info к множествам типов: суффикс обобщённого метатипа
+	# и счётчик состава. Копипаста строки оттуда — обычный путь, поэтому хвост снимаем молча.
+	# Срезаем ТОЛЬКО эти известные формы: круглые скобки заняты параметризованными типами
+	# (Число(15,2)), слепой срез скобок сломал бы их.
+	$typeStr = ($typeStr -replace '\s*\((?:все|all)\)\s*$', '').Trim()
+	$typeStr = ($typeStr -replace '\s*[—-]\s*(?:типов|types):\s*\d+\s*$', '').Trim()
+	$typeStr = ($typeStr -replace '\s*\((?:типов|types):\s*\d+\)\s*$', '').Trim()
+
 	# Параметризованные типы: Number(15,2), Строка(100)
 	if ($typeStr -match '^([^(]+)\((.+)\)$') {
 		$baseName = $Matches[1].Trim()
@@ -466,9 +474,44 @@ function Emit-ValueType {
 
 	if (-not $typeStr) { return }
 
-	# Multi-type: iterate and emit each type with its qualifiers
+	# Составной тип: по XSD TypeDescription сначала все Type, затем TypeSet, затем квалификаторы
+	# (Number, String, Date, BinaryData) — а не «тип со своими квалификаторами» подряд. Каждый тип
+	# пишем во временный буфер и раскладываем строки по разделам; квалификатор вида — один.
 	if ($typeStr -is [array] -or $typeStr -is [System.Collections.IList]) {
-		foreach ($t in $typeStr) { Emit-SingleValueType -typeStr "$t" -indent $indent }
+		$saved = $script:xml
+		$types = New-Object System.Collections.ArrayList
+		$typeSets = New-Object System.Collections.ArrayList
+		$quals = [ordered]@{ 'NumberQualifiers' = $null; 'StringQualifiers' = $null; 'DateQualifiers' = $null; 'BinaryDataQualifiers' = $null }
+		try {
+			foreach ($t in $typeStr) {
+				$script:xml = New-Object System.Text.StringBuilder
+				Emit-SingleValueType -typeStr "$t" -indent $indent
+				$lines = $script:xml.ToString() -split "`r?`n" | Where-Object { $_ -ne '' }
+				$cur = $null
+				foreach ($ln in $lines) {
+					if ($cur) {
+						[void]$cur.Add($ln)
+						if ($ln -eq "$indent</v8:$curKind>") { $cur = $null }
+						continue
+					}
+					if ($ln.StartsWith("$indent<v8:TypeSet")) { [void]$typeSets.Add($ln); continue }
+					$qm = [regex]::Match($ln, '^\s*<v8:(\w+Qualifiers)>$')
+					if ($qm.Success -and $quals.Contains($qm.Groups[1].Value)) {
+						$curKind = $qm.Groups[1].Value
+						$cur = New-Object System.Collections.ArrayList
+						[void]$cur.Add($ln)
+						if ($null -eq $quals[$curKind]) { $quals[$curKind] = $cur }
+						continue
+					}
+					[void]$types.Add($ln)
+				}
+			}
+		} finally {
+			$script:xml = $saved
+		}
+		foreach ($ln in $types) { X $ln }
+		foreach ($ln in $typeSets) { X $ln }
+		foreach ($k in $quals.Keys) { if ($quals[$k]) { foreach ($ln in $quals[$k]) { X $ln } } }
 		return
 	}
 
@@ -1097,6 +1140,85 @@ function Emit-InputParameters {
 	X "$indent</inputParameters>"
 }
 
+# Флаги ограничения использования — в порядке XSD FieldUseRestriction (field condition group order),
+# а не в порядке ввода: чтение по схеме (XDTO) отвергает нарушенный порядок. Имена — XML-имена
+# флагов; дубли (noFilter и noCondition дают один condition) схлопываются.
+function Emit-RestrictionFlags {
+	param([object[]]$names, [string]$indent)
+	$flagOrder = @('field', 'condition', 'group', 'order')
+	$given = @($names | ForEach-Object { "$_" } | Where-Object { $_ })
+	foreach ($n in $flagOrder) {
+		if ($given -contains $n) { X "$indent<$n>true</$n>" }
+	}
+}
+
+# Флаги запрета: DSL-имя → XML-имя. Один разбор и для эмиттеров, и для подбора полей варианта
+# по умолчанию — иначе поле, которому эмиттер запрета не пишет, молча выпадало бы из выбора.
+$script:restrictMap = @{
+	"noField" = "field"; "noFilter" = "condition"; "noCondition" = "condition"
+	"noGroup" = "group"; "noOrder" = "order"
+}
+
+function Resolve-RestrictFlags($tokens) {
+	return ,@(@($tokens) | ForEach-Object { $script:restrictMap["$_"] })
+}
+
+# Запрет в объектной форме поля (набора или вычисляемого): restrict, иначе useRestriction —
+# объект XML-флагов { field, condition, group, order }, массив или строка "#noField #noFilter"
+# (решётка необязательна)
+function Get-ObjectRestrict($o) {
+	$tokens = @()
+	$obj = $null
+	$restrictVal = if ($o.restrict) { $o.restrict } elseif ($o.useRestriction) { $o.useRestriction } else { $null }
+	if ($restrictVal) {
+		if ($restrictVal -is [System.Management.Automation.PSCustomObject] -or $restrictVal -is [hashtable]) {
+			$obj = $restrictVal
+		} elseif ($restrictVal -is [string]) {
+			foreach ($tok in ($restrictVal -split '\s+')) {
+				$t = $tok.Trim().TrimStart('#')
+				if ($t) { $tokens += $t }
+			}
+		} else {
+			foreach ($r in $restrictVal) { $tokens += "$r" }
+		}
+	}
+	return @{ tokens = $tokens; obj = $obj }
+}
+
+# Запрет поля набора: shorthand "Поле #noField" или объектная форма
+function Get-FieldRestrict($fieldDef) {
+	if ($fieldDef -is [string]) { return @{ tokens = @((Parse-FieldShorthand $fieldDef).restrict); obj = $null } }
+	return (Get-ObjectRestrict $fieldDef)
+}
+
+# Запрет вычисляемого поля: shorthand "Имя = Выражение #noField" или объектная форма
+function Get-CalcRestrict($cf) {
+	if ($cf -is [string]) {
+		$parsed = Parse-CalcShorthand $cf
+		$tokens = if ($parsed.restrict) { @($parsed.restrict) } else { @() }
+		return @{ tokens = $tokens; obj = $null }
+	}
+	return (Get-ObjectRestrict $cf)
+}
+
+function Get-RestrictFlagNames($restrict) {
+	$o = $restrict.obj
+	if ($o -is [hashtable]) {
+		return ,@($o.Keys | Where-Object { $o[$_] -eq $true } | ForEach-Object { "$_" })
+	}
+	if ($o) {
+		return ,@($o.PSObject.Properties | Where-Object { $_.Value -eq $true } | ForEach-Object { $_.Name })
+	}
+	return (Resolve-RestrictFlags $restrict.tokens)
+}
+
+# <useRestriction> пишется, только когда есть хотя бы один известный флаг: булево
+# useRestriction: true (форма параметров) или { field: false } не дают пустой пары
+function Test-HasRestrict($restrict) {
+	$names = Get-RestrictFlagNames $restrict
+	return @($names | Where-Object { $_ -in @('field', 'condition', 'group', 'order') }).Count -gt 0
+}
+
 function Emit-Field {
 	param($fieldDef, [string]$indent)
 
@@ -1115,7 +1237,6 @@ function Emit-Field {
 				}
 			} else { "" }
 			roles = @()
-			restrict = @()
 			appearance = [ordered]@{}
 			roleExtras = [ordered]@{}
 		}
@@ -1124,10 +1245,6 @@ function Emit-Field {
 			$parsed = Parse-RoleSpec $fieldDef.role
 			$f.roles = $parsed.tokens
 			$f.roleExtras = $parsed.extras
-		}
-		# Parse restrictions
-		if ($fieldDef.restrict) {
-			$f.restrict = @($fieldDef.restrict)
 		}
 		# Parse appearance (сохраняем значение как есть — может быть string или multilang dict)
 		if ($fieldDef.appearance) {
@@ -1179,30 +1296,17 @@ function Emit-Field {
 	}
 
 	# UseRestriction
-	$restrictMap = @{
-		"noField" = "field"; "noFilter" = "condition"; "noCondition" = "condition"
-		"noGroup" = "group"; "noOrder" = "order"
-	}
-	if ($f.restrict.Count -gt 0) {
+	$restrict = Get-FieldRestrict $fieldDef
+	if (Test-HasRestrict $restrict) {
 		X "$indent`t<useRestriction>"
-		foreach ($r in $f.restrict) {
-			$xmlName = $restrictMap["$r"]
-			if ($xmlName) {
-				X "$indent`t`t<$xmlName>true</$xmlName>"
-			}
-		}
+		Emit-RestrictionFlags -names (Get-RestrictFlagNames $restrict) -indent "$indent`t`t"
 		X "$indent`t</useRestriction>"
 	}
 
 	# AttributeUseRestriction
 	if ($f["attrRestrict"] -and $f["attrRestrict"].Count -gt 0) {
 		X "$indent`t<attributeUseRestriction>"
-		foreach ($r in $f["attrRestrict"]) {
-			$xmlName = $restrictMap["$r"]
-			if ($xmlName) {
-				X "$indent`t`t<$xmlName>true</$xmlName>"
-			}
-		}
+		Emit-RestrictionFlags -names (Resolve-RestrictFlags $f["attrRestrict"]) -indent "$indent`t`t"
 		X "$indent`t</attributeUseRestriction>"
 	}
 
@@ -1229,7 +1333,12 @@ function Emit-Field {
 		X "$indent`t</role>"
 	}
 
-	# OrderExpression — после role, до valueType. Допустим массив (multi-sort).
+	# PresentationExpression — сразу после role, до orderExpression (порядок XSD DataSetFieldField)
+	if ($f["presentationExpression"]) {
+		X "$indent`t<presentationExpression>$(Esc-XmlText $f["presentationExpression"])</presentationExpression>"
+	}
+
+	# OrderExpression — после presentationExpression, до valueType. Допустим массив (multi-sort).
 	if ($f["orderExpression"]) {
 		$oeRaw = $f["orderExpression"]
 		if ($oeRaw -is [System.Collections.IDictionary]) {
@@ -1258,27 +1367,6 @@ function Emit-Field {
 		X "$indent`t</valueType>"
 	}
 
-	# AvailableValues — list of allowed values with optional multilang presentation
-	if ($f["availableValues"]) {
-		foreach ($av in $f["availableValues"]) {
-			X "$indent`t<availableValue>"
-			$avVal = $av.value
-			$avType = if ($av.valueType) { "$($av.valueType)" } else { '' }
-			if (-not $avType) {
-				if ($avVal -is [bool]) { $avType = 'xs:boolean' }
-				elseif ($avVal -is [int] -or $avVal -is [long] -or $avVal -is [double]) { $avType = 'xs:decimal' }
-				elseif ("$avVal" -match '^\d{4}-\d{2}-\d{2}T') { $avType = 'xs:dateTime' }
-				else { $avType = 'xs:string' }
-			}
-			$avStr = if ($avVal -is [bool]) { "$avVal".ToLower() } else { Esc-XmlText "$avVal" }
-			X "$indent`t`t<value xsi:type=`"$avType`">$avStr</value>"
-			if ($av.presentation) {
-				Emit-MLText -tag "presentation" -text $av.presentation -indent "$indent`t`t"
-			}
-			X "$indent`t</availableValue>"
-		}
-	}
-
 	# Appearance
 	if ($f.appearance -and $f.appearance.Count -gt 0) {
 		X "$indent`t<appearance>"
@@ -1297,9 +1385,25 @@ function Emit-Field {
 		X "$indent`t</appearance>"
 	}
 
-	# PresentationExpression
-	if ($f["presentationExpression"]) {
-		X "$indent`t<presentationExpression>$(Esc-XmlText $f["presentationExpression"])</presentationExpression>"
+	# AvailableValues — после appearance (порядок XSD); список значений с необязательным представлением
+	if ($f["availableValues"]) {
+		foreach ($av in $f["availableValues"]) {
+			X "$indent`t<availableValue>"
+			$avVal = $av.value
+			$avType = if ($av.valueType) { "$($av.valueType)" } else { '' }
+			if (-not $avType) {
+				if ($avVal -is [bool]) { $avType = 'xs:boolean' }
+				elseif ($avVal -is [int] -or $avVal -is [long] -or $avVal -is [double]) { $avType = 'xs:decimal' }
+				elseif ("$avVal" -match '^\d{4}-\d{2}-\d{2}T') { $avType = 'xs:dateTime' }
+				else { $avType = 'xs:string' }
+			}
+			$avStr = if ($avVal -is [bool]) { "$avVal".ToLower() } else { Esc-XmlText "$avVal" }
+			X "$indent`t`t<value xsi:type=`"$avType`">$avStr</value>"
+			if ($av.presentation) {
+				Emit-MLText -tag "presentation" -text $av.presentation -indent "$indent`t`t"
+			}
+			X "$indent`t</availableValue>"
+		}
 	}
 
 	# InputParameters — в конце field
@@ -1396,19 +1500,14 @@ function Emit-DataSetLinks {
 # === CalculatedFields ===
 function Emit-CalcFields {
 	if (-not $def.calculatedFields) { return }
-	$restrictMap = @{
-		"noField" = "field"; "noFilter" = "condition"; "noCondition" = "condition"
-		"noGroup" = "group"; "noOrder" = "order"
-	}
 	foreach ($cf in $def.calculatedFields) {
 		# Collect dataPath/expression/title/type/restrict/appearance from either
 		# shorthand string or object form. Object form accepts dataPath/field/name
 		# as synonyms; useRestriction/restrict accepts object, array, or flag string.
 		$title = ""
 		$typeStr = ""
-		$restrictTokens = @()
-		$restrictObj = $null
 		$appearance = $null
+		$restrict = Get-CalcRestrict $cf
 
 		if ($cf -is [string]) {
 			$parsed = Parse-CalcShorthand $cf
@@ -1416,7 +1515,6 @@ function Emit-CalcFields {
 			$expression = "$($parsed.expression)"
 			$title = $parsed.title
 			$typeStr = "$($parsed.type)"
-			if ($parsed.restrict) { $restrictTokens = @($parsed.restrict) }
 		} else {
 			$dataPath = if ($cf.dataPath) { "$($cf.dataPath)" }
 				elseif ($cf.field) { "$($cf.field)" }
@@ -1424,22 +1522,6 @@ function Emit-CalcFields {
 			$expression = "$($cf.expression)"
 			if ($cf.title) { $title = $cf.title }
 			if ($cf.type) { $typeStr = Resolve-TypeStr "$($cf.type)" }
-
-			$restrictVal = if ($cf.restrict) { $cf.restrict } elseif ($cf.useRestriction) { $cf.useRestriction } else { $null }
-			if ($restrictVal) {
-				if ($restrictVal -is [System.Management.Automation.PSCustomObject] -or $restrictVal -is [hashtable]) {
-					$restrictObj = $restrictVal
-				} elseif ($restrictVal -is [string]) {
-					# Flag-string form: "#noField #noFilter #noGroup #noOrder" (or without `#`)
-					foreach ($tok in ($restrictVal -split '\s+')) {
-						$t = $tok.Trim().TrimStart('#')
-						if ($t) { $restrictTokens += $t }
-					}
-				} else {
-					# Array form: ["noField", "noFilter", ...]
-					foreach ($r in $restrictVal) { $restrictTokens += "$r" }
-				}
-			}
 			if ($cf.appearance) { $appearance = $cf.appearance }
 		}
 
@@ -1450,25 +1532,9 @@ function Emit-CalcFields {
 		if ($title) {
 			Emit-MLText -tag "title" -text $title -indent "`t`t"
 		}
-		if ($typeStr) {
-			X "`t`t<valueType>"
-			Emit-ValueType -typeStr $typeStr -indent "`t`t`t"
-			X "`t`t</valueType>"
-		}
-		if ($restrictObj -or $restrictTokens.Count -gt 0) {
+		if (Test-HasRestrict $restrict) {
 			X "`t`t<useRestriction>"
-			if ($restrictObj) {
-				foreach ($prop in $restrictObj.PSObject.Properties) {
-					if ($prop.Value -eq $true) {
-						X "`t`t`t<$($prop.Name)>true</$($prop.Name)>"
-					}
-				}
-			} else {
-				foreach ($r in $restrictTokens) {
-					$xmlName = $restrictMap["$r"]
-					if ($xmlName) { X "`t`t`t<$xmlName>true</$xmlName>" }
-				}
-			}
+			Emit-RestrictionFlags -names (Get-RestrictFlagNames $restrict) -indent "`t`t`t"
 			X "`t`t</useRestriction>"
 		}
 		if ($appearance) {
@@ -1485,6 +1551,12 @@ function Emit-CalcFields {
 				}
 			}
 			X "`t`t</appearance>"
+		}
+		# valueType — последним: после useRestriction и appearance (порядок XSD CalculatedField)
+		if ($typeStr) {
+			X "`t`t<valueType>"
+			Emit-ValueType -typeStr $typeStr -indent "`t`t`t"
+			X "`t`t</valueType>"
 		}
 
 		X "`t</calculatedField>"
@@ -1784,7 +1856,8 @@ function Emit-ParamValue {
 			if ($val.Contains('endDate'))   { $edStr = "$($val['endDate'])" }
 		}
 	}
-	$valStr = if ($variantStr) { $variantStr } else { "$val" }
+	# JSON-булево: "$val" даёт True/False, а xs:boolean — только true/false/1/0
+	$valStr = if ($variantStr) { $variantStr } elseif ($val -is [bool]) { "$val".ToLower() } else { "$val" }
 
 	if ($type -eq "StandardPeriod") {
 		# Platform-pattern: startDate/endDate эмитятся ТОЛЬКО для variant=Custom.
@@ -1801,7 +1874,7 @@ function Emit-ParamValue {
 	} elseif ($type -match '^date') {
 		X "$indent<value xsi:type=`"xs:dateTime`">$(Esc-XmlText $valStr)</value>"
 	} elseif ($type -eq "boolean") {
-		X "$indent<value xsi:type=`"xs:boolean`">$(Esc-XmlText $valStr)</value>"
+		X "$indent<value xsi:type=`"xs:boolean`">$(Esc-XmlText $valStr.ToLower())</value>"
 	} elseif ($type -match '^decimal') {
 		X "$indent<value xsi:type=`"xs:decimal`">$(Esc-XmlText $valStr)</value>"
 	} elseif ($type -match '^string') {
@@ -1813,7 +1886,7 @@ function Emit-ParamValue {
 		if ($valStr -match '^\d{4}-\d{2}-\d{2}T') {
 			X "$indent<value xsi:type=`"xs:dateTime`">$(Esc-XmlText $valStr)</value>"
 		} elseif ($valStr -eq "true" -or $valStr -eq "false") {
-			X "$indent<value xsi:type=`"xs:boolean`">$(Esc-XmlText $valStr)</value>"
+			X "$indent<value xsi:type=`"xs:boolean`">$(Esc-XmlText $valStr.ToLower())</value>"
 		} elseif ($valStr -match '^(ПланСчетов|Справочник|Перечисление|Документ|ПланВидовХарактеристик|ПланВидовРасчета|БизнесПроцесс|Задача|РегистрСведений|ПланОбмена)\.' -or $valStr -match '^(ChartOfAccounts|Catalog|Enum|Document|ChartOfCharacteristicTypes|ChartOfCalculationTypes|BusinessProcess|Task|InformationRegister|ExchangePlan)\.') {
 			X "$indent<value xsi:type=`"dcscor:DesignTimeValue`">$(Esc-XmlText $valStr)</value>"
 		} else {
@@ -2676,6 +2749,7 @@ function Emit-AppearanceValue {
 			} else {
 				if ($innerVal.Contains($attrName)) { $av = $innerVal[$attrName] }
 			}
+			if ($av -is [bool]) { $av = "$av".ToLower() }
 			if ($null -ne $av) { $attrParts += "$attrName=`"$(Esc-Xml "$av")`"" }
 		}
 		X "$indent`t<dcscor:value xsi:type=`"v8ui:Font`" $($attrParts -join ' ')/>"
@@ -2683,7 +2757,8 @@ function Emit-AppearanceValue {
 		# Multilang dict ({"ru": "...", "en": "..."}) → LocalStringType независимо от ключа.
 		Emit-MLText -tag "dcscor:value" -text $innerVal -indent "$indent`t"
 	} else {
-		$actualVal = "$innerVal"
+		# JSON-булево: "$innerVal" даёт True/False, а xs:boolean — только true/false
+		$actualVal = if ($innerVal -is [bool]) { "$innerVal".ToLower() } else { "$innerVal" }
 		# Параметр-специфичный тип для известных appearance keys
 		$keyTypeMap = @{
 			'Размещение'           = 'dcscor:DataCompositionTextPlacementType'
@@ -2701,7 +2776,7 @@ function Emit-AppearanceValue {
 			# локальный xmlns не нужен — эмитим short form.
 			X "$indent`t<dcscor:value xsi:type=`"v8ui:Color`">$(Esc-XmlText $actualVal)</dcscor:value>"
 		} elseif ($actualVal -eq "true" -or $actualVal -eq "false") {
-			X "$indent`t<dcscor:value xsi:type=`"xs:boolean`">$actualVal</dcscor:value>"
+			X "$indent`t<dcscor:value xsi:type=`"xs:boolean`">$($actualVal.ToLower())</dcscor:value>"
 		} elseif ($key -eq "Текст" -or $key -eq "Заголовок" -or $key -eq "Формат") {
 			# Строковые ключи, традиционно эмитятся как LocalStringType (даже если только ru).
 			Emit-MLText -tag "dcscor:value" -text $actualVal -indent "$indent`t"
@@ -2871,10 +2946,11 @@ function Emit-OutputParametersSubItem {
 	X "$indent`t`t<dcscor:item xsi:type=`"dcsset:SettingsParameterValue`">"
 	if ($subUseFalse) { X "$indent`t`t`t<dcscor:use>false</dcscor:use>" }
 	X "$indent`t`t`t<dcscor:parameter>$(Esc-XmlText $subName)</dcscor:parameter>"
+	$subStr = if ($subVal -is [bool]) { "$subVal".ToLower() } else { "$subVal" }
 	if ($subUri) {
-		X "$indent`t`t`t<dcscor:value xmlns:dN=`"$subUri`" xsi:type=`"dN:$subLocalName`">$(Esc-XmlText "$subVal")</dcscor:value>"
+		X "$indent`t`t`t<dcscor:value xmlns:dN=`"$subUri`" xsi:type=`"dN:$subLocalName`">$(Esc-XmlText $subStr)</dcscor:value>"
 	} else {
-		X "$indent`t`t`t<dcscor:value xsi:type=`"$subVT`">$(Esc-XmlText "$subVal")</dcscor:value>"
+		X "$indent`t`t`t<dcscor:value xsi:type=`"$subVT`">$(Esc-XmlText $subStr)</dcscor:value>"
 	}
 	X "$indent`t`t</dcscor:item>"
 }
@@ -2948,13 +3024,16 @@ function Emit-OutputParameters {
 				} else {
 					if ($rawVal.Contains($attrName)) { $av = $rawVal[$attrName] }
 				}
+				if ($av -is [bool]) { $av = "$av".ToLower() }
 				if ($null -ne $av) { $attrParts += "$attrName=`"$(Esc-Xml "$av")`"" }
 			}
 			X "$indent`t`t<dcscor:value xsi:type=`"v8ui:Font`" $($attrParts -join ' ')/>"
 		} elseif ($ptype -eq "mltext") {
 			Emit-MLText -tag "dcscor:value" -text $rawVal -indent "$indent`t`t"
 		} else {
-			X "$indent`t`t<dcscor:value xsi:type=`"$ptype`">$(Esc-XmlText "$rawVal")</dcscor:value>"
+			# JSON-булево: "$rawVal" даёт True/False, а xs:boolean — только true/false
+			$rawStr = if ($rawVal -is [bool]) { "$rawVal".ToLower() } else { "$rawVal" }
+			X "$indent`t`t<dcscor:value xsi:type=`"$ptype`">$(Esc-XmlText $rawStr)</dcscor:value>"
 		}
 		# Nested sub-параметры (ТипДиаграммы.ВидПодписей и т.п.) — эмитим между value и extras.
 		# valueType: строка → xsi:type=string, объект {uri, name} → локальный xmlns:dN + xsi:type=dN:name.
@@ -3352,14 +3431,15 @@ function Emit-StructureItem {
 		# Платформа на группировке (плоской и вложенной в ось, short/explicit) всегда пишет
 		# order+selection; при отсутствии ключа кладёт Auto. Ключ присутствует (в т.ч. пустой [])
 		# — уважаем как задано (blockViewMode/userSettingID имеют смысл только при явном order).
+		# filter — до order/selection (порядок XSD StructureItemGroup: groupItems filter order selection)
+		Emit-Filter -items $item.filter -indent "$indent`t"
+
 		$hasGrpOrderKey = $item.PSObject.Properties.Match('order').Count -gt 0
 		$grpOrderItems = if ($hasGrpOrderKey) { $item.order } else { @('Auto') }
 		Emit-Order -items $grpOrderItems -indent "$indent`t" -blockViewMode $item.orderViewMode -blockUserSettingID $item.orderUserSettingID
 		$hasGrpSelKey = $item.PSObject.Properties.Match('selection').Count -gt 0
 		$grpSelItems = if ($hasGrpSelKey) { $item.selection } else { @('Auto') }
 		Emit-Selection -items $grpSelItems -indent "$indent`t"
-
-		Emit-Filter -items $item.filter -indent "$indent`t"
 
 		if ($item.conditionalAppearance) {
 			Emit-ConditionalAppearance -items $item.conditionalAppearance -indent "$indent`t"
@@ -3439,13 +3519,6 @@ function Emit-StructureItem {
 		if ($item.outputParameters) {
 			Emit-OutputParameters -params $item.outputParameters -indent "$indent`t"
 		}
-		# columnsViewMode / rowsViewMode — axis-level режим доступности (после rows/columns)
-		if ($item.columnsViewMode) {
-			X "$indent`t<dcsset:columnsViewMode>$(Esc-XmlText "$($item.columnsViewMode)")</dcsset:columnsViewMode>"
-		}
-		if ($item.rowsViewMode) {
-			X "$indent`t<dcsset:rowsViewMode>$(Esc-XmlText "$($item.rowsViewMode)")</dcsset:rowsViewMode>"
-		}
 		# viewMode / userSettingID / userSettingPresentation / itemsViewMode на самой таблице
 		if ($item.viewMode) {
 			X "$indent`t<dcsset:viewMode>$(Esc-XmlText "$($item.viewMode)")</dcsset:viewMode>"
@@ -3456,6 +3529,13 @@ function Emit-StructureItem {
 		}
 		if ($item.userSettingPresentation) {
 			Emit-MLText -tag "dcsset:userSettingPresentation" -text $item.userSettingPresentation -indent "$indent`t"
+		}
+		# columnsViewMode / rowsViewMode — axis-level режим доступности: после viewMode/userSettingID (порядок XSD и платформы)
+		if ($item.columnsViewMode) {
+			X "$indent`t<dcsset:columnsViewMode>$(Esc-XmlText "$($item.columnsViewMode)")</dcsset:columnsViewMode>"
+		}
+		if ($item.rowsViewMode) {
+			X "$indent`t<dcsset:rowsViewMode>$(Esc-XmlText "$($item.rowsViewMode)")</dcsset:rowsViewMode>"
 		}
 		if ($item.itemsViewMode) {
 			X "$indent`t<dcsset:itemsViewMode>$(Esc-XmlText "$($item.itemsViewMode)")</dcsset:itemsViewMode>"
@@ -3521,13 +3601,6 @@ function Emit-StructureItem {
 			Emit-OutputParameters -params $item.outputParameters -indent "$indent`t"
 		}
 
-		# pointsViewMode / seriesViewMode — axis-level режим доступности (после points/series)
-		if ($item.pointsViewMode) {
-			X "$indent`t<dcsset:pointsViewMode>$(Esc-XmlText "$($item.pointsViewMode)")</dcsset:pointsViewMode>"
-		}
-		if ($item.seriesViewMode) {
-			X "$indent`t<dcsset:seriesViewMode>$(Esc-XmlText "$($item.seriesViewMode)")</dcsset:seriesViewMode>"
-		}
 		# viewMode / userSettingID / userSettingPresentation / itemsViewMode на самой диаграмме
 		if ($item.viewMode) {
 			X "$indent`t<dcsset:viewMode>$(Esc-XmlText "$($item.viewMode)")</dcsset:viewMode>"
@@ -3538,6 +3611,13 @@ function Emit-StructureItem {
 		}
 		if ($item.userSettingPresentation) {
 			Emit-MLText -tag "dcsset:userSettingPresentation" -text $item.userSettingPresentation -indent "$indent`t"
+		}
+		# pointsViewMode / seriesViewMode — axis-level режим доступности: после viewMode/userSettingID (порядок XSD и платформы)
+		if ($item.pointsViewMode) {
+			X "$indent`t<dcsset:pointsViewMode>$(Esc-XmlText "$($item.pointsViewMode)")</dcsset:pointsViewMode>"
+		}
+		if ($item.seriesViewMode) {
+			X "$indent`t<dcsset:seriesViewMode>$(Esc-XmlText "$($item.seriesViewMode)")</dcsset:seriesViewMode>"
 		}
 		if ($item.itemsViewMode) {
 			X "$indent`t<dcsset:itemsViewMode>$(Esc-XmlText "$($item.itemsViewMode)")</dcsset:itemsViewMode>"
@@ -3562,38 +3642,191 @@ function Emit-StructureItem {
 	}
 }
 
-function Emit-SettingsVariants {
-	$variants = $def.settingsVariants
+# --- Достройка настроек варианта ---
+# Чего нет в определении (ключа нет) — достраиваем и сообщаем подсказкой; что задано, даже
+# пустым ([] / ["Auto"]), — решение автора, не трогаем. Корневой Auto раскрывать не из чего:
+# вариант без явных полей выводит пустой отчёт (#115).
 
-	# Default variant if none specified
-	if (-not $variants -or $variants.Count -eq 0) {
-		$variants = @(@{
-			name = "Основной"
-			presentation = "Основной"
-			settings = @{
-				selection = @("Auto")
-				structure = @(@{
-					type = "group"
-					order = @("Auto")
-					selection = @("Auto")
-				})
+$script:hints = New-Object System.Collections.Generic.List[string]
+
+# Объявленные поля набора; у объединения без своих полей — поля его частей
+function Get-DatasetDeclaredFields($ds) {
+	if (-not $ds) { return ,@() }
+	if ($ds.fields) { return ,@($ds.fields) }
+	$acc = @()
+	foreach ($it in @($ds.items)) { if ($it) { $acc += Get-DatasetDeclaredFields $it } }
+	return ,$acc
+}
+
+# Поля для выбора по умолчанию: объявленные поля наборов верхнего уровня, затем вычисляемые.
+# Без запрета на выбор и папок; путь с точкой — реквизит, если перед точкой не объявленная папка
+# (поля папки — «Папка.Поле»); повторы — по dataPath. Возвращает поля и признак «что-то объявлено».
+function Get-DefaultSelectionFields {
+	$result = New-Object System.Collections.Generic.List[string]
+	$seen = @{}
+	# Путь с точкой — реквизит, если перед точкой не объявленная папка: поля папки — «Папка.Поле»
+	$folders = @{}
+	foreach ($ds in @($def.dataSets)) {
+		foreach ($fd in (Get-DatasetDeclaredFields $ds)) {
+			if ($fd -and $fd -isnot [string] -and $fd.folder -eq $true) {
+				$fp = if ($fd.dataPath) { "$($fd.dataPath)" } else { "$($fd.field)" }
+				if ($fp) { $folders[$fp] = $true }
 			}
-		})
-		# Convert to PSCustomObject-like structure
-		$variants = @($variants | ForEach-Object {
-			$v = New-Object PSObject
-			$v | Add-Member -NotePropertyName "name" -NotePropertyValue $_.name
-			$v | Add-Member -NotePropertyName "presentation" -NotePropertyValue $_.presentation
-			$settingsObj = New-Object PSObject
-			$settingsObj | Add-Member -NotePropertyName "selection" -NotePropertyValue $_.settings.selection
-			$structItem = New-Object PSObject
-			$structItem | Add-Member -NotePropertyName "type" -NotePropertyValue "group"
-			$structItem | Add-Member -NotePropertyName "order" -NotePropertyValue @("Auto")
-			$structItem | Add-Member -NotePropertyName "selection" -NotePropertyValue @("Auto")
-			$settingsObj | Add-Member -NotePropertyName "structure" -NotePropertyValue @($structItem)
-			$v | Add-Member -NotePropertyName "settings" -NotePropertyValue $settingsObj
-			$v
-		})
+		}
+	}
+	$declared = $false
+	$add = {
+		param([string]$dp)
+		if (-not $dp) { return }
+		$dot = $dp.LastIndexOf('.')
+		if ($dot -ge 0 -and -not $folders.ContainsKey($dp.Substring(0, $dot))) { return }
+		if (-not $seen.ContainsKey($dp)) { $seen[$dp] = $true; $result.Add($dp) }
+	}
+	foreach ($ds in @($def.dataSets)) {
+		foreach ($fd in (Get-DatasetDeclaredFields $ds)) {
+			if ($null -eq $fd) { continue }
+			$declared = $true
+			if ((Get-RestrictFlagNames (Get-FieldRestrict $fd)) -contains 'field') { continue }
+			if ($fd -is [string]) {
+				& $add "$((Parse-FieldShorthand $fd).dataPath)"
+			} else {
+				if ($fd.folder -eq $true) { continue }
+				$dp = if ($fd.dataPath) { "$($fd.dataPath)" } else { "$($fd.field)" }
+				& $add $dp
+			}
+		}
+	}
+	foreach ($cf in @($def.calculatedFields)) {
+		if ($null -eq $cf) { continue }
+		$declared = $true
+		if ((Get-RestrictFlagNames (Get-CalcRestrict $cf)) -contains 'field') { continue }
+		if ($cf -is [string]) {
+			& $add "$((Parse-CalcShorthand $cf).dataPath)"
+		} else {
+			$dp = if ($cf.dataPath) { "$($cf.dataPath)" } elseif ($cf.field) { "$($cf.field)" } else { "$($cf.name)" }
+			& $add $dp
+		}
+	}
+	return @{ fields = $result.ToArray(); declared = $declared }
+}
+
+function New-DetailsGroup {
+	$g = New-Object PSObject
+	$g | Add-Member -NotePropertyName "type" -NotePropertyValue "group"
+	$g | Add-Member -NotePropertyName "order" -NotePropertyValue @("Auto")
+	$g | Add-Member -NotePropertyName "selection" -NotePropertyValue @("Auto")
+	return $g
+}
+
+function Format-HintList([string[]]$items) {
+	if ($items.Count -le 8) { return ($items -join ', ') }
+	return (($items[0..7] -join ', ') + " и ещё $($items.Count - 8)")
+}
+
+function Test-SelectionHasFields($items) {
+	foreach ($it in @($items)) {
+		if ($null -eq $it) { continue }
+		if ($it -is [string]) { if ($it -ne 'Auto') { return $true }; continue }
+		# Папка — как её выводит эмиттер: use у папки не пишется, собственное field выводится
+		if (Has-JsonProp $it 'folder') {
+			if ($it.field -or (Test-SelectionHasFields $it.items)) { return $true }
+			continue
+		}
+		if ($it.use -eq $false -or $it.auto -eq $true) { continue }
+		if ($it.field) { return $true }
+	}
+	return $false
+}
+
+# Группировки, у которых выбор пуст по всей цепочке до корня (Auto наследует выбор родителя).
+# Явный [] у группировки — решение автора, ветку не проверяем. Таблицы и диаграммы не обходим.
+function Find-GroupsWithoutFields($items, [bool]$inherited, $out) {
+	foreach ($it in @($items)) {
+		if ($null -eq $it) { continue }
+		$type = if ($it.type) { "$($it.type)" } else { "group" }
+		if ($type -ne 'group' -or $it.use -eq $false) { continue }
+		$own = $false
+		if (Has-JsonProp $it 'selection') {
+			if (@($it.selection).Count -eq 0) { continue }
+			$own = Test-SelectionHasFields $it.selection
+		}
+		$eff = $inherited -or $own
+		if (-not $eff) {
+			$gb = if ($it.groupBy) { $it.groupBy } else { $it.groupFields }
+			$names = @(@($gb) | Where-Object { $null -ne $_ } | ForEach-Object { if ($_ -is [string]) { $_ } else { "$($_.field)" } })
+			$out.Add($names -join ', ')
+		}
+		if ($it.children) { Find-GroupsWithoutFields $it.children $eff $out }
+	}
+}
+
+function Complete-VariantSettings($v, [bool]$autoVariant) {
+	$s = $v.settings
+	$noSettings = $null -eq $s
+	if ($noSettings) { $s = New-Object PSObject }
+	$hasSel = Has-JsonProp $s 'selection'
+	$hasStruct = Has-JsonProp $s 'structure'
+	$vn = "$($v.name)"
+
+	if (-not $hasSel -and -not $hasStruct) {
+		$picked = Get-DefaultSelectionFields
+		$fields = $picked.fields
+		$s | Add-Member -NotePropertyName "selection" -NotePropertyValue $fields -Force
+		$s | Add-Member -NotePropertyName "structure" -NotePropertyValue @(New-DetailsGroup) -Force
+		if ($autoVariant) {
+			$head = "Вариант «$vn» создан автоматически, потому что в определении нет settingsVariants"
+			$target = 'settingsVariants'
+		} elseif ($noSettings) {
+			$head = "Вариант «$vn»: настройки достроены автоматически, потому что у варианта нет settings"
+			$target = 'settings.selection и settings.structure этого варианта'
+		} else {
+			$head = "Вариант «$vn»: настройки достроены автоматически, потому что в settings нет selection и structure"
+			$target = 'settings.selection и settings.structure этого варианта'
+		}
+		if ($fields.Count -gt 0) {
+			$script:hints.Add("[INFO] $head. Выбранные поля — $(Format-HintList $fields); структура — детальные записи (details). Если по задаче отчёту нужны другие поля или группировки — опишите $target и скомпилируйте заново; иначе действий не требуется.")
+		} else {
+			$fix = if ($autoVariant) { 'опишите settingsVariants и перечислите нужные поля в settings.selection' } else { 'перечислите нужные поля в settings.selection' }
+			$why = if ($picked.declared) { 'все объявленные поля исключены — с запретом на выбор, папки или реквизиты через точку' } else { 'в наборах данных не объявлены fields' }
+			$script:hints.Add("[WARN] $head, но выбранные поля подставить не из чего: $why. Без выбранных полей отчёт будет пустым — $fix.")
+		}
+	} elseif ($hasSel -and -not $hasStruct) {
+		$s | Add-Member -NotePropertyName "structure" -NotePropertyValue @(New-DetailsGroup) -Force
+		if (Test-SelectionHasFields $s.selection) {
+			$script:hints.Add("[INFO] Вариант «$vn»: в settings нет structure — добавлены детальные записи (details), отчёт выведет выбранные поля построчно. Если по задаче нужны группировки с итогами — опишите settings.structure; иначе действий не требуется.")
+		} else {
+			$script:hints.Add("[WARN] Вариант «$vn»: в settings нет structure — добавлены детальные записи (details), но в settings.selection нет ни одного поля — отчёт будет пустым. Перечислите нужные поля в settings.selection.")
+		}
+	} elseif ($hasStruct -and -not $hasSel) {
+		$structItems = $s.structure
+		if ($structItems -is [string]) { $structItems = Parse-StructureShorthand $structItems }
+		$found = New-Object System.Collections.Generic.List[string]
+		Find-GroupsWithoutFields $structItems $false $found
+		if ($found.Count -gt 0) {
+			$labels = @($found | ForEach-Object { if ($_) { "«$_»" } else { '«детальные записи (details)»' } })
+			$groupCols = @($found | Where-Object { $_ })
+			$hasDetails = @($found | Where-Object { -not $_ }).Count -gt 0
+			$who = if ($labels.Count -eq 1) { "у группировки $($labels[0])" } else { "у группировок $($labels -join ', ')" }
+			if ($groupCols.Count -gt 0) {
+				$tail = if ($hasDetails) { 'ресурсы, другие поля и детальные записи не выведутся' } else { 'ресурсы и другие поля не выведутся' }
+				$effect = "в отчёте будут только колонки группировок ($($groupCols -join ', ')), $tail"
+			} else {
+				$effect = 'отчёт будет пустым'
+			}
+			$script:hints.Add("[WARN] Вариант «$vn»: в settings нет selection, и $who выбранных полей тоже нет — $effect. Перечислите нужные поля в settings.selection.")
+		}
+	}
+	return $s
+}
+
+function Emit-SettingsVariants {
+	$variants = @($def.settingsVariants | Where-Object { $null -ne $_ })
+	$autoVariant = $variants.Count -eq 0
+	if ($autoVariant) {
+		$v = New-Object PSObject
+		$v | Add-Member -NotePropertyName "name" -NotePropertyValue "Основной"
+		$v | Add-Member -NotePropertyName "presentation" -NotePropertyValue "Основной"
+		$variants = @($v)
 	}
 
 	foreach ($v in $variants) {
@@ -3605,7 +3838,7 @@ function Emit-SettingsVariants {
 
 		X "`t`t<dcsset:settings xmlns:style=`"http://v8.1c.ru/8.1/data/ui/style`" xmlns:sys=`"http://v8.1c.ru/8.1/data/ui/fonts/system`" xmlns:web=`"http://v8.1c.ru/8.1/data/ui/colors/web`" xmlns:win=`"http://v8.1c.ru/8.1/data/ui/colors/windows`">"
 
-		$s = $v.settings
+		$s = Complete-VariantSettings $v $autoVariant
 
 		# Helper: resolve XViewMode/XUserSettingID from settings — emit only if explicitly set
 		function Get-BlockVM([string]$key) {
@@ -3637,24 +3870,7 @@ function Emit-SettingsVariants {
 			Emit-Filter -items $s.filter -indent "`t`t`t" -blockViewMode $fvm -blockUserSettingID $fusid
 		}
 
-		# Order
-		$ovm = Get-BlockVM 'order';  $ousid = Get-BlockUSID 'order'
-		if ($s.order -or $null -ne $ovm -or $null -ne $ousid) {
-			Emit-Order -items $s.order -indent "`t`t`t" -blockViewMode $ovm -blockUserSettingID $ousid
-		}
-
-		# ConditionalAppearance
-		$cavm = Get-BlockVM 'conditionalAppearance';  $causid = Get-BlockUSID 'conditionalAppearance'
-		if ($s.conditionalAppearance -or $null -ne $cavm -or $null -ne $causid) {
-			Emit-ConditionalAppearance -items $s.conditionalAppearance -indent "`t`t`t" -blockViewMode $cavm -blockUserSettingID $causid
-		}
-
-		# OutputParameters (platform does NOT emit <viewMode> on this block)
-		if ($s.outputParameters) {
-			Emit-OutputParameters -params $s.outputParameters -indent "`t`t`t"
-		}
-
-		# DataParameters
+		# DataParameters — сразу после filter, до order (порядок XSD Settings; иначе XDTO: «нарушен порядок»)
 		if ($s.dataParameters -eq 'auto') {
 			# Auto-generate dataParameters for all non-hidden params.
 			# Pattern follows 1C Designer / ERP persistence:
@@ -3703,6 +3919,23 @@ function Emit-SettingsVariants {
 			Emit-DataParameters -items $s.dataParameters -indent "`t`t`t"
 		}
 
+		# Order
+		$ovm = Get-BlockVM 'order';  $ousid = Get-BlockUSID 'order'
+		if ($s.order -or $null -ne $ovm -or $null -ne $ousid) {
+			Emit-Order -items $s.order -indent "`t`t`t" -blockViewMode $ovm -blockUserSettingID $ousid
+		}
+
+		# ConditionalAppearance
+		$cavm = Get-BlockVM 'conditionalAppearance';  $causid = Get-BlockUSID 'conditionalAppearance'
+		if ($s.conditionalAppearance -or $null -ne $cavm -or $null -ne $causid) {
+			Emit-ConditionalAppearance -items $s.conditionalAppearance -indent "`t`t`t" -blockViewMode $cavm -blockUserSettingID $causid
+		}
+
+		# OutputParameters (platform does NOT emit <viewMode> on this block)
+		if ($s.outputParameters) {
+			Emit-OutputParameters -params $s.outputParameters -indent "`t`t`t"
+		}
+
 		# Structure (supports string shorthand: "Организация > details")
 		if ($s.structure) {
 			$structItems = $s.structure
@@ -3714,12 +3947,7 @@ function Emit-SettingsVariants {
 			}
 		}
 
-		# <dcsset:itemsViewMode> on <dcsset:settings> — emit only if explicitly set
-		if ($s.itemsViewMode) {
-			X "`t`t`t<dcsset:itemsViewMode>$(Esc-XmlText "$($s.itemsViewMode)")</dcsset:itemsViewMode>"
-		}
-
-		# <dcsset:additionalProperties> — key/value свойства варианта
+		# <dcsset:additionalProperties> — key/value свойства варианта; до itemsViewMode (порядок XSD)
 		if ($s.additionalProperties) {
 			X "`t`t`t<dcsset:additionalProperties>"
 			foreach ($prop in $s.additionalProperties.PSObject.Properties) {
@@ -3728,6 +3956,11 @@ function Emit-SettingsVariants {
 				X "`t`t`t`t</v8:Property>"
 			}
 			X "`t`t`t</dcsset:additionalProperties>"
+		}
+
+		# <dcsset:itemsViewMode> on <dcsset:settings> — emit only if explicitly set
+		if ($s.itemsViewMode) {
+			X "`t`t`t<dcsset:itemsViewMode>$(Esc-XmlText "$($s.itemsViewMode)")</dcsset:itemsViewMode>"
 		}
 
 		X "`t`t</dcsset:settings>"
@@ -3789,3 +4022,4 @@ $fileSize = (Get-Item $OutputPath).Length
 Write-Host "OK  $OutputPath"
 Write-Host "    DataSets: $dsCount  Fields: $fieldCount  Calculated: $calcCount  Totals: $totalCount  Params: $paramCount  Variants: $variantCount"
 Write-Host "    Size: $fileSize bytes"
+foreach ($h in $script:hints) { Write-Host $h }

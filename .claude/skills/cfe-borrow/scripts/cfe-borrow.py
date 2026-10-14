@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-# cfe-borrow v1.37 — Borrow objects from configuration into extension (CFE)
+# cfe-borrow v1.47 — Borrow objects from configuration into extension (CFE)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 import argparse
+import html
 import json
 import os
 import re
+import shutil
 import sys
 import uuid
 from lxml import etree
@@ -76,78 +78,201 @@ def strip_form_bindings(xml, main_attr_name):
     return xml
 
 
+def indent_for_base_form(xml, first_indent):
+    """Сдвиг блока на уровень вглубь для <BaseForm>; first_indent — отступ первой строки.
+    Таб добавляется только в пробельные промежутки между тегами: строки продолжения многострочного
+    текста (<v8:content>, текст запроса) — часть значения. Со сдвигом снимок расходился с формой,
+    и Конфигуратор показывал такой текст изменённым в расширении. Пробельный промежуток между
+    открывающим и закрывающим тегом одного элемента — тоже значение, его не сдвигаем."""
+    parts = re.split(r'''(<(?:[^>"']|"[^"]*"|'[^']*')*>)''', xml)
+    for i in range(0, len(parts), 2):
+        seg = parts[i]
+        if '\n' not in seg or seg.strip():
+            continue
+        prev_tag = parts[i - 1] if i > 0 else ''
+        next_tag = parts[i + 1] if i + 1 < len(parts) else ''
+        m = re.match(r'<([\w:.-]+)[^>]*(?<!/)>$', prev_tag)
+        if m and next_tag == f'</{m.group(1)}>':
+            continue
+        parts[i] = seg.replace('\n', '\n\t')
+    return first_indent + ''.join(parts)
+
+
 DROPPED_LINKS = []
 
+# Связи формы — параметров выбора (<ChoiceParameterLinks>/<xr:Link>) и по типу (<TypeLink>) —
+# хранят путь в <xr:DataPath>, обычным стриппингом он не снимается. Путь — внутренняя ссылка
+# платформы: в выгрузке она пишет имя, а если имя в контексте формы не разрешается — код.
+# Текстовое имя в расширении разрешается, только если его корень объявлен в <Attributes> самой
+# заимствованной формы; иначе платформа отвергает загрузку — «Неверный путь к полю - X».
+# Конфигуратор поэтому пишет текст там, где он разрешается, и код — где нет.
+# Грамматика кода (оракул «код в форму конфигурации → загрузка → выгрузка → имя», 8.3.27; эталоны
+# Конфигуратора УТ и Issue66Example4-7, JR2433, JR2976, JR49904):
+#   первый сегмент  <id>                — реквизит ИСХОДНОЙ формы (в расширении реквизиты
+#                                         перенумерованы в 1000000+, ссылка остаётся в нумерации базы);
+#                   <id>:<CurrentData>  — элемент-таблица исходной формы, её текущая строка;
+#   дальше          0:<uuid>            — реквизит/ТЧ/измерение/ресурс метаданных источника;
+#                   <id>                — колонка реквизита формы;
+#                   <id>:<AddColumn>    — колонка AdditionalColumns;
+#                   -<k>                — стандартный реквизит, код по виду объекта (STD_FIELD_CODES).
+# В расширении платформа код обратно в имя не переводит, а висячий код грузит молча — ошибка
+# кодирования не упадёт, а тихо не сработает. Поэтому кодируется только измеренное; прочее
+# вырезается с предупреждением: связь — удобство подбора, без неё форма работает, с неверной
+# текстовой — не грузится вовсе.
+LINK_CURRENT_DATA = '02023637-7868-4a5f-8576-835a76e0c9ba'
+LINK_ADD_COLUMN = '5bdad865-f2c5-434b-8041-ba4aad3b6687'
+# Коды стандартных реквизитов — свой порядок у каждого вида (оракул 8.3.27; в XML объекта
+# полного списка нет). Незамеренное (-1, скрытые поля, колонки ExtDimensionTypes) — не кодируем.
+STD_FIELD_CODES = {
+    'Catalog': {'Code': -2, 'Description': -3, 'Parent': -4, 'Owner': -5, 'IsFolder': -6, 'DeletionMark': -7, 'Ref': -8, 'DataVersion': -9, 'Predefined': -10, 'PredefinedDataName': -13},
+    'Document': {'Number': -2, 'Date': -3, 'DeletionMark': -4, 'Ref': -5, 'DataVersion': -6, 'Posted': -7, 'RegisterRecords': -8},
+    'ChartOfCharacteristicTypes': {'Ref': -2, 'DataVersion': -3, 'DeletionMark': -4, 'Predefined': -5, 'Parent': -6, 'IsFolder': -7, 'Code': -8, 'Description': -9, 'ValueType': -11, 'PredefinedDataName': -14},
+    'ChartOfAccounts': {'Ref': -2, 'DataVersion': -3, 'DeletionMark': -4, 'Predefined': -5, 'Parent': -6, 'Code': -7, 'Description': -8, 'Type': -10, 'OffBalance': -11, 'ExtDimensionTypes': -12, 'Order': -17, 'PredefinedDataName': -28},
+    'ChartOfCalculationTypes': {'Code': -2, 'Description': -3, 'ActionPeriodIsBasic': -4, 'DeletionMark': -5, 'Ref': -6, 'DataVersion': -7, 'Predefined': -8, 'PredefinedDataName': -11, 'DisplacingCalculationTypes': -20, 'LeadingCalculationTypes': -30},
+    'ExchangePlan': {'Code': -2, 'Description': -3, 'DeletionMark': -4, 'Ref': -6, 'DataVersion': -7, 'SentNo': -9, 'ReceivedNo': -10, 'ThisNode': -13, 'ExchangeDate': -14},
+    'BusinessProcess': {'Number': -2, 'Date': -3, 'DeletionMark': -4, 'Ref': -5, 'DataVersion': -6, 'Completed': -7, 'HeadTask': -8, 'Started': -9},
+    'Task': {'Number': -2, 'Date': -3, 'DeletionMark': -4, 'Ref': -5, 'DataVersion': -6, 'BusinessProcess': -7, 'RoutePoint': -8, 'Description': -9, 'Executed': -10},
+    'InformationRegisterRecord': {'Period': -2, 'Recorder': -3, 'LineNumber': -4, 'Active': -5},
+    'AccumulationRegisterRow': {'Period': -2, 'Recorder': -3, 'LineNumber': -4, 'Active': -5, 'RecordType': -9, 'SecondPeriod': -10, 'MinutePeriod': -11, 'HourPeriod': -12, 'DayPeriod': -13, 'WeekPeriod': -14, 'TenDaysPeriod': -15},
+    'TabularSectionRow': {'LineNumber': -2},
+}
+# Тип основного реквизита → вид для таблицы стандартных кодов (запись РС — сам реквизит,
+# набор записей РН — строка таблицы на нём)
+MAIN_ATTR_KINDS = {
+    'CatalogObject': 'Catalog', 'DocumentObject': 'Document', 'ChartOfCharacteristicTypesObject': 'ChartOfCharacteristicTypes',
+    'ChartOfAccountsObject': 'ChartOfAccounts', 'ChartOfCalculationTypesObject': 'ChartOfCalculationTypes',
+    'ExchangePlanObject': 'ExchangePlan', 'BusinessProcessObject': 'BusinessProcess', 'TaskObject': 'Task',
+    'InformationRegisterRecordManager': 'InformationRegisterRecord', 'AccumulationRegisterRecordSet': 'AccumulationRegisterRow',
+    'ConstantsSet': 'ConstantsSet',
+}
 
-def rewrite_choice_parameter_links(xml, attr_uuids, form_attr_ids, main_attr_name, main_attr_borrowed):
-    """Ссылки параметров выбора (<ChoiceParameterLinks>/<xr:Link>) — привязка особого рода: путь лежит
-    в <xr:DataPath> и обычным стриппингом не снимается. Текстовое имя в расширении разрешается только
-    если его корень объявлен в <Attributes> самой заимствованной формы; иначе платформа отвергает
-    загрузку — «Неверный путь к полю - X». Реквизиты формы не заимствуются никогда, поэтому ссылка на
-    них разрешима только через id: Конфигуратор подставляет id реквизита ИСХОДНОЙ формы (эталоны
-    Issue66Example4/5/6, JR2433, JR2976, JR49904 — совпадение на шести расширениях). Именно id
-    исходной, а не заимствованной: при заимствовании реквизиты перенумеровываются в 1000000+, а
-    ссылка продолжает указывать в нумерацию базовой формы.
-    Путь на основной реквизит («Объект.X») при заимствованном основном реквизите разрешается текстом
-    и остаётся читаемым; без заимствования переводится в «<id>/0:<uuid реквизита объекта>».
-    Реквизит, которого в источнике нет, недоступен и по uuid: такую связь вырезаем целиком."""
-    if '<ChoiceParameterLinks>' not in xml:
-        return xml
 
-    main_pat = re.escape(main_attr_name) if main_attr_name else None
-    main_id = form_attr_ids.get(main_attr_name, "1") if main_attr_name else "1"
+def resolve_link_data_path(path, ctx):
+    """Путь связи → текст (разрешается в расширении), код или None (вырезать).
+    ctx: MainName, MainId, MainBorrowed, MainKind, BorrowedNames (реквизиты объекта в расширении;
+    None — все), AttrUuids (имя/«ТЧ.Реквизит» → uuid),
+    FormAttrIds, FormAttrCols («Реквизит.Колонка» → id), AddCols («<путь таблицы>.Колонка» → id),
+    Tables (имя элемента-таблицы → {Id, Path})."""
+    # Уже код (форма-источник сама из расширения, или висячая ссылка в типовой) — как есть
+    if re.match(r'^-?\d', path):
+        return path
+    main = ctx['MainName']
+    attr_uuids = ctx['AttrUuids']
 
+    # Текущая строка элемента-таблицы
+    cd = re.match(r'^Items\.([^.]+)\.CurrentData\.([^.]+)$', path)
+    if cd:
+        tbl = ctx['Tables'].get(cd.group(1))
+        field = cd.group(2)
+        if not tbl:
+            return None
+        tp = tbl['Path']
+        prefix = f"{tbl['Id']}:{LINK_CURRENT_DATA}"
+        if main and (tp == main or tp.startswith(main + '.')):
+            # Таблица на основном реквизите: с заимствованным — текст разрешается (эталоны 7_1, УТ)
+            if ctx['MainBorrowed']:
+                return path
+            if tp == main:
+                # Строки самого основного реквизита — набор записей регистра накопления
+                if ctx['MainKind'] != 'AccumulationRegisterRow':
+                    return None
+                if field in attr_uuids:
+                    return f"{prefix}/0:{attr_uuids[field]}"
+                code = STD_FIELD_CODES['AccumulationRegisterRow'].get(field)
+                return f"{prefix}/{code}" if code else None
+            ts = tp[len(main) + 1:]
+            if '.' in ts:
+                return None
+            if f"{ts}.{field}" in attr_uuids:
+                return f"{prefix}/0:{attr_uuids[ts + '.' + field]}"
+            if f"{tp}.{field}" in ctx['AddCols']:
+                return f"{prefix}/{ctx['AddCols'][tp + '.' + field]}:{LINK_ADD_COLUMN}"
+            code = STD_FIELD_CODES['TabularSectionRow'].get(field)
+            return f"{prefix}/{code}" if code else None
+        # Таблица на реквизите формы: реквизиты формы не заимствуются никогда — только код
+        # (текст платформа отвергает и с заимствованным основным реквизитом, оракул 8.3.27)
+        if tp in ctx['FormAttrIds'] and f"{tp}.{field}" in ctx['FormAttrCols']:
+            return f"{prefix}/{ctx['FormAttrCols'][tp + '.' + field]}"
+        return None
+
+    # Путь от основного реквизита формы
+    if main and path.startswith(main + '.'):
+        rest = path[len(main) + 1:]
+        if ctx['MainBorrowed']:
+            # Заимствованный реквизит объекта разрешается текстом и остаётся читаемым. Стандартное
+            # поле («Объект.Owner», «Объект.Date») и реквизит, который в расширение не попал (в режиме
+            # Form заимствуется только используемое формой) — нет: платформа отвергает «Неверный путь
+            # к полю». Конфигуратор в обоих случаях ставит ссылку на сам основной реквизит (эталоны
+            # Issue66Example7_1 и УТ Претензии.ФормаЭлементаСамообслуживание).
+            borrowed = ctx['BorrowedNames'] is None or rest.split('.')[0] in ctx['BorrowedNames']
+            if borrowed and rest in attr_uuids:
+                return path
+            return ctx['MainId']
+        # Код пути на константу набора не измерен — такую связь вырезаем, а не кодируем наугад
+        if ctx['MainKind'] == 'ConstantsSet':
+            return None
+        segs = rest.split('.')
+        if len(segs) == 1:
+            if rest in attr_uuids:
+                return f"{ctx['MainId']}/0:{attr_uuids[rest]}"
+            codes = STD_FIELD_CODES.get(ctx['MainKind']) if ctx['MainKind'] else None
+            if codes and rest in codes:
+                return f"{ctx['MainId']}/{codes[rest]}"
+            return None
+        if len(segs) == 2 and segs[0] in attr_uuids and rest in attr_uuids:
+            return f"{ctx['MainId']}/0:{attr_uuids[segs[0]]}/0:{attr_uuids[rest]}"
+        return None
+
+    # Путь от реквизита формы — только по id исходной формы, в обоих режимах
+    segs = path.split('.')
+    if segs[0] in ctx['FormAttrIds']:
+        attr_id = ctx['FormAttrIds'][segs[0]]
+        if len(segs) == 1:
+            return attr_id
+        if len(segs) == 2 and path in ctx['FormAttrCols']:
+            return f"{attr_id}/{ctx['FormAttrCols'][path]}"
+        return None
+
+    # Прочее: с заимствованным основным реквизитом текст может разрешиться, без него — нет
+    if ctx['MainBorrowed']:
+        return path
+    return None
+
+
+def rewrite_link_blocks(xml, block_pattern, ctx):
+    """Путь в <xr:DataPath> блока связи → разрешённый; неразрешимый блок вырезается целиком."""
     def repl(m):
         link = m.group(0)
         dp = re.search(r'<xr:DataPath[^>]*>([^<]+)</xr:DataPath>', link)
         if not dp:
             return link
         path = dp.group(1)
-
-        # Путь на основной реквизит формы
-        if main_pat:
-            mm = re.match('^' + main_pat + r'\.(.+)$', path)
-            if mm:
-                attr_name = mm.group(1)
-                if main_attr_borrowed:
-                    # Реквизит объекта разрешается текстом и остаётся читаемым. Стандартное поле
-                    # («Объект.Owner», «Объект.Date») — нет: платформа отвергает «Неверный путь к данным».
-                    # Конфигуратор в этом случае оставляет ссылку на сам реквизит (эталон Issue66Example7_1).
-                    if attr_name in attr_uuids:
-                        return link
-                    return re.sub(r'(<xr:DataPath[^>]*>)[^<]+(</xr:DataPath>)',
-                                  lambda x: f"{x.group(1)}{main_id}{x.group(2)}", link)
-                if attr_name in attr_uuids:
-                    return re.sub(r'(<xr:DataPath[^>]*>)[^<]+(</xr:DataPath>)',
-                                  lambda x: f"{x.group(1)}{main_id}/0:{attr_uuids[attr_name]}{x.group(2)}", link)
-                return ''
-
-        # Односегментный путь на реквизит формы — только по id исходной формы
-        if '.' not in path and path in form_attr_ids:
-            return re.sub(r'(<xr:DataPath[^>]*>)[^<]+(</xr:DataPath>)',
-                          lambda x: f"{x.group(1)}{form_attr_ids[path]}{x.group(2)}", link)
-
-        # Уже непрозрачный путь (форма-источник сама из расширения) — не трогаем
-        if re.match(r'^\d', path):
+        resolved = resolve_link_data_path(path, ctx)
+        if resolved is None:
+            DROPPED_LINKS.append(path)
+            return ''
+        if resolved == path:
             return link
+        return link[:dp.start(1)] + resolved + link[dp.end(1):]
 
-        # С заимствованным основным реквизитом текстовый путь разрешается: элементы формы на месте,
-        # а их данные доступны через основной реквизит. Конфигуратор такие пути и оставляет текстом
-        # (эталон Issue66Example7_1: «Items.Товары.CurrentData.Характеристика» перенесён как есть).
-        if main_attr_borrowed:
-            return link
+    return re.sub(block_pattern, repl, xml, flags=re.DOTALL)
 
-        # Прочее текстом не разрешается: платформа отвергает загрузку «Неверный путь к полю».
-        # Сюда попадают «Items.<Элемент>.CurrentData.<Поле>» — их кодировка непрозрачна и по
-        # имеющимся эталонам не воспроизводима. Связь параметров выбора — удобство подбора, а не
-        # данные: без неё форма заимствуется и работает, с ней — не грузится вовсе.
-        DROPPED_LINKS.append(path)
-        return ''
 
-    xml = re.sub(r'\s*<xr:Link>.*?</xr:Link>', repl, xml, flags=re.DOTALL)
+def rewrite_choice_parameter_links(xml, ctx):
+    if '<ChoiceParameterLinks>' not in xml:
+        return xml
+    xml = rewrite_link_blocks(xml, r'\s*<xr:Link>.*?</xr:Link>', ctx)
     # Опустевший контейнер платформе не нужен
     xml = re.sub(r'\s*<ChoiceParameterLinks>\s*</ChoiceParameterLinks>', '', xml, flags=re.DOTALL)
     return xml
+
+
+def rewrite_type_links(xml, ctx):
+    """Связь по типу — тот же путь и то же правило (эталоны УТ ВводОстатков.ФормаРасчетыМеждуОрганизациями:
+    без основного реквизита — код, с ним — текст)."""
+    if '<TypeLink>' not in xml:
+        return xml
+    return rewrite_link_blocks(xml, r'\s*<TypeLink>.*?</TypeLink>', ctx)
 
 
 def get_own_child_object_names(obj_file):
@@ -357,6 +482,122 @@ MODULE_KINDS_BY_TYPE = {
 # Отказ — `-Module None`.
 AUTO_MODULE_TYPES = ["CommonModule", "HTTPService", "WebService"]
 MODULE_KIND_NAMES = ["Module", "ObjectModule", "ManagerModule", "RecordSetModule", "ValueManagerModule"]
+
+def query_key(s):
+    """Ключ сравнения имён в тексте запроса: язык запросов регистронезависим, Ё и Е — одна буква."""
+    return s.upper().replace('Ё', 'Е')
+
+
+# Виды таблиц языка запросов (рус. и англ.) → вид метаданных. Ключи — через query_key.
+QUERY_TABLE_KINDS = {}
+for _ru, _en in (
+    ("Справочник", "Catalog"), ("Документ", "Document"), ("Перечисление", "Enum"),
+    ("ПланВидовХарактеристик", "ChartOfCharacteristicTypes"), ("ПланСчетов", "ChartOfAccounts"),
+    ("ПланВидовРасчета", "ChartOfCalculationTypes"), ("ПланОбмена", "ExchangePlan"),
+    ("БизнесПроцесс", "BusinessProcess"), ("Задача", "Task"),
+    ("РегистрСведений", "InformationRegister"), ("РегистрНакопления", "AccumulationRegister"),
+    ("РегистрБухгалтерии", "AccountingRegister"), ("РегистрРасчета", "CalculationRegister"),
+    ("ЖурналДокументов", "DocumentJournal"), ("Константа", "Constant"),
+    ("Последовательность", "Sequence"), ("КритерийОтбора", "FilterCriterion"),
+    ("ВнешнийИсточникДанных", "ExternalDataSource"),
+):
+    QUERY_TABLE_KINDS[query_key(_ru)] = _en
+    QUERY_TABLE_KINDS[query_key(_en)] = _en
+
+
+# Ключевые слова языка запросов, которые могут стоять сразу за таблицей вместо псевдонима.
+QUERY_ALIAS_STOP_WORDS = {query_key(_kw) for _kw in (
+    "ГДЕ", "WHERE", "ЛЕВОЕ", "LEFT", "ПРАВОЕ", "RIGHT", "ПОЛНОЕ", "FULL", "ВНУТРЕННЕЕ", "INNER",
+    "ВНЕШНЕЕ", "OUTER", "СОЕДИНЕНИЕ", "JOIN", "ПО", "ON", "СГРУППИРОВАТЬ", "GROUP", "УПОРЯДОЧИТЬ", "ORDER",
+    "ИМЕЮЩИЕ", "HAVING", "ОБЪЕДИНИТЬ", "UNION", "ДЛЯ", "FOR", "ИТОГИ", "TOTALS", "ИНДЕКСИРОВАТЬ", "INDEX",
+    "ИЗ", "FROM", "ВЫБРАТЬ", "SELECT", "И", "AND", "ИЛИ", "OR", "НЕ", "NOT", "КОГДА", "WHEN", "ТОГДА", "THEN",
+    "ИНАЧЕ", "ELSE", "КОНЕЦ", "END", "ПОМЕСТИТЬ", "INTO", "ССЫЛКА", "REFS", "В", "IN", "МЕЖДУ", "BETWEEN",
+    "ПОДОБНО", "LIKE", "ЕСТЬ", "IS", "ИЕРАРХИИ", "HIERARCHY", "ВОЗР", "ASC", "УБЫВ", "DESC", "АВТОУПОРЯДОЧИВАНИЕ",
+    "AUTOORDER", "ИЗМЕНЕНИЯ", "UPDATE", "ВСЕ", "ALL")}
+
+# Стандартные поля по видам объектов (рус. и англ.) — есть у таблицы без заимствования реквизитов.
+# У каждого вида свои: Номер/Дата — стандартные у документа, а у справочника это обычные реквизиты,
+# которых в оболочке нет. Неизвестный вид — только общие поля. Поля, которые включаются свойством
+# объекта (Родитель, Владелец, Период регистра сведений…), — в QUERY_GATED_STD. Ключи — query_key.
+_QS_COMMON = ("Ссылка", "Ref", "ПометкаУдаления", "DeletionMark", "Предопределенный", "Predefined",
+              "ИмяПредопределенныхДанных", "PredefinedDataName", "ВерсияДанных", "DataVersion", "Представление",
+              "Presentation", "DefaultPicture")
+_QS_BY_KIND = {
+    "Catalog": ("Код", "Code", "Наименование", "Description"),
+    "Document": ("Номер", "Number", "Дата", "Date", "Проведен", "Posted", "МоментВремени", "PointInTime"),
+    "ChartOfCharacteristicTypes": ("Код", "Code", "Наименование", "Description", "ТипЗначения", "ValueType"),
+    "ChartOfAccounts": ("Код", "Code", "Наименование", "Description", "Родитель", "Parent", "Порядок", "Order", "Вид", "Type", "Забалансовый", "OffBalance"),
+    "ChartOfCalculationTypes": ("Код", "Code", "Наименование", "Description"),
+    "ExchangePlan": ("Код", "Code", "Наименование", "Description", "НомерОтправленного", "SentNo", "НомерПринятого", "ReceivedNo", "ЭтотУзел", "ThisNode"),
+    "BusinessProcess": ("Номер", "Number", "Дата", "Date", "Завершен", "Completed", "Стартован", "Started", "ВедущаяЗадача", "HeadTask"),
+    "Task": ("Номер", "Number", "Дата", "Date", "Наименование", "Description", "Выполнена", "Executed", "БизнесПроцесс", "BusinessProcess", "ТочкаМаршрута", "RoutePoint"),
+    "Enum": ("Порядок", "Order"),
+    "DocumentJournal": ("Номер", "Number", "Дата", "Date", "Проведен", "Posted", "Тип", "Type"),
+    "InformationRegister": (),
+    "AccumulationRegister": ("Период", "Period", "Регистратор", "Recorder", "НомерСтроки", "LineNumber", "Активность", "Active", "ВидДвижения", "RecordType"),
+    "AccountingRegister": ("Период", "Period", "Регистратор", "Recorder", "НомерСтроки", "LineNumber", "Активность", "Active"),
+    "CalculationRegister": ("Регистратор", "Recorder", "НомерСтроки", "LineNumber", "Активность", "Active"),
+}
+QUERY_STD_COMMON = {query_key(_sf) for _sf in _QS_COMMON}
+QUERY_STD_BY_KIND = {_k: {query_key(_sf) for _sf in _QS_COMMON + _v} for _k, _v in _QS_BY_KIND.items()}
+
+
+# Стандартные поля, которые есть, только если это включено свойством объекта: у заимствованного
+# объекта в расширении их нет, пока свойства нет в его копии (замер 8.3.24: Родитель у иерархического
+# справочника на оболочке без <Hierarchical> — «Неверный путь к данным»; Код, Наименование — есть).
+QUERY_GATED_STD = {}
+for _kind, _gate, _fields in (
+    ("Catalog", "Hierarchical", ("Родитель", "Parent", "ЭтоГруппа", "IsFolder")),
+    ("ChartOfCharacteristicTypes", "Hierarchical", ("Родитель", "Parent", "ЭтоГруппа", "IsFolder")),
+    ("Catalog", "Owners", ("Владелец", "Owner")),
+    ("InformationRegister", "Periodic", ("Период", "Period")),
+    ("InformationRegister", "Recorder", ("Регистратор", "Recorder", "НомерСтроки", "LineNumber", "Активность", "Active")),
+):
+    for _f in _fields:
+        QUERY_GATED_STD[f"{_kind}|{query_key(_f)}"] = _gate
+
+
+def test_query_std_field(info_, field_key):
+    gate = QUERY_GATED_STD.get(f"{info_['Kind']}|{field_key}")
+    if gate:
+        return bool(info_['Gates'].get(gate))
+    if info_['Kind'] in QUERY_STD_BY_KIND:
+        return field_key in QUERY_STD_BY_KIND[info_['Kind']]
+    return field_key in QUERY_STD_COMMON
+
+
+# Поля таблицы — только данные: команды, формы, макеты и т.п. полями не бывают
+QUERY_FIELD_KINDS = ('Attribute', 'Dimension', 'Resource', 'TabularSection', 'AddressingAttribute',
+                     'AccountingFlag', 'ExtDimensionAccountingFlag', 'Column', 'EnumValue')
+
+
+# Зарезервированные слова языка запросов — полем быть не могут: стоп-слова псевдонима плюс
+# литералы и модификаторы. Имена типов (СТРОКА, ДАТА…) и периодов (МЕСЯЦ, ГОД…) сюда не входят:
+# это бывают и имена полей. Тип пропускается по позиции — после КАК, как всякое определение
+# псевдонима; период — аргументом после запятой внутри скобок (НАЧАЛОПЕРИОДА(Д.Дата, МЕСЯЦ)).
+QUERY_RESERVED_WORDS = set(QUERY_ALIAS_STOP_WORDS) | {query_key(_kw) for _kw in (
+    "КАК", "AS", "РАЗРЕШЕННЫЕ", "ALLOWED", "РАЗЛИЧНЫЕ", "DISTINCT", "ПЕРВЫЕ", "TOP", "NULL", "ИСТИНА",
+    "TRUE", "ЛОЖЬ", "FALSE", "НЕОПРЕДЕЛЕНО", "UNDEFINED", "ВЫБОР", "CASE", "СПЕЦСИМВОЛ", "ESCAPE", "BY",
+    "ИЕРАРХИЯ", "ОБЩИЕ", "OVERALL", "ПЕРИОДАМИ", "PERIODS", "УНИЧТОЖИТЬ", "DROP", "ГРУППИРУЮЩИМ", "НАБОРАМ",
+    "GROUPING", "SETS")}
+QUERY_PERIOD_NAMES = {query_key(_kw) for _kw in (
+    "СЕКУНДА", "SECOND", "МИНУТА", "MINUTE", "ЧАС", "HOUR", "ДЕНЬ", "DAY", "НЕДЕЛЯ", "WEEK",
+    "МЕСЯЦ", "MONTH", "КВАРТАЛ", "QUARTER", "ГОД", "YEAR", "ДЕКАДА", "TENDAYS", "ПОЛУГОДИЕ", "HALFYEAR", "АВТО", "AUTO")}
+RE_TABLE_ALIAS = re.compile(r'(?:(КАК|AS)\s+)?([^\W\d]\w*)', re.IGNORECASE)
+RE_FUNC_PAREN = re.compile(r'\s*\(')
+# Слова, после которых в запросе стоит таблица-источник
+QUERY_SOURCE_KEYWORDS = {query_key(_kw) for _kw in ("ИЗ", "FROM", "СОЕДИНЕНИЕ", "JOIN")}
+
+
+def get_ref_kind_from_type(type_text):
+    """Ссылочный тип → вид метаданных: CatalogRef → Catalog и т.п. (у DefinedType и прочих — None)."""
+    t = type_text.strip()
+    ci = t.find(':')
+    if ci >= 0:
+        t = t[ci + 1:]
+    m = re.match(r'^(\w+)Ref\.(\w+)$', t)
+    return {'Kind': m.group(1), 'Name': m.group(2)} if m else None
+
 
 SYNONYM_MAP = {
     "\u0421\u043f\u0440\u0430\u0432\u043e\u0447\u043d\u0438\u043a": "Catalog",
@@ -582,8 +823,11 @@ COMMON_MODULE_PROPS = ["Global", "ClientManagedApplication", "Server", "External
 # отвергает загрузку — «Неверный путь к данным». Конфигуратор переносит ровно их (эталоны
 # Issue66Example7_1 и Issue66Example2). Проверено сплошным прогоном по типам: у регистра
 # сведений без InformationRegisterPeriodicity не разрешается «Запись.Period».
+# Тем же путём переносится код языка: платформа принимает заимствованный язык и без него, но
+# конфигуратор пишет LanguageCode у любого заимствованного языка, основного и неосновного (замер 8.3.24).
 TYPE_GATE_PROPS = {
     "InformationRegister": ["InformationRegisterPeriodicity", "WriteMode"],
+    "Language": ["LanguageCode"],
 }
 # Владельцы справочника — список <xr:Item>, а не скаляр: переносится фрагментом, как __TypeXml
 TYPES_WITH_OWNERS = ("Catalog", "ChartOfCharacteristicTypes")
@@ -907,11 +1151,13 @@ def main():
 
     # Module-level list for borrowed files (used by both main loop and borrow_main_attribute)
     borrowed_files = []
+    # Формы с динамическим списком — основная таблица и тильда решаются в конце запуска (шаги 14a, 14c)
+    dyn_list_forms = []
 
     # --- Helper functions ---
     def get_source_attribute_uuids(type_name, obj_name):
-        """Имена реквизитов исходного объекта → uuid. Нужны для непрозрачной формы пути в ссылках
-        параметров выбора (см. rewrite_choice_parameter_links)."""
+        """Имена реквизитов исходного объекта → uuid: реквизиты, ТЧ, измерения и ресурсы регистра,
+        реквизиты ТЧ — ключом «ТЧ.Реквизит». Нужны для кода пути в связях формы (см. resolve_link_data_path)."""
         result = {}
         dir_name = CHILD_TYPE_DIR_MAP.get(type_name)
         if not dir_name:
@@ -932,21 +1178,36 @@ def main():
             if not isinstance(child.tag, str) or localname(child) != "ChildObjects":
                 continue
             for sub in child:
-                if not isinstance(sub.tag, str) or localname(sub) not in ("Attribute", "TabularSection"):
+                if not isinstance(sub.tag, str) or localname(sub) not in ("Attribute", "TabularSection", "Dimension", "Resource"):
                     continue
                 uuid_val = sub.get("uuid")
-                name_val = None
-                for props in sub:
-                    if isinstance(props.tag, str) and localname(props) == "Properties":
-                        for prop in props:
-                            if isinstance(prop.tag, str) and localname(prop) == "Name":
-                                name_val = (prop.text or "").strip()
-                                break
-                        break
-                if uuid_val and name_val:
-                    result[name_val] = uuid_val
+                name_val = md_name(sub)
+                if not (uuid_val and name_val):
+                    continue
+                result[name_val] = uuid_val
+                if localname(sub) != "TabularSection":
+                    continue
+                for ts_children in sub:
+                    if not isinstance(ts_children.tag, str) or localname(ts_children) != "ChildObjects":
+                        continue
+                    for ts_attr in ts_children:
+                        if not isinstance(ts_attr.tag, str) or localname(ts_attr) != "Attribute":
+                            continue
+                        ts_uuid, ts_name = ts_attr.get("uuid"), md_name(ts_attr)
+                        if ts_uuid and ts_name:
+                            result[f"{name_val}.{ts_name}"] = ts_uuid
             break
         return result
+
+    def md_name(el):
+        """<Properties>/<Name> объекта метаданных."""
+        for props in el:
+            if isinstance(props.tag, str) and localname(props) == "Properties":
+                for prop in props:
+                    if isinstance(prop.tag, str) and localname(prop) == "Name":
+                        return (prop.text or "").strip()
+                break
+        return None
 
     def read_source_object(type_name, obj_name):
         dir_name = CHILD_TYPE_DIR_MAP.get(type_name)
@@ -1010,7 +1271,11 @@ def main():
 
     def read_source_form_uuid(type_name, obj_name, form_name):
         dir_name = CHILD_TYPE_DIR_MAP[type_name]
-        src_file = os.path.join(cfg_dir, dir_name, obj_name, "Forms", f"{form_name}.xml")
+        # Общая форма — сама объект конфигурации: её описание лежит рядом с другими, а не в Forms владельца
+        if type_name == "CommonForm":
+            src_file = os.path.join(cfg_dir, dir_name, f"{obj_name}.xml")
+        else:
+            src_file = os.path.join(cfg_dir, dir_name, obj_name, "Forms", f"{form_name}.xml")
         if not os.path.isfile(src_file):
             print(f"Source form not found: {src_file}", file=sys.stderr)
             sys.exit(1)
@@ -1239,6 +1504,303 @@ def main():
             break
         return result
 
+    def get_link_context(form_el, main_name, main_borrowed, borrowed_names, attr_uuids, form_attr_ids):
+        """Контекст разрешения путей в связях формы (см. resolve_link_data_path) — всё по ИСХОДНОЙ
+        форме: колонки реквизитов формы, колонки AdditionalColumns, элементы-таблицы и вид основного
+        реквизита."""
+        cols, add_cols, tables, kind = {}, {}, {}, None
+        for child in form_el:
+            if not isinstance(child.tag, str):
+                continue
+            if localname(child) == "Attributes":
+                for a in child:
+                    if not isinstance(a.tag, str) or localname(a) != "Attribute":
+                        continue
+                    nm = a.get("name")
+                    for sub in a:
+                        if not isinstance(sub.tag, str):
+                            continue
+                        if localname(sub) == "Columns":
+                            for c in sub:
+                                if not isinstance(c.tag, str):
+                                    continue
+                                if localname(c) == "Column":
+                                    cols[f"{nm}.{c.get('name')}"] = c.get("id")
+                                elif localname(c) == "AdditionalColumns":
+                                    tbl_path = c.get("table")
+                                    for ac in c:
+                                        if isinstance(ac.tag, str) and localname(ac) == "Column":
+                                            add_cols[f"{tbl_path}.{ac.get('name')}"] = ac.get("id")
+                        elif localname(sub) == "Type" and main_name and nm == main_name and kind is None:
+                            for tn in sub:
+                                if isinstance(tn.tag, str) and localname(tn) == "Type":
+                                    # Тип без имени объекта (cfg:ConstantsSet) — тоже вид
+                                    tm = re.match(r'^(?:\w+:)?(\w+)(?:\.|$)', (tn.text or "").strip())
+                                    if tm and tm.group(1) in MAIN_ATTR_KINDS:
+                                        kind = MAIN_ATTR_KINDS[tm.group(1)]
+                                    break
+            elif localname(child) == "ChildItems":
+                for tbl in child.iter():
+                    if not isinstance(tbl.tag, str) or localname(tbl) != "Table":
+                        continue
+                    for dp in tbl:
+                        if isinstance(dp.tag, str) and localname(dp) == "DataPath":
+                            tables[tbl.get("name")] = {"Id": tbl.get("id"), "Path": (dp.text or "").strip()}
+                            break
+        main_id = form_attr_ids.get(main_name, "1") if main_name else "1"
+        return {"MainName": main_name, "MainId": main_id, "MainBorrowed": main_borrowed, "MainKind": kind,
+                "BorrowedNames": borrowed_names,
+                "AttrUuids": attr_uuids, "FormAttrIds": form_attr_ids, "FormAttrCols": cols,
+                "AddCols": add_cols, "Tables": tables}
+
+    # Псевдоним таблицы, ссылка на которую кончается в позиции pos: «КАК имя» / «AS имя», имя без
+    # КАК (если это не ключевое слово); параметры виртуальной таблицы в скобках пропускаются.
+    # None — псевдонима нет, тогда псевдоним — последний сегмент имени таблицы. Иначе — имя и позиция:
+    # имя без КАК — тоже определение псевдонима, а не поле.
+    def get_query_table_alias(q, pos):
+        i = pos
+        while i < len(q) and q[i].isspace():
+            i += 1
+        if i < len(q) and q[i] == '(':
+            depth = 0
+            while i < len(q):
+                if q[i] == '(':
+                    depth += 1
+                elif q[i] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        break
+                i += 1
+            while i < len(q) and q[i].isspace():
+                i += 1
+        m = RE_TABLE_ALIAS.match(q, i)
+        if not m:
+            return None
+        if m.group(1) is None and query_key(m.group(2)) in QUERY_ALIAS_STOP_WORDS:
+            return None
+        return m.group(2), m.start(2)
+
+    # Что объект предоставляет запросу в контексте расширения — по итоговому составу расширения.
+    # None — объекта в расширении нет. Fields: имена заимствованных подобъектов (реквизиты, измерения,
+    # ресурсы, ТЧ, признаки учёта…); TSCols: колонки заимствованных ТЧ; EnumValues: значения
+    # перечисления; Types: поле → ссылочный тип (одиночный) для разыменования. Ключи — query_key.
+    ext_table_info_cache = {}
+
+    def get_ext_table_info(kind, name_key):
+        cache_key = f"{kind}|{name_key}"
+        if cache_key in ext_table_info_cache:
+            return ext_table_info_cache[cache_key]
+        info_ = None
+        dir_ = CHILD_TYPE_DIR_MAP.get(kind)
+        actual = None
+        if dir_:
+            # Имя — каноническое, из состава расширения: в запросе регистр и Ё/Е произвольны
+            for c in child_objs_el:
+                if isinstance(c.tag, str) and etree.QName(c.tag).localname == kind \
+                        and query_key((c.text or '').strip()) == name_key:
+                    actual = (c.text or '').strip()
+                    break
+        if actual:
+            f = os.path.join(ext_dir, dir_, f"{actual}.xml")
+            if os.path.isfile(f):
+                root = etree.parse(f).getroot()
+                el = next((c for c in root if isinstance(c.tag, str)), None)
+                info_ = {'Kind': kind, 'Fields': set(), 'TSCols': {}, 'EnumValues': set(), 'Types': {}, 'Gates': {}}
+                if el is not None:
+                    pr = el.xpath("*[local-name()='Properties']")
+                    if pr:
+                        pr = pr[0]
+
+                        def _prop(name):
+                            n = pr.xpath(f"*[local-name()='{name}']")
+                            return (n[0].text or '').strip() if n else None
+                        info_['Gates']['Hierarchical'] = _prop('Hierarchical') == 'true'
+                        info_['Gates']['Owners'] = bool(pr.xpath("*[local-name()='Owners']/*"))
+                        pv = _prop('InformationRegisterPeriodicity')
+                        info_['Gates']['Periodic'] = bool(pv) and pv != 'Nonperiodical'
+                        info_['Gates']['Recorder'] = _prop('WriteMode') == 'RecorderSubordinate'
+                    for sub in el.xpath("*[local-name()='ChildObjects']/*"):
+                        local = etree.QName(sub.tag).localname
+                        if local not in QUERY_FIELD_KINDS:
+                            continue
+                        nm = sub.xpath("*[local-name()='Properties']/*[local-name()='Name']")
+                        if not nm:
+                            continue
+                        k = query_key((nm[0].text or '').strip())
+                        if local == 'EnumValue':
+                            info_['EnumValues'].add(k)
+                            continue
+                        info_['Fields'].add(k)
+                        types = sub.xpath("*[local-name()='Properties']/*[local-name()='Type']/*[local-name()='Type']")
+                        if len(types) == 1:
+                            rk = get_ref_kind_from_type(types[0].text or '')
+                            if rk:
+                                info_['Types'][k] = rk
+                        if local == 'TabularSection':
+                            info_['TSCols'][k] = {
+                                query_key((cn.text or '').strip())
+                                for cn in sub.xpath("*[local-name()='ChildObjects']/*/*[local-name()='Properties']/*[local-name()='Name']")}
+        ext_table_info_cache[cache_key] = info_
+        return info_
+
+    # Что в ручном запросе динамического списка не разрешится в контексте расширения — список причин;
+    # пустой — запрос разрешим, тильда не нужна. Проверяется по ИТОГОВОМУ составу расширения, а не по
+    # прогнозу заимствования: каждая таблица запроса (её объект) должна быть в расширении, её ТЧ,
+    # значения перечисления — тоже; каждое поле — заимствованным подобъектом или стандартным полем,
+    # разыменование — по одиночному ссылочному типу до объекта, который тоже есть в расширении.
+    # Предопределённые, виртуальные таблицы, «*», обращения через скобку и неизвестные слова — не
+    # разрешаются. Правило консервативное: лишняя тильда — лишь шум, пропущенная — отказ загрузки.
+    # Сверено с платформой 8.3.24 (оракул — загрузка без тильды).
+    def get_dyn_list_query_unresolved(query_text):
+        reasons = []
+        # Строковые литералы и комментарии — не код запроса; пробелы вокруг точки — часть пути
+        q = re.sub(r'"(?:[^"]|"")*"|//[^\r\n]*', ' ', query_text)
+        q = re.sub(r'(?<=[\w)])\s*\.\s*(?=[^\W\d]|\*)', '.', q)
+        empty_ref_keys = (query_key("ПустаяСсылка"), query_key("EmptyRef"))
+        ts_std_keys = (query_key("Ссылка"), query_key("Ref"), query_key("НомерСтроки"), query_key("LineNumber"))
+        same_obj_std = (query_key("Ссылка"), query_key("Ref"), query_key("Родитель"), query_key("Parent"))
+        ref_keys = (query_key("Ссылка"), query_key("Ref"))
+
+        # «*» (кроме КОЛИЧЕСТВО(*)) и обращение через скобку — состав полей не виден
+        if re.search(r'(?i)\.\*|(?:(?<![\w.])(?:ВЫБРАТЬ|SELECT|РАЗЛИЧНЫЕ|DISTINCT|РАЗРЕШЕННЫЕ|ALLOWED)|,|\{|(?<![\w.])(?:ПЕРВЫЕ|TOP)\s+\d+)\s*\*', q):
+            reasons.append("*")
+        # Области запроса не разбираются: части ОБЪЕДИНИТЬ и вложенные запросы — со своими таблицами
+        if re.search(r'(?i)(?<![\w.])(?:ОБЪЕДИНИТЬ|UNION)(?![\w.])', q):
+            reasons.append("ОБЪЕДИНИТЬ")
+        if len(re.findall(r'(?i)(?<![\w.])(?:ВЫБРАТЬ|SELECT)(?![\w.])', q)) > 1:
+            reasons.append("вложенный запрос")
+        if re.search(r'\)\.[^\W\d]', q):
+            reasons.append(").Поле")
+
+        path_matches = list(re.finditer(r'(?<![\w.&])[^\W\d]\w*(?:\.[^\W\d]\w*)+', q))
+        alias_pos = set()
+        # Таблицы и их псевдонимы: псевдоним → {Info, TS ('' — сам объект)}
+        alias_map = {}
+        for pm in path_matches:
+            segs = pm.group(0).split('.')
+            k0 = query_key(segs[0])
+            if k0 not in QUERY_TABLE_KINDS:
+                continue
+            kind = QUERY_TABLE_KINDS[k0]
+            tinfo = get_ext_table_info(kind, query_key(segs[1]))
+            if tinfo is None:
+                reasons.append(f"{segs[0]}.{segs[1]}")
+                continue
+            ts_key = ''
+            if len(segs) >= 3:
+                k2 = query_key(segs[2])
+                if len(segs) == 3 and (k2 in empty_ref_keys or k2 in tinfo['EnumValues']):
+                    continue
+                if len(segs) == 3 and k2 in tinfo['TSCols']:
+                    ts_key = k2
+                else:
+                    reasons.append(pm.group(0))
+                    continue
+            # Псевдоним — только у таблицы-источника (после ИЗ/СОЕДИНЕНИЕ или запятой в их списке). У
+            # ссылок в ЗНАЧЕНИЕ(), ТИП(), ВЫРАЗИТЬ(... КАК …), ССЫЛКА … псевдонима нет: фантомный псевдоним
+            # закрыл бы от проверки одноимённое поле.
+            bi = pm.start() - 1
+            while bi >= 0 and q[bi].isspace():
+                bi -= 1
+            is_source = False
+            if bi >= 0 and q[bi] == ',':
+                is_source = True
+            elif bi >= 0:
+                we = bi + 1
+                while bi >= 0 and q[bi].isalnum():
+                    bi -= 1
+                is_source = query_key(q[bi + 1:we]) in QUERY_SOURCE_KEYWORDS
+            if not is_source:
+                continue
+            al = get_query_table_alias(q, pm.end())
+            alias = segs[-1]
+            if al:
+                alias = al[0]
+                alias_pos.add(al[1])
+            alias_map[query_key(alias)] = {'Info': tinfo, 'TS': ts_key}
+
+        # Поле Источник.Поле[.Подполе…]: каждое звено — заимствованный подобъект или стандартное поле
+        for pm in path_matches:
+            segs = pm.group(0).split('.')
+            k0 = query_key(segs[0])
+            if k0 in QUERY_TABLE_KINDS:
+                continue
+            if k0 not in alias_map:
+                reasons.append(pm.group(0))
+                continue
+            cur_info = alias_map[k0]['Info']
+            cur_ts = alias_map[k0]['TS']
+            ok = True
+            for i in range(1, len(segs)):
+                fk = query_key(segs[i])
+                last = (i == len(segs) - 1)
+                if cur_ts:
+                    # Поле строки ТЧ: колонка (без разыменования) или Ссылка/НомерСтроки
+                    if last and (fk in cur_info['TSCols'][cur_ts] or fk in ts_std_keys):
+                        break
+                    if not last and fk in ref_keys:
+                        cur_ts = ''
+                        continue
+                    ok = False
+                    break
+                if last:
+                    if not (fk in cur_info['Fields'] or test_query_std_field(cur_info, fk)):
+                        ok = False
+                    break
+                # Разыменование: Ссылка/Родитель — тот же объект; реквизит — по его ссылочному типу
+                if fk in same_obj_std and test_query_std_field(cur_info, fk):
+                    continue
+                if fk in cur_info['Types']:
+                    t = cur_info['Types'][fk]
+                    cur_info = get_ext_table_info(t['Kind'], query_key(t['Name']))
+                    if cur_info is None:
+                        ok = False
+                        break
+                    continue
+                ok = False
+                break
+            if not ok:
+                reasons.append(pm.group(0))
+
+        # Слова без точки. Пропускаются: определение псевдонима (после КАК/AS — в т.ч. имя типа в
+        # ВЫРАЗИТЬ), имя функции (перед «(»), зарезервированное слово, период аргументом после запятой
+        # внутри скобок. Остальное — поле одной из таблиц запроса: Месяц, Документ, Сумма — и имена полей.
+        alias_defs = {mm.start(1) for mm in re.finditer(r'(?i)(?<![\w.])(?:КАК|AS)\s+([^\W\d]\w*)', q)}
+        comma_args = {mm.start(1) for mm in re.finditer(r',\s*([^\W\d]\w*)', q)}
+        depth_at = [0] * (len(q) + 1)
+        depth = 0
+        for ci, ch in enumerate(q):
+            depth_at[ci] = depth
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+        for wm in re.finditer(r'(?<![\w.&])[^\W\d]\w*(?![\w.])', q):
+            if wm.start() in alias_defs or wm.start() in alias_pos:
+                continue
+            wk = query_key(wm.group(0))
+            if wk in QUERY_RESERVED_WORDS:
+                continue
+            if wk in QUERY_PERIOD_NAMES and wm.start() in comma_args and depth_at[wm.start()] > 0:
+                continue
+            if RE_FUNC_PAREN.match(q, wm.end()):
+                continue
+            found = False
+            for src in alias_map.values():
+                if src['TS']:
+                    if wk in src['Info']['TSCols'][src['TS']] or wk in ts_std_keys:
+                        found = True
+                        break
+                elif wk in src['Info']['Fields'] or test_query_std_field(src['Info'], wk):
+                    found = True
+                    break
+            if not found:
+                reasons.append(wm.group(0))
+
+        seen = set()
+        return [r for r in reasons if not (r in seen or seen.add(r))]
+
     def get_main_attribute_info(form_el, ns_strip_pattern):
         main_attr = None
         for child in form_el:
@@ -1344,6 +1906,9 @@ def main():
     # --- 11c. Resolve source attributes and tabular sections ---
     def resolve_source_attributes(type_name, obj_name, first_level_names):
         # first_level_names: dict of names, or None for "all"
+        # Имена сверяются ключом запроса (регистр, Ё/Е): слова приходят и из текста запроса списка,
+        # а правило тильды (get_dyn_list_query_unresolved) считает их найденными по тому же ключу.
+        fl_keys = None if first_level_names is None else {query_key(k) for k in first_level_names}
         dir_name = CHILD_TYPE_DIR_MAP[type_name]
         src_file = os.path.join(cfg_dir, dir_name, f"{obj_name}.xml")
         if not os.path.isfile(src_file):
@@ -1386,7 +1951,7 @@ def main():
                 if name_node is None:
                     continue
                 attr_name = (name_node.text or "").strip()
-                if first_level_names is not None and attr_name not in first_level_names:
+                if fl_keys is not None and query_key(attr_name) not in fl_keys:
                     continue
 
                 attr_uuid = child.get("uuid", "")
@@ -1403,7 +1968,7 @@ def main():
                 if name_node is None:
                     continue
                 ts_name = (name_node.text or "").strip()
-                if first_level_names is not None and ts_name not in first_level_names:
+                if fl_keys is not None and query_key(ts_name) not in fl_keys:
                     continue
 
                 ts_uuid = child.get("uuid", "")
@@ -1581,15 +2146,142 @@ def main():
             info(f"  Merged {added} attribute(s) into: {obj_file}")
 
     # --- 11h. Borrow main attribute orchestrator ---
-    def borrow_main_attribute(type_name, obj_name, form_name, mode):
+    # Объект-оболочка в расширении: кто уже заимствован — пропускается, без источника — предупреждение.
+    def borrow_object_shell(type_name, obj_name):
+        if type_name not in CHILD_TYPE_DIR_MAP:
+            warn(f"  Unknown object type: {type_name}.{obj_name}")
+            return
+        if test_object_borrowed(type_name, obj_name):
+            info(f"  Already borrowed: {type_name}.{obj_name}")
+            return
+        src_file = os.path.join(cfg_dir, CHILD_TYPE_DIR_MAP[type_name], f"{obj_name}.xml")
+        if not os.path.isfile(src_file):
+            warn(f"  Source not found: {type_name}.{obj_name}")
+            return
+        src = read_source_object(type_name, obj_name)
+        borrowed_xml = build_borrowed_object_xml(type_name, obj_name, src["Uuid"], src["Properties"])
+        target_dir = os.path.join(ext_dir, CHILD_TYPE_DIR_MAP[type_name])
+        os.makedirs(target_dir, exist_ok=True)
+        target_file = os.path.join(target_dir, f"{obj_name}.xml")
+        write_xml_file(target_file, borrowed_xml)
+        add_to_child_objects(type_name, obj_name)
+        borrowed_files.append(target_file)
+        info(f"  Auto-borrowed: {type_name}.{obj_name}")
+
+    def borrow_reference_type_shells(type_xmls):
+        """Ссылочные типы → объекты-оболочки в расширении (кто уже заимствован — пропускается)."""
+        ref_types = collect_reference_types(type_xmls)
+        info(f"  Reference types to borrow: {len(ref_types)}")
+
+        for rt in ref_types:
+            borrow_object_shell(rt["TypeName"], rt["ObjName"])
+
+    # Владелец общей формы — из ТИПА её основного реквизита (эталон УТ CommonMain):
+    # <Вид>Object.Имя / <Вид>RecordManager.Имя → объект; DynamicList → объект из <MainTable>;
+    # ConstantsSet → константы по путям формы. Примитив, тип без имени (ReportObject — любой отчёт),
+    # список без MainTable → владельца нет: в расширение идёт только сам реквизит формы.
+    common_form_owner_kinds = {
+        'CatalogObject': 'Catalog', 'DocumentObject': 'Document', 'DataProcessorObject': 'DataProcessor', 'ReportObject': 'Report',
+        'ChartOfCharacteristicTypesObject': 'ChartOfCharacteristicTypes', 'ChartOfAccountsObject': 'ChartOfAccounts',
+        'ChartOfCalculationTypesObject': 'ChartOfCalculationTypes', 'ExchangePlanObject': 'ExchangePlan',
+        'BusinessProcessObject': 'BusinessProcess', 'TaskObject': 'Task',
+        'InformationRegisterRecordManager': 'InformationRegister', 'InformationRegisterRecordSet': 'InformationRegister',
+        'AccumulationRegisterRecordSet': 'AccumulationRegister',
+    }
+
+    def resolve_common_form_owner(form_el):
+        main_attr = None
+        for attrs in form_el:
+            if isinstance(attrs.tag, str) and localname(attrs) == "Attributes":
+                for a in attrs:
+                    if not isinstance(a.tag, str) or localname(a) != "Attribute":
+                        continue
+                    if any(isinstance(c.tag, str) and localname(c) == "MainAttribute" and (c.text or "").strip() == "true" for c in a):
+                        main_attr = a
+                        break
+                break
+        if main_attr is None:
+            return None
+        type_text = ""
+        for c in main_attr:
+            if isinstance(c.tag, str) and localname(c) == "Type":
+                for tn in c:
+                    if isinstance(tn.tag, str) and localname(tn) == "Type":
+                        type_text = (tn.text or "").strip()
+                        break
+                break
+        if type_text == "cfg:ConstantsSet":
+            return {"Kind": "Constants", "MainName": main_attr.get("name")}
+        m = re.match(r'^cfg:(\w+)\.(\w+)$', type_text)
+        if m and m.group(1) in common_form_owner_kinds:
+            return {"Kind": "Object", "TypeName": common_form_owner_kinds[m.group(1)], "ObjName": m.group(2)}
+        if type_text == "cfg:DynamicList":
+            for el in main_attr.iter():
+                if isinstance(el.tag, str) and localname(el) == "MainTable":
+                    mtm = re.match(r'^(\w+)\.(\w+)$', (el.text or "").strip())
+                    if mtm and mtm.group(1) in CHILD_TYPE_DIR_MAP:
+                        return {"Kind": "Object", "TypeName": mtm.group(1), "ObjName": mtm.group(2)}
+                    break
+        return None
+
+    def borrow_form_constants(src_form_xml_path, main_name):
+        """Набор констант как основной реквизит общей формы: заимствуются константы, пути на которые есть
+        в форме (<Реквизит>.<Константа>), — с типом как в источнике; их ссылочные типы — оболочками
+        (эталон УТ CommonMain: НастройкаПереводаТекста → две константы + перечисление из типа)."""
+        info(f"Borrowing constants for main attribute {main_name} (ConstantsSet)...")
+        names = collect_form_data_paths(src_form_xml_path, main_name)["FirstLevel"]
+        type_xmls = []
+        for c_name in list(names.keys()):
+            c_src_file = os.path.join(cfg_dir, "Constants", f"{c_name}.xml")
+            if not os.path.isfile(c_src_file):
+                continue
+            with open(c_src_file, "r", encoding="utf-8-sig") as fh:
+                c_text = fh.read()
+            # С пробелами: вложенные отступы типа в источнике — ровно та же глубина, что в расширении
+            tm = re.search(r'<Constant uuid="[^"]+">[\s\S]*?<Properties>[\s\S]*?(<Type>[\s\S]*?</Type>)', c_text)
+            c_type_xml = re.sub(r'\s+xmlns(?::\w+)?="[^"]*"', '', tm.group(1)).replace("\r\n", "\n") if tm else ""
+            if c_type_xml:
+                type_xmls.append(c_type_xml)
+            def add_type(xml):
+                # Тип — последним свойством, после ExtendedConfigurationObject (как у Конфигуратора)
+                return re.sub(r'(?P<ind>[ \t]*)<ExtendedConfigurationObject>[^<]*</ExtendedConfigurationObject>',
+                              lambda mm: mm.group(0) + "\n" + mm.group('ind') + c_type_xml, xml, count=1)
+            if test_object_borrowed("Constant", c_name):
+                # Заимствованная раньше оболочкой (-Object Constant.X) — без типа: дописываем, как при
+                # слиянии реквизитов в уже заимствованный объект
+                ext_c_file = os.path.join(ext_dir, "Constants", f"{c_name}.xml")
+                with open(ext_c_file, "r", encoding="utf-8-sig", newline="") as fh:
+                    ext_c_text = fh.read()
+                if c_type_xml and '<Type>' not in ext_c_text:
+                    write_xml_file(ext_c_file, add_type(ext_c_text.replace("\r\n", "\n")))
+                    info(f"  Added type: Constant.{c_name}")
+                else:
+                    info(f"  Already borrowed: Constant.{c_name}")
+                continue
+            src = read_source_object("Constant", c_name)
+            borrowed_xml = build_borrowed_object_xml("Constant", c_name, src["Uuid"], src["Properties"])
+            if c_type_xml:
+                borrowed_xml = add_type(borrowed_xml)
+            target_dir = os.path.join(ext_dir, "Constants")
+            os.makedirs(target_dir, exist_ok=True)
+            target_file = os.path.join(target_dir, f"{c_name}.xml")
+            write_xml_file(target_file, borrowed_xml)
+            add_to_child_objects("Constant", c_name)
+            borrowed_files.append(target_file)
+            info(f"  Borrowed: Constant.{c_name}")
+        borrow_reference_type_shells(type_xmls)
+
+    def borrow_main_attribute(type_name, obj_name, form_name, mode, src_form_xml_path=""):
         dir_name = CHILD_TYPE_DIR_MAP[type_name]
         info(f"Borrowing main attribute for {type_name}.{obj_name} (mode: {mode})...")
+        # Путь к исходной форме: у общей формы его передают явно (владелец выведен из типа реквизита)
+        if not src_form_xml_path:
+            src_form_xml_path = os.path.join(cfg_dir, dir_name, obj_name, "Forms", form_name, "Ext", "Form.xml")
 
         # Step 1: Collect DataPaths (Form mode) or take all (All mode)
         first_level_names = None
         deep_paths = []
         if mode == "Form":
-            src_form_xml_path = os.path.join(cfg_dir, dir_name, obj_name, "Forms", form_name, "Ext", "Form.xml")
             if not os.path.isfile(src_form_xml_path):
                 print(f"Source Form.xml not found: {src_form_xml_path}", file=sys.stderr)
                 sys.exit(1)
@@ -1670,7 +2362,7 @@ def main():
         # тип должен быть заимствован — иначе колонка ссылается на DefinedType/справочник, которого в
         # расширении нет. Конфигуратор поступает так же (эталон: DefinedTypes/Артикул при заимствовании
         # формы заказа поставщику).
-        src_form_for_cols = os.path.join(cfg_dir, dir_name, obj_name, "Forms", form_name, "Ext", "Form.xml")
+        src_form_for_cols = src_form_xml_path
         if os.path.isfile(src_form_for_cols):
             cols_tree = etree.parse(src_form_for_cols)
             cols_ns_strip = re.compile(r'\s+xmlns(?::\w+)?="[^"]*"')
@@ -1678,29 +2370,7 @@ def main():
             if cols_info:
                 all_type_xmls.extend(re.findall(r'(?s)<Columns>.*?</Columns>', cols_info["Xml"]))
 
-        ref_types = collect_reference_types(all_type_xmls)
-        info(f"  Reference types to borrow: {len(ref_types)}")
-
-        for rt in ref_types:
-            if rt["TypeName"] not in CHILD_TYPE_DIR_MAP:
-                warn(f"  Unknown reference type: {rt['TypeName']}.{rt['ObjName']}")
-                continue
-            if test_object_borrowed(rt["TypeName"], rt["ObjName"]):
-                info(f"  Already borrowed: {rt['TypeName']}.{rt['ObjName']}")
-                continue
-            rt_src_file = os.path.join(cfg_dir, CHILD_TYPE_DIR_MAP[rt["TypeName"]], f"{rt['ObjName']}.xml")
-            if not os.path.isfile(rt_src_file):
-                warn(f"  Source not found: {rt['TypeName']}.{rt['ObjName']}")
-                continue
-            src = read_source_object(rt["TypeName"], rt["ObjName"])
-            borrowed_xml = build_borrowed_object_xml(rt["TypeName"], rt["ObjName"], src["Uuid"], src["Properties"])
-            target_dir = os.path.join(ext_dir, CHILD_TYPE_DIR_MAP[rt["TypeName"]])
-            os.makedirs(target_dir, exist_ok=True)
-            target_file = os.path.join(target_dir, f"{rt['ObjName']}.xml")
-            write_xml_file(target_file, borrowed_xml)
-            add_to_child_objects(rt["TypeName"], rt["ObjName"])
-            borrowed_files.append(target_file)
-            info(f"  Auto-borrowed: {rt['TypeName']}.{rt['ObjName']}")
+        borrow_reference_type_shells(all_type_xmls)
 
         # Step 5: Handle deep paths (Form mode only)
         if mode == "Form" and deep_paths:
@@ -1794,12 +2464,30 @@ def main():
     def borrow_form(type_name, obj_name, form_name, borrow_main_attr=False):
         dir_name = CHILD_TYPE_DIR_MAP[type_name]
 
+        # Общая форма — сама объект конфигурации: описание CommonForms/<Имя>.xml с корнем <CommonForm>,
+        # тело CommonForms/<Имя>/Ext/Form.xml, регистрация в Configuration.xml. Форма объекта — в Forms
+        # владельца. Остальное (скелет, BaseForm, связи, оформление, картинки) одинаково (эталон УТ link).
+        is_common_form = type_name == "CommonForm"
+        # Уже заимствованная общая форма (в т.ч. оболочкой от прежних версий навыка) в Configuration.xml
+        # уже есть — повторно не регистрируем
+        common_form_registered = is_common_form and test_object_borrowed(type_name, obj_name)
+        if is_common_form:
+            src_form_dir = os.path.join(cfg_dir, dir_name, obj_name)
+            form_meta_file = os.path.join(ext_dir, dir_name, f"{obj_name}.xml")
+            ext_form_dir = os.path.join(ext_dir, dir_name, obj_name)
+            form_meta_tag = "CommonForm"
+        else:
+            src_form_dir = os.path.join(cfg_dir, dir_name, obj_name, "Forms", form_name)
+            form_meta_file = os.path.join(ext_dir, dir_name, obj_name, "Forms", f"{form_name}.xml")
+            ext_form_dir = os.path.join(ext_dir, dir_name, obj_name, "Forms", form_name)
+            form_meta_tag = "Form"
+
         # 1. Read source form UUID
         form_uuid = read_source_form_uuid(type_name, obj_name, form_name)
         info(f"  Source form UUID: {form_uuid}")
 
         # 2. Read source Form.xml
-        src_form_xml_path = os.path.join(cfg_dir, dir_name, obj_name, "Forms", form_name, "Ext", "Form.xml")
+        src_form_xml_path = os.path.join(src_form_dir, "Ext", "Form.xml")
         if not os.path.isfile(src_form_xml_path):
             print(f"Source Form.xml not found: {src_form_xml_path}", file=sys.stderr)
             sys.exit(1)
@@ -1809,13 +2497,12 @@ def main():
         # 3. Generate form metadata XML.
         # If the wrapper was already borrowed, reuse its uuid so re-borrow is idempotent
         # (regenerating it would churn the form's identity on every rerun).
-        existing_wrapper = os.path.join(ext_dir, dir_name, obj_name, "Forms", f"{form_name}.xml")
         new_form_uuid = ""
-        if os.path.isfile(existing_wrapper):
+        if os.path.isfile(form_meta_file):
             try:
-                existing_root = etree.parse(existing_wrapper).getroot()
+                existing_root = etree.parse(form_meta_file).getroot()
                 for c in existing_root:
-                    if isinstance(c.tag, str) and localname(c) == "Form":
+                    if isinstance(c.tag, str) and localname(c) == form_meta_tag:
                         new_form_uuid = c.get("uuid", "") or ""
                         break
             except Exception:
@@ -1825,7 +2512,7 @@ def main():
         form_meta_lines = [
             '<?xml version="1.0" encoding="UTF-8"?>',
             f'<MetaDataObject {XMLNS_DECL} version="{format_version}">',
-            f'\t<Form uuid="{new_form_uuid}">',
+            f'\t<{form_meta_tag} uuid="{new_form_uuid}">',
             '\t\t<InternalInfo/>',
             '\t\t<Properties>',
             '\t\t\t<ObjectBelonging>Adopted</ObjectBelonging>',
@@ -1834,15 +2521,14 @@ def main():
             f'\t\t\t<ExtendedConfigurationObject>{form_uuid}</ExtendedConfigurationObject>',
             '\t\t\t<FormType>Managed</FormType>',
             '\t\t</Properties>',
-            '\t</Form>',
+            f'\t</{form_meta_tag}>',
             '</MetaDataObject>',
         ]
 
         # 4. Create directories
-        form_meta_dir = os.path.join(ext_dir, dir_name, obj_name, "Forms")
+        form_meta_dir = os.path.dirname(form_meta_file)
         os.makedirs(form_meta_dir, exist_ok=True)
 
-        form_meta_file = os.path.join(form_meta_dir, f"{form_name}.xml")
         write_xml_file(form_meta_file, "\n".join(form_meta_lines))
         info(f"  Created: {form_meta_file}")
 
@@ -1895,14 +2581,51 @@ def main():
         src_main_info = get_main_attribute_info(src_form_el, ns_strip_pattern)
         src_main_attr_name = src_main_info["Name"] if src_main_info else ""
         form_attr_ids = get_form_attribute_ids(src_form_el)
+        # Условное оформление формы Конфигуратор копирует как есть в обе части, внутрь <Attributes>
+        # после реквизитов — и без основного реквизита тоже; ссылки на незаимствованные реквизиты формы
+        # платформа принимает (эталоны УТ StdPic, StdPic_WithMain, CAStyle, УНФ Номенклатура)
+        src_cond_appearance_xml = ""
+        for attrs_el in src_form_el:
+            if isinstance(attrs_el.tag, str) and localname(attrs_el) == "Attributes":
+                for ca_el in attrs_el:
+                    if isinstance(ca_el.tag, str) and localname(ca_el) == "ConditionalAppearance":
+                        src_cond_appearance_xml = ns_strip_pattern.sub("", decode_numeric_entities(
+                            etree.tostring(ca_el, encoding="unicode", with_tail=False)))
+                        break
+                break
 
         # Основной реквизит исходной формы: его имя — корень путей к данным, которые нужно сохранить
         # («Объект.» у формы объекта, «Список.» у формы списка, «Запись.» у формы записи регистра)
         main_attr_info = src_main_info if borrow_main_attr else None
-        # Имена реквизитов объекта нужны в обоих режимах: без заимствования — чтобы построить
-        # непрозрачный путь, с заимствованием — чтобы отличить реквизит (разрешается текстом) от
-        # стандартного поля (не разрешается)
-        src_attr_uuids = get_source_attribute_uuids(type_name, obj_name)
+        # Имена реквизитов объекта нужны в обоих режимах: без заимствования — для кода пути в связях
+        # формы, с заимствованием — чтобы отличить реквизит (разрешается текстом) от стандартного поля
+        # У общей формы реквизиты берутся у владельца, выведенного из типа основного реквизита;
+        # у набора констант — ничего: код пути на константу не измерен, связь без основного реквизита
+        # вырезается с предупреждением, с ним — остаётся текстом
+        if is_common_form:
+            cf_owner = resolve_common_form_owner(etree.parse(src_form_xml_path).getroot())
+            src_attr_uuids = {}
+            if cf_owner and cf_owner["Kind"] == "Object":
+                src_attr_uuids = get_source_attribute_uuids(cf_owner["TypeName"], cf_owner["ObjName"])
+            elif cf_owner and cf_owner["Kind"] == "Constants":
+                # Константы, на которые есть пути: с основным реквизитом путь на заимствованную — текстом
+                for c_name in list(collect_form_data_paths(src_form_xml_path, cf_owner["MainName"])["FirstLevel"].keys()):
+                    c_file = os.path.join(cfg_dir, "Constants", f"{c_name}.xml")
+                    if not os.path.isfile(c_file):
+                        continue
+                    with open(c_file, "r", encoding="utf-8-sig") as fh:
+                        cm = re.search(r'<Constant uuid="([^"]+)"', fh.read())
+                    if cm:
+                        src_attr_uuids[c_name] = cm.group(1)
+        else:
+            src_attr_uuids = get_source_attribute_uuids(type_name, obj_name)
+        # Реквизиты объекта, которые попадут в расширение: в режиме Form — только используемые формой
+        # (тот же сбор, что в borrow_main_attribute), в режиме All — все (None)
+        borrowed_names = None
+        if main_attr_info is not None and borrow_main_attribute_mode == "Form":
+            borrowed_names = collect_form_data_paths(src_form_xml_path, src_main_attr_name)["FirstLevel"]
+        link_ctx = get_link_context(src_form_el, src_main_attr_name, main_attr_info is not None,
+                                    borrowed_names, src_attr_uuids, form_attr_ids)
         main_attr_name = main_attr_info["Name"] if main_attr_info else ""
         if borrow_main_attr and main_attr_info is None:
             warn("  У формы нет основного реквизита — -BorrowMainAttribute проигнорирован")
@@ -1920,8 +2643,7 @@ def main():
             auto_cmd_xml = re.sub(r'\s*<CommandSet/>', '', auto_cmd_xml)
             # Strip data-binding tags whose root attribute isn't borrowed
             auto_cmd_xml = strip_form_bindings(auto_cmd_xml, main_attr_name)
-            auto_cmd_xml = rewrite_choice_parameter_links(
-                auto_cmd_xml, src_attr_uuids, form_attr_ids, src_main_attr_name, main_attr_info is not None)
+            auto_cmd_xml = rewrite_choice_parameter_links(auto_cmd_xml, link_ctx)
 
         # ChildItems: copy full tree, clean up base-config references
         child_items_xml = ""
@@ -1931,6 +2653,22 @@ def main():
                 src_child_items = fc
                 break
 
+        # Картинка декорации в заимствованную форму не переносится: Конфигуратор выбрасывает <Picture>
+        # у PictureDecoration из обеих частей формы при любом виде картинки (своя, общая, стандартная)
+        # и не тянет за ней ни файл, ни общую картинку. Замер 8.3.27: 10 декораций в 5 формах УТ.
+        # Картинки кнопок, таблиц и полей картинки остаются — вместе с файлами, см. копирование ниже.
+        if src_child_items is not None:
+            for deco in [e for e in src_child_items.iter() if isinstance(e.tag, str) and localname(e) == "PictureDecoration"]:
+                for deco_pic in [c for c in deco if isinstance(c.tag, str) and localname(c) == "Picture"]:
+                    # Отступ перед картинкой — хвост предыдущего узла; как в PS-порте, уходит он,
+                    # а хвост самой картинки занимает его место.
+                    prev = deco_pic.getprevious()
+                    if prev is not None:
+                        prev.tail = deco_pic.tail
+                    else:
+                        deco.text = deco_pic.tail
+                    deco.remove(deco_pic)
+
         if src_child_items is not None:
             child_items_xml = decode_numeric_entities(etree.tostring(src_child_items, encoding="unicode", with_tail=False))
             child_items_xml = ns_strip_pattern.sub("", child_items_xml)
@@ -1938,13 +2676,28 @@ def main():
             child_items_xml = re.sub(r'<CommandName>[^<]*</CommandName>', '<CommandName>0</CommandName>', child_items_xml)
             # Strip data-binding tags whose root attribute isn't borrowed
             child_items_xml = strip_form_bindings(child_items_xml, main_attr_name)
-            child_items_xml = rewrite_choice_parameter_links(
-                child_items_xml, src_attr_uuids, form_attr_ids, src_main_attr_name, main_attr_info is not None)
-            # Вложенные CommandSet (у таблиц, полей табличного документа и т.п.) — целиком, см. выше
+            child_items_xml = rewrite_choice_parameter_links(child_items_xml, link_ctx)
+            # Вложенные CommandSet (у таблиц, полей табличного документа и т.п.) — целиком, см. выше.
+            # Исключение — набор таблицы самого основного реквизита, когда он заимствован: его команды
+            # (Find/CancelSearch динамического списка) снова разрешимы, и Конфигуратор набор оставляет
+            # (эталоны УТ CommonMain/ФайлыВТоме, StdPic_WithMain/ЖурналСкладскихАктов; без основного
+            # реквизита и у прочих элементов — выброшен во всех эталонах).
+            kept_cmd_sets = {}
+            if main_attr_name:
+                main_table_pat = (r'(?s)(<Table name="[^"]+" id="\d+">(?:(?!<ChildItems>|</Table>|<CommandSet>).)*?<DataPath>'
+                                  + re.escape(main_attr_name)
+                                  + r'</DataPath>(?:(?!<ChildItems>|</Table>|<CommandSet>).)*?)(<CommandSet>.*?</CommandSet>)')
+
+                def keep_cmd_set(m):
+                    key = f"@@KEPTCMDSET{len(kept_cmd_sets)}@@"
+                    kept_cmd_sets[key] = m.group(2)
+                    return m.group(1) + key
+                child_items_xml = re.sub(main_table_pat, keep_cmd_set, child_items_xml)
             child_items_xml = re.sub(r'(?s)\s*<CommandSet>.*?</CommandSet>', '', child_items_xml)
             child_items_xml = re.sub(r'\s*<CommandSet/>', '', child_items_xml)
-            # Strip TypeLink blocks with human-readable DataPath (Items.XXX)
-            child_items_xml = re.sub(r'\s*<TypeLink>\s*<xr:DataPath>Items\.[^<]*</xr:DataPath>.*?</TypeLink>', '', child_items_xml, flags=re.DOTALL)
+            for key, val in kept_cmd_sets.items():
+                child_items_xml = child_items_xml.replace(key, val)
+            child_items_xml = rewrite_type_links(child_items_xml, link_ctx)
             # Strip element-level Events
             child_items_xml = re.sub(r'\s*<Events>.*?</Events>', '', child_items_xml, flags=re.DOTALL)
 
@@ -1988,8 +2741,8 @@ def main():
                 cp_name = pm.group(1)
                 if cp_name not in borrowed_pic_set:
                     child_items_xml = child_items_xml[:pm.start()] + child_items_xml[pm.end():]
-            # Strip StdPicture blocks (except Print)
-            child_items_xml = re.sub(r'\s*<Picture>\s*<xr:Ref>StdPicture\.(?!Print\b)\w+</xr:Ref>.*?</Picture>', '', child_items_xml, flags=re.DOTALL)
+            # Стандартные картинки (StdPicture.*) не вырезаются: Конфигуратор оставляет их у кнопок, подменю
+            # и страниц в обеих частях формы (эталоны 8.3.27, 26 элементов в 3 формах).
 
             # Same Picture strip for AutoCommandBar
             if auto_cmd_xml:
@@ -1998,30 +2751,6 @@ def main():
                     cp_name = pm.group(1)
                     if cp_name not in borrowed_pic_set:
                         auto_cmd_xml = auto_cmd_xml[:pm.start()] + auto_cmd_xml[pm.end():]
-                auto_cmd_xml = re.sub(r'\s*<Picture>\s*<xr:Ref>StdPicture\.(?!Print\b)\w+</xr:Ref>.*?</Picture>', '', auto_cmd_xml, flags=re.DOTALL)
-
-            # Auto-borrow StyleItems referenced in ChildItems
-            referenced_styles = set()
-            for m in re.finditer(r'ref="style:(\w+)"[^>]*kind="StyleItem"', child_items_xml):
-                referenced_styles.add(m.group(1))
-            for m in re.finditer(r'>style:(\w+)</\w+>', child_items_xml):
-                referenced_styles.add(m.group(1))
-
-            for style_name in referenced_styles:
-                if not test_object_borrowed("StyleItem", style_name):
-                    style_src_file = os.path.join(cfg_dir, "StyleItems", f"{style_name}.xml")
-                    if os.path.isfile(style_src_file):
-                        src = read_source_object("StyleItem", style_name)
-                        borrowed_xml = build_borrowed_object_xml("StyleItem", style_name, src["Uuid"], src["Properties"])
-                        target_dir = os.path.join(ext_dir, "StyleItems")
-                        os.makedirs(target_dir, exist_ok=True)
-                        target_file = os.path.join(target_dir, f"{style_name}.xml")
-                        write_xml_file(target_file, borrowed_xml)
-                        add_to_child_objects("StyleItem", style_name)
-                        borrowed_files.append(target_file)
-                        info(f"  Auto-borrowed: StyleItem.{style_name}")
-                    else:
-                        warn(f"  StyleItem.{style_name} not found in source config")
 
             # Auto-borrow Enums + EnumValues referenced via DesignTimeRef
             referenced_enum_values = {}  # enum_name -> set of value_names
@@ -2087,6 +2816,35 @@ def main():
                     else:
                         warn(f"  Enum.{enum_name} not found in source config")
 
+        # Вне блока ChildItems: стили нужны и оформлению формы без элементов
+        # Auto-borrow StyleItems referenced in ChildItems and in the form's conditional appearance
+        # (стиль только из оформления Конфигуратор тоже заимствует — эталон УТ CAStyle).
+        # Порядок первого упоминания — как в PS-порте (от него зависит порядок в ChildObjects)
+        style_scan_xml = child_items_xml + src_cond_appearance_xml
+        referenced_styles = {}
+        for m in re.finditer(r'ref="style:(\w+)"[^>]*kind="StyleItem"', style_scan_xml):
+            referenced_styles[m.group(1)] = True
+        # Закрывающий тег может быть с префиксом: в оформлении значение — <dcscor:value>style:X</dcscor:value>
+        for m in re.finditer(r'>style:(\w+)</[\w:]+>', style_scan_xml):
+            referenced_styles[m.group(1)] = True
+
+        for style_name in referenced_styles:
+            if not test_object_borrowed("StyleItem", style_name):
+                style_src_file = os.path.join(cfg_dir, "StyleItems", f"{style_name}.xml")
+                if os.path.isfile(style_src_file):
+                    src = read_source_object("StyleItem", style_name)
+                    borrowed_xml = build_borrowed_object_xml("StyleItem", style_name, src["Uuid"], src["Properties"])
+                    target_dir = os.path.join(ext_dir, "StyleItems")
+                    os.makedirs(target_dir, exist_ok=True)
+                    target_file = os.path.join(target_dir, f"{style_name}.xml")
+                    write_xml_file(target_file, borrowed_xml)
+                    add_to_child_objects("StyleItem", style_name)
+                    borrowed_files.append(target_file)
+                    info(f"  Auto-borrowed: StyleItem.{style_name}")
+                # Файла нет — встроенный стиль платформы (ImportantColor, AccentColor…): заимствовать
+                # нечего, пропускаем молча. Пользовательский стиль, на который ссылается форма, в
+                # валидном источнике существует всегда — предупреждение было только шумом.
+
         # Открывающий тег <Form ...> берём из исходной формы — ради её объявлений пространств
         # имён, но version подставляем СВОЮ: форма обязана нести версию расширения, иначе
         # платформа отвергает импорт (форма 2.13 внутри расширения 2.17). Раньше тег
@@ -2124,45 +2882,38 @@ def main():
         if child_items_xml:
             parts.append(f"\t{child_items_xml}\r\n")
 
-        # Attributes: empty or with MainAttribute when borrow_main_attr
-        if borrow_main_attr and main_attr_info:
+        # Attributes: основной реквизит (с -BorrowMainAttribute) и условное оформление формы — после него
+        with_main_attr = bool(borrow_main_attr and main_attr_info)
+        if with_main_attr or src_cond_appearance_xml:
             parts.append("\t<Attributes>\r\n")
-            parts.append(f"\t\t{main_attr_info['Xml']}\r\n")
+            if with_main_attr:
+                parts.append(f"\t\t{main_attr_info['Xml']}\r\n")
+            if src_cond_appearance_xml:
+                parts.append(f"\t\t{src_cond_appearance_xml}\r\n")
             parts.append("\t</Attributes>")
         else:
             parts.append("\t<Attributes/>")
         parts.append("\r\n")
 
-        # BaseForm: same content, indented one more level
+        # BaseForm: same content, indented one more level (многострочный текст не сдвигается)
         parts.append(f'\t<BaseForm version="{form_version}">\r\n')
 
         for prop_xml in form_props:
             prop_xml_clean = ns_strip_pattern.sub("", prop_xml)
-            parts.append(f"\t\t{prop_xml_clean}\r\n")
+            parts.append(indent_for_base_form(prop_xml_clean, "\t\t") + "\r\n")
         if auto_cmd_xml:
-            ac_lines = auto_cmd_xml.split("\n")
-            for li, line in enumerate(ac_lines):
-                if li == 0:
-                    parts.append(f"\t\t{line}")
-                else:
-                    parts.append(f"\t{line}")
-                parts.append("\r\n")
+            parts.append(indent_for_base_form(auto_cmd_xml, "\t\t") + "\r\n")
         if child_items_xml:
-            ci_lines = child_items_xml.split("\n")
-            for li, line in enumerate(ci_lines):
-                if li == 0:
-                    parts.append(f"\t\t{line}")
-                else:
-                    parts.append(f"\t{line}")
-                parts.append("\r\n")
+            parts.append(indent_for_base_form(child_items_xml, "\t\t") + "\r\n")
 
         # BaseForm Attributes: same as main section
-        if borrow_main_attr and main_attr_info:
+        if with_main_attr or src_cond_appearance_xml:
             parts.append("\t\t<Attributes>\r\n")
-            # В BaseForm та же секция на уровень глубже — приём переиндентации тот же, что у ChildItems
-            for li, line in enumerate(main_attr_info['Xml'].split('\n')):
-                parts.append(f"\t\t\t{line}" if li == 0 else f"\t{line}")
-                parts.append("\r\n")
+            # В BaseForm та же секция на уровень глубже — сдвиг тот же, что у ChildItems
+            if with_main_attr:
+                parts.append(indent_for_base_form(main_attr_info['Xml'], "\t\t\t") + "\r\n")
+            if src_cond_appearance_xml:
+                parts.append(indent_for_base_form(src_cond_appearance_xml, "\t\t\t") + "\r\n")
             parts.append("\t\t</Attributes>")
         else:
             parts.append("\t\t<Attributes/>")
@@ -2170,14 +2921,29 @@ def main():
         parts.append("\t</BaseForm>\r\n")
         parts.append("</Form>")
 
-        form_xml_dir = os.path.join(form_meta_dir, form_name, "Ext")
+        # Динамический список: оболочка его основной таблицы и тильда у путей полей — в конце запуска
+        # (шаги 14a и 14c), по итоговому составу расширения — реквизиты основной таблицы заимствует
+        # borrow_main_attribute уже после формы, а в пакете — и соседние формы.
+        form_xml_text = "".join(parts)
+        pending_dyn_list = with_main_attr and (':DynamicList<' in main_attr_info['Xml']
+                                               or 'xsi:type="DynamicList"' in main_attr_info['Xml'])
+
+        form_xml_dir = os.path.join(ext_form_dir, "Ext")
         os.makedirs(form_xml_dir, exist_ok=True)
         form_xml_file = os.path.join(form_xml_dir, "Form.xml")
-        write_xml_file(form_xml_file, "".join(parts))
+        write_xml_file(form_xml_file, form_xml_text)
+        if pending_dyn_list:
+            dl_mt = re.search(r'<MainTable>([^<]*)</MainTable>', main_attr_info['Xml'])
+            dl_qt = re.search(r'(?s)<QueryText>(.*?)</QueryText>', main_attr_info['Xml'])
+            dyn_list_forms.append({
+                'File': form_xml_file, 'MainName': main_attr_info['Name'],
+                'Manual': '<ManualQuery>true</ManualQuery>' in main_attr_info['Xml'],
+                'MainTable': dl_mt.group(1).strip() if dl_mt else '',
+                'Query': html.unescape(dl_qt.group(1)) if dl_qt else ''})
         info(f"  Created: {form_xml_file}")
         if DROPPED_LINKS:
             uniq = sorted(set(DROPPED_LINKS))
-            warn(f"  Вырезано связей параметров выбора: {len(uniq)} — путь не разрешается в расширении: {', '.join(uniq)}")
+            warn(f"  Вырезано связей формы: {len(uniq)} — путь не разрешается в расширении: {', '.join(uniq)}")
             DROPPED_LINKS.clear()
 
         # 6. Create empty Module.bsl — but NEVER overwrite an existing one (re-borrow must
@@ -2191,10 +2957,55 @@ def main():
             write_utf8_bom(module_bsl_file, "")
             info(f"  Created: {module_bsl_file}")
 
-        # 7. Register form in parent object ChildObjects
-        register_form_in_object(type_name, obj_name, form_name)
+        # 6b. Встроенные картинки элементов. Form.xml ссылается на них как <xr:Abs>Файл</xr:Abs>, а сам файл
+        # лежит в Ext/Form/Items/<Элемент>/<Файл>; без него платформа отвергает расширение («Файл не найден»).
+        # Конфигуратор копирует их байт в байт. Берём ровно то, на что ссылается скелет (картинки декораций
+        # выброшены выше). Уже лежащий файл не перезаписываем: его могли заменить в расширении.
+        pic_files = []
+        src_items_dir = os.path.join(os.path.dirname(src_form_xml_path), "Form", "Items")
+        pic_rels = []
+        for sect in (src_auto_cmd, src_child_items):
+            if sect is None:
+                continue
+            for abs_node in sect.iter("{http://v8.1c.ru/8.3/xcf/readable}Abs"):
+                pic_owner = abs_node.getparent().getparent()
+                pic_el_name = pic_owner.get("name") if pic_owner is not None else None
+                pic_file_name = (abs_node.text or "").strip()
+                if not pic_el_name or not pic_file_name:
+                    continue
+                # Платформа пишет сюда голое имя файла. Иное (путь, «..») — не наша выгрузка: мимо Items не ходим.
+                if ("\\" in pic_el_name or "\\" in pic_file_name or "/" in pic_el_name or "/" in pic_file_name
+                        or pic_el_name in (".", "..") or pic_file_name in (".", "..")):
+                    warn(f"  Картинка элемента пропущена — не имя файла: {pic_el_name} / {pic_file_name}")
+                    continue
+                rel = f"{pic_el_name}/{pic_file_name}"
+                if rel not in pic_rels:
+                    pic_rels.append(rel)
+        for rel in sorted(pic_rels):
+            pic_el_name, pic_file_name = rel.split("/", 1)
+            src_pic = os.path.join(src_items_dir, pic_el_name, pic_file_name)
+            dst_pic_dir = os.path.join(module_dir, "Items", pic_el_name)
+            dst_pic = os.path.join(dst_pic_dir, pic_file_name)
+            if os.path.exists(dst_pic):
+                info(f"  Preserved existing: {dst_pic}")
+                continue
+            if not os.path.isfile(src_pic):
+                warn(f"  Картинка элемента не найдена в источнике: {src_pic}")
+                continue
+            os.makedirs(dst_pic_dir, exist_ok=True)
+            shutil.copyfile(src_pic, dst_pic)
+            pic_files.append(dst_pic)
+            info(f"  Copied: {dst_pic}")
 
-        return [form_meta_file, form_xml_file, module_bsl_file]
+        # 7. Register form in parent object ChildObjects
+        # общая форма — в Configuration.xml, форма объекта — в ChildObjects владельца
+        if is_common_form:
+            if not common_form_registered:
+                add_to_child_objects(type_name, obj_name)
+        else:
+            register_form_in_object(type_name, obj_name, form_name)
+
+        return [form_meta_file, form_xml_file, module_bsl_file] + pic_files
 
     # --- 9. Parse -Object into items ---
     items = []
@@ -2213,8 +3024,8 @@ def main():
         if borrow_main_attribute_mode not in ("Form", "All"):
             print("-BorrowMainAttribute accepts 'Form' or 'All' (default: Form)", file=sys.stderr)
             sys.exit(1)
-        # Validate: only with .Form. pattern
-        has_form = any(".Form." in item for item in items)
+        # Validate: only with a form — .Form. pattern or a common form
+        has_form = any(".Form." in item or re.match(r'^(CommonForm|ОбщаяФорма)\.', item) for item in items)
         if not has_form:
             print("-BorrowMainAttribute requires a form in -Object (e.g. 'Catalog.X.Form.Y')", file=sys.stderr)
             sys.exit(1)
@@ -2285,14 +3096,24 @@ def main():
             form_name = remainder[form_idx + 6:]
         else:
             obj_name = remainder
+        # Общая форма — сама форма: «CommonForm.X» заимствуется вместе с содержимым, владельца у неё нет
+        is_common_form = type_name == "CommonForm"
+        if is_common_form:
+            if form_name:
+                print(f"Invalid format '{item}': общая форма задаётся как 'CommonForm.Имя'", file=sys.stderr)
+                sys.exit(1)
+            form_name = obj_name
 
         dir_name = CHILD_TYPE_DIR_MAP[type_name]
 
         if form_name:
             # --- Form borrowing ---
-            info(f"Borrowing form {type_name}.{obj_name}.Form.{form_name}...")
+            if is_common_form:
+                info(f"Borrowing common form {type_name}.{obj_name}...")
+            else:
+                info(f"Borrowing form {type_name}.{obj_name}.Form.{form_name}...")
 
-            if not test_object_borrowed(type_name, obj_name):
+            if not is_common_form and not test_object_borrowed(type_name, obj_name):
                 info(f"  Parent object {type_name}.{obj_name} not yet borrowed \u2014 borrowing first...")
 
                 src = read_source_object(type_name, obj_name)
@@ -2317,7 +3138,27 @@ def main():
             borrowed_count += 1
 
             # Borrow main attribute if requested
-            if has_bma:
+            if has_bma and is_common_form:
+                # У общей формы владельца нет — он выводится из типа основного реквизита
+                cf_src_form_xml_path = os.path.join(cfg_dir, dir_name, obj_name, "Ext", "Form.xml")
+                cf_owner = resolve_common_form_owner(etree.parse(cf_src_form_xml_path).getroot())
+                if not cf_owner:
+                    info("  Основной реквизит общей формы не ссылается на объект — заимствуется только сам реквизит")
+                elif cf_owner["Kind"] == "Constants":
+                    borrow_form_constants(cf_src_form_xml_path, cf_owner["MainName"])
+                else:
+                    if not test_object_borrowed(cf_owner["TypeName"], cf_owner["ObjName"]):
+                        src = read_source_object(cf_owner["TypeName"], cf_owner["ObjName"])
+                        borrowed_xml = build_borrowed_object_xml(cf_owner["TypeName"], cf_owner["ObjName"], src["Uuid"], src["Properties"])
+                        owner_dir = os.path.join(ext_dir, CHILD_TYPE_DIR_MAP[cf_owner["TypeName"]])
+                        os.makedirs(owner_dir, exist_ok=True)
+                        owner_file = os.path.join(owner_dir, f"{cf_owner['ObjName']}.xml")
+                        write_xml_file(owner_file, borrowed_xml)
+                        add_to_child_objects(cf_owner["TypeName"], cf_owner["ObjName"])
+                        borrowed_files.append(owner_file)
+                        info(f"  Auto-borrowed: {cf_owner['TypeName']}.{cf_owner['ObjName']}")
+                    borrow_main_attribute(cf_owner["TypeName"], cf_owner["ObjName"], None, borrow_main_attribute_mode, cf_src_form_xml_path)
+            elif has_bma:
                 borrow_main_attribute(type_name, obj_name, form_name, borrow_main_attribute_mode)
         else:
             # --- Object borrowing ---
@@ -2348,6 +3189,19 @@ def main():
             for kind in resolve_module_kinds(type_name):
                 borrowed_files.append(new_borrowed_module_file(type_name, obj_name, kind))
             borrowed_count += 1
+
+    # --- 14a. Основные таблицы динамических списков заимствованных форм — оболочками ---
+    # Объект основной таблицы списка обязан быть в расширении («Неверно указана главная таблица
+    # динамического списка»), даже если форма принадлежит другому объекту. Для виртуальной таблицы или
+    # ТЧ (InformationRegister.Цены.SliceLast) — объект по первым двум сегментам. До шага 14b: оболочке
+    # справочника нужны и его владельцы.
+    for dl in dyn_list_forms:
+        mt = re.match(r'^(\w+)\.(\w+)(?:\.\w+)*$', dl['MainTable'])
+        if mt and mt.group(1) in CHILD_TYPE_DIR_MAP:
+            mt_kind, mt_name = mt.group(1), mt.group(2)
+            if not test_object_borrowed(mt_kind, mt_name):
+                info(f"Основная таблица динамического списка {mt_kind}.{mt_name} — в расширение оболочкой")
+                borrow_object_shell(mt_kind, mt_name)
 
     # --- Владельцы заимствованных справочников ---
     # Ссылка в <Owners> должна вести на объект, который в расширении есть: иначе платформа падает
@@ -2389,6 +3243,44 @@ def main():
             add_to_child_objects(o_type, o_name)
             borrowed_files.append(ow_file)
             info(f"  Auto-borrowed owner: {o_type}.{o_name}")
+
+    # --- 14c. Тильда у путей полей динамических списков заимствованных форм ---
+    # Запрос списка компилируется в контексте расширения, и что-то из него, чего там нет, делает
+    # невалидными все поля списка («Неверный путь к данным»). Конфигуратор такие пути пишет с тильдой —
+    # платформа разрешает их после наложения на основную конфигурацию. Тильду ставим, только если
+    # список не разрешится в расширении (get_dyn_list_query_unresolved): лишняя тильда безвредна, но первая
+    # выгрузка из базы её снимет — шум в истории файлов. У списка без ручного запроса поля — пути формы
+    # по основной таблице: проверяем их как запрос «ВЫБРАТЬ Т.Поле… ИЗ <таблица> КАК Т». Решаем здесь,
+    # по итоговому составу расширения (после 14a и 14b): реквизиты заимствуются уже после формы, в пакете —
+    # и соседними формами. Помечаются привязки, которые платформа проверяет при загрузке: *DataPath
+    # элементов (DataPath, FooterDataPath, RowPictureDataPath…) и <Field> в UseAlways; в форме и в
+    # BaseForm. Сам список (DataPath без поля) — как есть; пути отбора и оформления (dcsset:/dcscor:)
+    # не проверяются.
+    for dl in dyn_list_forms:
+        with open(dl['File'], 'r', encoding='utf-8-sig', newline='') as fh:
+            dl_text = fh.read()
+        if dl['Manual']:
+            dl_query = dl['Query']
+        else:
+            if not dl['MainTable']:
+                continue
+            dl_path_pat = r'<(?:\w*DataPath|Field)>~?' + re.escape(dl['MainName']) + r'\.([^<]+)<'
+            dl_fields = list(dict.fromkeys("Т." + m.group(1) for m in re.finditer(dl_path_pat, dl_text)))
+            if not dl_fields:
+                continue
+            dl_query = "ВЫБРАТЬ " + ", ".join(dl_fields) + f" ИЗ {dl['MainTable']} КАК Т"
+        dl_unresolved = get_dyn_list_query_unresolved(dl_query)
+        if not dl_unresolved:
+            continue
+        dl_field_pat = r'(<(?:\w*DataPath|Field)>)(?=' + re.escape(dl['MainName']) + r'\.)'
+        dl_text, dl_count = re.subn(dl_field_pat, r'\1~', dl_text)
+        if dl_count > 0:
+            write_utf8_bom(dl['File'], dl_text)
+            dl_shown = ", ".join(dl_unresolved[:5])
+            if len(dl_unresolved) > 5:
+                dl_shown += ", …"
+            dl_rel = os.path.relpath(dl['File'], ext_dir).replace('\\', '/')
+            info(f"Поля динамического списка ({dl_rel}): пути с тильдой ({dl_count}) — список использует то, чего нет в расширении ({dl_shown}); разрешатся после наложения")
 
     # --- Save modified Configuration.xml ---
     save_xml_bom(tree, ext_resolved)

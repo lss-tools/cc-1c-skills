@@ -12,15 +12,18 @@ const GUARDS = [
   ['check-enum-drift.mjs', 'allowlist-и перечислений: meta-compile ↔ meta-validate ↔ meta-edit'],
   ['check-type-synonyms.mjs', 'словари типов: meta-edit не противоречит meta-compile'],
   ['check-uuid-invariant.mjs', 'сохранение uuid объекта и сущностей при правке'],
-  ['check-minimal-diff.mjs', 'правка роли: диф только там, где просили'],
+  ['check-minimal-diff.mjs', 'правка роли и формы: диф только там, где просили'],
   ['check-inline-drift.mjs', 'общие inline-реализации: копии совпадают с эталонами'],
+  ['check-ps-define-before-call.mjs', 'порядок в .ps1: функция объявлена выше точки вызова'],
   ['check-type-maps.mjs', 'карты типов метаданных: согласованы со спецификацией'],
+  ['check-typeset-coverage.mjs', 'имена типов: вывод meta-info замыкается на вход meta-compile'],
   ['check-format-versions.mjs', 'проверенный диапазон версий формата: согласован со спецификацией'],
   ['check-form-purposes.mjs', 'назначения форм в form-add: согласованы со спецификацией и между портами'],
   ['check-positional-binding.mjs', 'read-only навыки: позиционным остаётся только путь ко входу'],
   ['check-agent-portability.mjs', 'исходники навыков: без привязки к конкретному AI-агенту'],
   ['check-error-streams.mjs', 'сообщения об ошибках: один и тот же поток в обоих портах'],
   ['check-nonascii-fs.mjs', 'fsutil: удаление и копирование держат не-ASCII пути, копии не разошлись'],
+  ['check-ps-portability.mjs', '.ps1: без $env:TEMP, необработанная ошибка у db-*/epf-* даёт код 1'],
 ];
 
 let failed = 0;

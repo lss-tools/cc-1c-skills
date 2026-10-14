@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# cfe-patch-method v2.11 — Source-aware method interceptor for 1C extension (CFE)
+# cfe-patch-method v2.13 — Source-aware method interceptor for 1C extension (CFE)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 import argparse
@@ -41,6 +41,7 @@ TYPE_DIR_MAP = {
     "BusinessProcess": "BusinessProcesses", "Task": "Tasks",
     "InformationRegister": "InformationRegisters", "AccumulationRegister": "AccumulationRegisters",
     "AccountingRegister": "AccountingRegisters", "CalculationRegister": "CalculationRegisters",
+    "CommonForm": "CommonForms",
     # Прощающий ввод: имя каталога принимается наравне с именем типа (Catalogs.X ≡ Catalog.X) —
     # PS1-порт так умел с самого начала, PY отставал.
     "Catalogs": "Catalogs",
@@ -70,8 +71,83 @@ DECORATOR_MAP = {
     "ModificationAndControl": "ИзменениеИКонтроль",
 }
 
+# InterceptorType -> keyword table key (emission goes through the table, the map above stays
+# the normalized value the logic compares against)
+DECORATOR_KEY = {
+    "Before": "Before", "After": "After", "Instead": "Around",
+    "ModificationAndControl": "Control",
+}
+
+
+# Built-in language keywords in both spellings. The platform accepts either one in any module
+# (pairs taken from the platform string tables), so a module written in English is ordinary
+# source, not a broken one: we must read both and emit the spelling we read.
+def bsl_keywords():
+    return {
+        "ru": {
+            "Async": "Асинх", "Proc": "Процедура", "EndProc": "КонецПроцедуры",
+            "Func": "Функция", "EndFunc": "КонецФункции", "Val": "Знач",
+            "Region": "Область", "EndRegion": "КонецОбласти",
+            "If": "Если", "Then": "Тогда", "ElsIf": "ИначеЕсли", "Else": "Иначе", "EndIf": "КонецЕсли",
+            # Platform spells the negation "Не"; we emit "НЕ" as this skill always has —
+            # the language is case-insensitive, and the lower case would churn every snapshot.
+            "And": "И", "Or": "Или", "Not": "НЕ",
+            "Insert": "Вставка", "EndInsert": "КонецВставки", "Delete": "Удаление", "EndDelete": "КонецУдаления",
+            "Before": "Перед", "After": "После", "Around": "Вместо", "Control": "ИзменениеИКонтроль",
+            "Proceed": "ПродолжитьВызов", "Return": "Возврат",
+            # Not a keyword: name of the local the generated Instead-stub declares. Lives here so
+            # that the language of emitted text is decided in exactly one place.
+            "ResultVar": "Результат",
+            "Directives": ["НаКлиенте", "НаСервере", "НаСервереБезКонтекста", "НаКлиентеНаСервереБезКонтекста", "НаКлиентеНаСервере"],
+        },
+        "en": {
+            "Async": "Async", "Proc": "Procedure", "EndProc": "EndProcedure",
+            "Func": "Function", "EndFunc": "EndFunction", "Val": "Val",
+            "Region": "Region", "EndRegion": "EndRegion",
+            "If": "If", "Then": "Then", "ElsIf": "ElsIf", "Else": "Else", "EndIf": "EndIf",
+            "And": "And", "Or": "Or", "Not": "Not",
+            "Insert": "Insert", "EndInsert": "EndInsert", "Delete": "Delete", "EndDelete": "EndDelete",
+            "Before": "Before", "After": "After", "Around": "Around", "Control": "ChangeAndValidate",
+            "Proceed": "ProceedWithCall", "Return": "Return",
+            "ResultVar": "Result",
+            "Directives": ["AtClient", "AtServer", "AtServerNoContext", "AtClientAtServerNoContext", "AtClientAtServer"],
+        },
+    }
+
+
+BSL_KW = bsl_keywords()
+
+
+# Regex alternation for a keyword in both spellings
+def kw_alt(key):
+    return '(?:' + BSL_KW["ru"][key] + '|' + BSL_KW["en"][key] + ')'
+
+
+# Spelling language of a recognized keyword. English is the discriminator: a Russian keyword
+# never equals an English one, so anything else is 'ru'.
+def bsl_lang(word):
+    w = word.strip().lower()
+    for k in ("Async", "Proc", "EndProc", "Func", "EndFunc", "Region", "If", "Insert", "Delete",
+              "Before", "After", "Around", "Control"):
+        if BSL_KW["en"][k].lower() == w:
+            return "en"
+    return "ru"
+
+
+# Edit marker kind at the start of a line: Insert/Delete/EndInsert/EndDelete, None if none.
+# The marker owns the start of the line only — a trailing comment does not bother the platform
+# and must not bother us either.
+def bsl_marker_kind(line):
+    kw = BSL_KW
+    for k in ("EndInsert", "EndDelete", "Insert", "Delete"):
+        if re.match(r'^\s*#(?:' + kw["ru"][k] + '|' + kw["en"][k] + r')\b', line, re.IGNORECASE):
+            return k
+    return None
+
+
 CONTEXT_RE = re.compile(
-    r'^&(НаКлиенте|НаСервере|НаСервереБезКонтекста|НаКлиентеНаСервереБезКонтекста|НаКлиентеНаСервере)\s*$'
+    r'^&(' + '|'.join(BSL_KW["ru"]["Directives"] + BSL_KW["en"]["Directives"]) + r')\s*$',
+    re.IGNORECASE
 )
 
 
@@ -173,7 +249,7 @@ def get_module_rel_path(module_path):
     if len(parts) < 2:
         raise ValueError(
             "Invalid ModulePath format: %s. Expected: Type.Name.Module, "
-            "Type.Name.Form.FormName or CommonModule.Name" % module_path
+            "Type.Name.Form.FormName, CommonModule.Name or CommonForm.Name" % module_path
         )
     obj_type = parts[0]
     obj_name = parts[1]
@@ -183,6 +259,9 @@ def get_module_rel_path(module_path):
 
     if obj_type == "CommonModule":
         return [dir_name, obj_name, "Ext", "Module.bsl"]
+    if dir_name == "CommonForms":
+        # Общая форма — сама форма: модуль лежит прямо у неё, без Forms/<Имя>
+        return [dir_name, obj_name, "Ext", "Form", "Module.bsl"]
     if len(parts) >= 4 and parts[2] == "Form":
         form_name = parts[3]
         return [dir_name, obj_name, "Forms", form_name, "Ext", "Form", "Module.bsl"]
@@ -300,37 +379,45 @@ def read_signature(lines, start_idx):
     return None
 
 
-def effective_condition(frame):
+def effective_condition(frame, lang):
+    kw_not = BSL_KW[lang]["Not"]
+    kw_and = BSL_KW[lang]["And"]
     conds = frame["conds"]
     n = len(conds)
     if frame["in_else"]:
-        return " И ".join("НЕ (%s)" % c for c in conds)
+        return (" %s " % kw_and).join("%s (%s)" % (kw_not, c) for c in conds)
     if n == 1:
         return conds[0]
-    parts = ["НЕ (%s)" % conds[j] for j in range(n - 1)]
+    parts = ["%s (%s)" % (kw_not, conds[j]) for j in range(n - 1)]
     parts.append(conds[n - 1])
-    return " И ".join(parts)
+    return (" %s " % kw_and).join(parts)
 
 
-def get_enclosing_chain(lines, target_idx):
+def get_enclosing_chain(lines, target_idx, lang):
+    re_region = re.compile(r'^#' + kw_alt("Region") + r'\s+(\S+)', re.IGNORECASE)
+    re_end_region = re.compile(r'^#' + kw_alt("EndRegion"), re.IGNORECASE)
+    re_if = re.compile(r'^#' + kw_alt("If") + r'\s+(.+?)\s+' + kw_alt("Then"), re.IGNORECASE)
+    re_elsif = re.compile(r'^#' + kw_alt("ElsIf") + r'\s+(.+?)\s+' + kw_alt("Then"), re.IGNORECASE)
+    re_else = re.compile(r'^#' + kw_alt("Else") + r'(\s|$)', re.IGNORECASE)
+    re_endif = re.compile(r'^#' + kw_alt("EndIf"), re.IGNORECASE)
     stack = []
     for i in range(target_idx):
         t = lines[i].strip()
-        m = re.match(r'^#Область\s+(\S+)', t)
+        m = re_region.match(t)
         if m:
             stack.append({"kind": "region", "name": m.group(1)})
             continue
-        if re.match(r'^#КонецОбласти', t):
+        if re_end_region.match(t):
             for k in range(len(stack) - 1, -1, -1):
                 if stack[k]["kind"] == "region":
                     del stack[k]
                     break
             continue
-        m = re.match(r'^#Если\s+(.+?)\s+Тогда', t)
+        m = re_if.match(t)
         if m:
             stack.append({"kind": "if", "conds": [m.group(1).strip()], "in_else": False})
             continue
-        m = re.match(r'^#ИначеЕсли\s+(.+?)\s+Тогда', t)
+        m = re_elsif.match(t)
         if m:
             for k in range(len(stack) - 1, -1, -1):
                 if stack[k]["kind"] == "if":
@@ -338,13 +425,13 @@ def get_enclosing_chain(lines, target_idx):
                     stack[k]["in_else"] = False
                     break
             continue
-        if re.match(r'^#Иначе(\s|$)', t):
+        if re_else.match(t):
             for k in range(len(stack) - 1, -1, -1):
                 if stack[k]["kind"] == "if":
                     stack[k]["in_else"] = True
                     break
             continue
-        if re.match(r'^#КонецЕсли', t):
+        if re_endif.match(t):
             for k in range(len(stack) - 1, -1, -1):
                 if stack[k]["kind"] == "if":
                     del stack[k]
@@ -355,13 +442,14 @@ def get_enclosing_chain(lines, target_idx):
         if f["kind"] == "region":
             chain.append({"kind": "region", "name": f["name"]})
         else:
-            chain.append({"kind": "if", "cond": effective_condition(f)})
+            chain.append({"kind": "if", "cond": effective_condition(f, lang)})
     return chain
 
 
 def extract_method(lines, method_name):
     decl_re = re.compile(
-        r'^\s*(Асинх\s+)?(Процедура|Функция)\s+(' + re.escape(method_name) + r')\s*\(',
+        r'^\s*(' + kw_alt("Async") + r'\s+)?(' + kw_alt("Proc") + '|' + kw_alt("Func") + r')\s+('
+        + re.escape(method_name) + r')\s*\(',
         re.IGNORECASE,
     )
     for i in range(len(lines)):
@@ -371,7 +459,8 @@ def extract_method(lines, method_name):
         is_async = bool(m.group(1))
         keyword = m.group(2)
         canonical = m.group(3)
-        is_function = keyword.lower() == "функция"
+        lang = bsl_lang(keyword)
+        is_function = keyword.lower() in (BSL_KW["ru"]["Func"].lower(), BSL_KW["en"]["Func"].lower())
 
         sig = read_signature(lines, i)
         if not sig:
@@ -381,12 +470,12 @@ def extract_method(lines, method_name):
         param_names = []
         if params_text.strip():
             for seg in split_top_level(params_text):
-                s = re.sub(r'^Знач\s+', '', seg.strip())
+                s = re.sub(r'^' + kw_alt("Val") + r'\s+', '', seg.strip(), flags=re.IGNORECASE)
                 mm = re.match(r'^([\w]+)', s)
                 if mm:
                     param_names.append(mm.group(1))
 
-        end_re = re.compile(r'^\s*КонецФункции\b' if is_function else r'^\s*КонецПроцедуры\b',
+        end_re = re.compile(r'^\s*' + (kw_alt("EndFunc") if is_function else kw_alt("EndProc")) + r'\b',
                             re.IGNORECASE)
         body_start = sig_end + 1
         body_end = -1
@@ -404,10 +493,11 @@ def extract_method(lines, method_name):
             if is_context_directive(prev):
                 context = prev
 
-        chain = get_enclosing_chain(lines, i)
+        chain = get_enclosing_chain(lines, i, lang)
 
         return {
             "canonical": canonical,
+            "lang": lang,
             "is_function": is_function,
             "is_async": is_async,
             "params_text": params_text,
@@ -422,19 +512,32 @@ def extract_method(lines, method_name):
     return None
 
 
+# Parse interceptor annotations present in a module. Type is normalized to the Russian spelling
+# so everything downstream stays single-language; raw keeps what the file actually says.
 def get_interceptors(lines):
+    kw = BSL_KW
+    keys = ("Before", "After", "Control", "Around")
+    alt = []
+    norm = {}
+    for k in keys:
+        alt.append(kw["ru"][k])
+        alt.append(kw["en"][k])
+        norm[kw["ru"][k].lower()] = kw["ru"][k]
+        norm[kw["en"][k].lower()] = kw["ru"][k]
+    pat = re.compile(r'^&(' + '|'.join(alt) + r')\("([^"]+)"\)', re.IGNORECASE)
     result = []
-    pat = re.compile(r'^&(Перед|После|ИзменениеИКонтроль|Вместо)\("([^"]+)"\)')
     for i in range(len(lines)):
         m = pat.match(lines[i].strip())
         if m:
-            result.append({"type": m.group(1), "method": m.group(2), "line": i})
+            raw = m.group(1)
+            result.append({"type": norm[raw.lower()], "raw": raw, "method": m.group(2), "line": i})
     return result
 
 
 def get_proc_names(lines):
     names = []
-    pat = re.compile(r'^\s*(?:Асинх\s+)?(?:Процедура|Функция)\s+([\w]+)\s*\(', re.IGNORECASE)
+    pat = re.compile(r'^\s*(?:' + kw_alt("Async") + r'\s+)?(?:' + kw_alt("Proc") + '|' + kw_alt("Func")
+                     + r')\s+([\w]+)\s*\(', re.IGNORECASE)
     for line in lines:
         m = pat.match(line)
         if m:
@@ -443,15 +546,16 @@ def get_proc_names(lines):
 
 
 def build_interceptor_core(method, interceptor_type, interceptor_name):
-    decorator_ru = DECORATOR_MAP[interceptor_type]
-    async_prefix = "Асинх " if method["is_async"] else ""
-    keyword = "Функция" if method["is_function"] else "Процедура"
-    end_keyword = "КонецФункции" if method["is_function"] else "КонецПроцедуры"
+    kw = BSL_KW[method["lang"]]
+    decorator = kw[DECORATOR_KEY[interceptor_type]]
+    async_prefix = (kw["Async"] + " ") if method["is_async"] else ""
+    keyword = kw["Func"] if method["is_function"] else kw["Proc"]
+    end_keyword = kw["EndFunc"] if method["is_function"] else kw["EndProc"]
 
     lines = []
     if method["context"]:
         lines.append(method["context"])
-    lines.append('&%s("%s")' % (decorator_ru, method["canonical"]))
+    lines.append('&%s("%s")' % (decorator, method["canonical"]))
     lines.append("%s%s %s(%s)" % (async_prefix, keyword, interceptor_name, method["params_text"]))
 
     if interceptor_type == "Before":
@@ -461,11 +565,11 @@ def build_interceptor_core(method, interceptor_type, interceptor_name):
     elif interceptor_type == "Instead":
         names_joined = ", ".join(method["param_names"])
         if method["is_function"]:
-            lines.append("\tРезультат = ПродолжитьВызов(%s);" % names_joined)
+            lines.append("\t%s = %s(%s);" % (kw["ResultVar"], kw["Proceed"], names_joined))
             lines.append("\t// TODO: доработать поведение")
-            lines.append("\tВозврат Результат;")
+            lines.append("\t%s %s;" % (kw["Return"], kw["ResultVar"]))
         else:
-            lines.append("\tПродолжитьВызов(%s);" % names_joined)
+            lines.append("\t%s(%s);" % (kw["Proceed"], names_joined))
             lines.append("\t// TODO: доработать поведение")
     elif interceptor_type == "ModificationAndControl":
         lines.extend(method["body_lines"])
@@ -474,16 +578,18 @@ def build_interceptor_core(method, interceptor_type, interceptor_name):
     return lines
 
 
-def build_wrapped_block(chain_arr, core):
+def build_wrapped_block(chain_arr, core, lang):
     """Wrap core with region/preprocessor lines, adding blank lines around each boundary."""
+    kw = BSL_KW[lang]
     b = []
     for w in chain_arr:
-        b.append("#Область %s" % w["name"] if w["kind"] == "region" else "#Если %s Тогда" % w["cond"])
+        b.append(("#%s %s" % (kw["Region"], w["name"])) if w["kind"] == "region"
+                 else ("#%s %s %s" % (kw["If"], w["cond"], kw["Then"])))
         b.append("")
     b.extend(core)
     for w in reversed(chain_arr):
         b.append("")
-        b.append("#КонецОбласти" if w["kind"] == "region" else "#КонецЕсли")
+        b.append(("#" + kw["EndRegion"]) if w["kind"] == "region" else ("#" + kw["EndIf"]))
     return b
 
 
@@ -512,25 +618,34 @@ def parse_marked_body(body_lines):
     i = 0
     n = len(body_lines)
     while i < n:
-        t = body_lines[i].strip()
-        if t == "#Вставка":
+        kind = bsl_marker_kind(body_lines[i])
+        if kind == "Insert":
+            # Marker lines are kept verbatim: they carry the author's spelling, indent and — since
+            # a tail comment is legal — the note explaining the edit. Re-emitting a bare keyword
+            # would silently drop that note on -Actualize.
+            open_line = body_lines[i]
             ins = []
             i += 1
-            while i < n and body_lines[i].strip() != "#КонецВставки":
+            while i < n and bsl_marker_kind(body_lines[i]) != "EndInsert":
                 ins.append(body_lines[i])
                 i += 1
+            close_line = body_lines[i] if i < n else None
             i += 1
-            ops.append({"kind": "insert", "after": len(v1) - 1, "lines": ins})
-        elif t == "#Удаление":
+            ops.append({"kind": "insert", "after": len(v1) - 1, "lines": ins,
+                        "open": open_line, "close": close_line})
+        elif kind == "Delete":
+            open_line = body_lines[i]
             start_idx = len(v1)
             i += 1
             dels = []
-            while i < n and body_lines[i].strip() != "#КонецУдаления":
+            while i < n and bsl_marker_kind(body_lines[i]) != "EndDelete":
                 dels.append(body_lines[i])
                 v1.append(body_lines[i])
                 i += 1
+            close_line = body_lines[i] if i < n else None
             i += 1
-            ops.append({"kind": "delete", "start": start_idx, "end": len(v1) - 1, "lines": dels})
+            ops.append({"kind": "delete", "start": start_idx, "end": len(v1) - 1, "lines": dels,
+                        "open": open_line, "close": close_line})
         else:
             v1.append(body_lines[i])
             i += 1
@@ -879,6 +994,8 @@ def main():
             "(перехват &Перед/&После к функциям неприменим)." % method_name)
 
     decorator_ru = DECORATOR_MAP[interceptor_type]
+    # What the annotation will actually look like in the module: the source's spelling
+    decorator_out = BSL_KW[method["lang"]][DECORATOR_KEY[interceptor_type]]
 
     # --- Read existing extension module (if any) ---
     ext_exists = os.path.isfile(ext_bsl)
@@ -896,7 +1013,7 @@ def main():
     if dup:
         if interceptor_type != "ModificationAndControl":
             print('[ПРОПУЩЕН] Перехватчик &%s("%s") уже есть в модуле — дубль не создаётся.'
-                  % (decorator_ru, method_name))
+                  % (dup["raw"], method_name))
             print("     Файл: %s" % ext_bsl)
             sys.exit(0)
         rel = rel_parts_under(extension_path, ext_bsl)
@@ -940,14 +1057,11 @@ def main():
     taken = [n.lower() for n in existing_proc_names]
     interceptor_name = candidate
     if candidate.lower() in taken:
-        if interceptor_type == "ModificationAndControl":
-            interceptor_name = candidate + "_ИзменениеИКонтроль"
-        else:
-            interceptor_name = candidate + "_" + decorator_ru
+        interceptor_name = candidate + "_" + decorator_out
 
     core = build_interceptor_core(method, interceptor_type, interceptor_name)
 
-    place_new(ext_bsl, ext_lines, ext_exists, method["chain"], core)
+    place_new(ext_bsl, ext_lines, ext_exists, method["chain"], core, method["lang"])
 
     # Модуль в расширении есть — отражаем это в метаданных объекта (формат ≥ 2.19).
     flag_target = get_module_flag_target(rel_parts, extension_path)
@@ -957,7 +1071,7 @@ def main():
 
     # emit summary
     placement = place_new.placement
-    print('[OK] Перехватчик &%s("%s") — %s' % (decorator_ru, method_name, placement))
+    print('[OK] Перехватчик &%s("%s") — %s' % (decorator_out, method_name, placement))
     print("     Файл:       %s" % ext_bsl)
     print("     Процедура:  %s(%s)" % (interceptor_name, normalize(method["params_text"])))
     if method["context"]:
@@ -970,7 +1084,7 @@ def main():
         print("     Обрамление: %s" % desc)
 
 
-def place_new(ext_bsl, ext_lines, ext_exists, chain, core):
+def place_new(ext_bsl, ext_lines, ext_exists, chain, core, lang):
     enc_bom = True  # noqa
 
     # find innermost region in chain that already exists in the extension module
@@ -980,7 +1094,7 @@ def place_new(ext_bsl, ext_lines, ext_exists, chain, core):
         for c in range(len(chain) - 1, -1, -1):
             if chain[c]["kind"] == "region":
                 rname = chain[c]["name"]
-                rre = re.compile(r'^#Область\s+' + re.escape(rname) + r'\s*$')
+                rre = re.compile(r'^#' + kw_alt("Region") + r'\s+' + re.escape(rname) + r'\s*$', re.IGNORECASE)
                 for li in range(len(ext_lines)):
                     if rre.match(ext_lines[li].strip()):
                         reuse_region_idx = c
@@ -991,15 +1105,15 @@ def place_new(ext_bsl, ext_lines, ext_exists, chain, core):
 
     if reuse_region_idx >= 0:
         inner_chain = chain[reuse_region_idx + 1:]
-        block = build_wrapped_block(inner_chain, core)
+        block = build_wrapped_block(inner_chain, core, lang)
 
         depth = 0
         close_idx = -1
         for li in range(reuse_line_idx, len(ext_lines)):
             t = ext_lines[li].strip()
-            if re.match(r'^#Область\s', t):
+            if re.match(r'^#' + kw_alt("Region") + r'\s', t, re.IGNORECASE):
                 depth += 1
-            elif re.match(r'^#КонецОбласти', t):
+            elif re.match(r'^#' + kw_alt("EndRegion"), t, re.IGNORECASE):
                 depth -= 1
                 if depth == 0:
                     close_idx = li
@@ -1021,7 +1135,7 @@ def place_new(ext_bsl, ext_lines, ext_exists, chain, core):
         return
 
     # full wrapper chain, append (or create)
-    block = build_wrapped_block(chain, core)
+    block = build_wrapped_block(chain, core, lang)
     block_text = "\r\n".join(block) + "\r\n"
 
     bsl_dir = os.path.dirname(ext_bsl)
@@ -1053,7 +1167,7 @@ DIR_TO_TYPE = {
     "ChartsOfCalculationTypes": "ChartOfCalculationTypes", "BusinessProcesses": "BusinessProcess",
     "Tasks": "Task", "InformationRegisters": "InformationRegister",
     "AccumulationRegisters": "AccumulationRegister", "AccountingRegisters": "AccountingRegister",
-    "CalculationRegisters": "CalculationRegister",
+    "CalculationRegisters": "CalculationRegister", "CommonForms": "CommonForm",
 }
 
 
@@ -1062,6 +1176,8 @@ def module_path_from_rel(rel_parts):
     typ = DIR_TO_TYPE.get(dir0, dir0)
     if dir0 == "CommonModules":
         return "CommonModule.%s" % name
+    if dir0 == "CommonForms":
+        return "CommonForm.%s" % name
     if len(rel_parts) >= 7 and rel_parts[2] == "Forms":
         return "%s.%s.Form.%s" % (typ, name, rel_parts[3])
     mod = rel_parts[-1][:-4] if rel_parts[-1].endswith(".bsl") else rel_parts[-1]
@@ -1083,7 +1199,8 @@ def conflict_reason(disputed):
     return "; ".join(parts)
 
 
-def write_conflict_folder(folder, method_id, ext_bsl, existing_name, method, v1, marked_body, v2, v1norm, v2norm, disputed):
+def write_conflict_folder(folder, method_id, ext_bsl, existing_name, method, v1, marked_body, v2, v1norm, v2norm, disputed, lang):
+    kw = BSL_KW[lang]
     os.makedirs(folder, exist_ok=True)
     write_bsl(os.path.join(folder, "base.bsl"), v1)
     write_bsl(os.path.join(folder, "local.bsl"), marked_body)
@@ -1091,7 +1208,7 @@ def write_conflict_folder(folder, method_id, ext_bsl, existing_name, method, v1,
     md = []
     md.append("# %s" % method_id)
     md.append("Править: %s" % ext_bsl)
-    md.append('Метод:   %s (&ИзменениеИКонтроль("%s"))' % (existing_name, method["canonical"]))
+    md.append('Метод:   %s (&%s("%s"))' % (existing_name, kw["Control"], method["canonical"]))
     md.append("Причина: %s" % conflict_reason(disputed))
     md.append("")
     md.append("## Не размещено — перенести вручную")
@@ -1105,12 +1222,13 @@ def write_conflict_folder(folder, method_id, ext_bsl, existing_name, method, v1,
             if d.get("before"):
                 for l in d["before"]:
                     md.append(l)
-            md.append("#Вставка"); md.extend(d["lines"]); md.append("#КонецВставки")
+            md.append(d.get("open") or ("#" + kw["Insert"])); md.extend(d["lines"])
+            md.append(d.get("close") or ("#" + kw["EndInsert"]))
             if d.get("after"):
                 for l in d["after"]:
                     md.append(l)
             md.append("")
-            md.append("Якорь (строки вокруг #Вставка) изменился/исчез в новом оригинале — блок не лёг автоматически (см. дифф base→remote ниже).")
+            md.append("Якорь (строки вокруг #%s) изменился/исчез в новом оригинале — блок не лёг автоматически (см. дифф base→remote ниже)." % kw["Insert"])
             md.append("В модуле расширения блок припаркован в конце метода под меткой // [РЕСИНК-КОНФЛИКТ №%d] — найди по ней." % cn)
             md.append("Куда переносить: если якорного кода в новом методе больше нет — он, вероятно, вынесен/отрефакторен (ищите в диффе новый вызов/процедуру). Размести адаптацию по смыслу: например пост-обработкой после нового вызова, либо в заимствованной процедуре, куда переехал код. При правке файла сохрани кодировку (UTF-8 с BOM).")
         else:
@@ -1136,17 +1254,23 @@ def resync_one(ext_bsl, ext_lines, dup, method, logical_module, conflict_folder,
     method_id = "%s.%s" % (logical_module, method["canonical"])
     dec_line = dup["line"]
     sig_line_idx = dec_line + 1
-    name_re = re.compile(r'^\s*(?:Асинх\s+)?(?:Процедура|Функция)\s+([\w]+)\s*\(', re.IGNORECASE)
+    name_re = re.compile(r'^\s*(?:' + kw_alt("Async") + r'\s+)?(' + kw_alt("Proc") + '|' + kw_alt("Func")
+                         + r')\s+([\w]+)\s*\(', re.IGNORECASE)
     m0 = name_re.match(ext_lines[sig_line_idx]) if sig_line_idx < len(ext_lines) else None
     if not m0:
         return {"id": method_id, "status": "ОШИБКА", "ext_bsl": ext_bsl, "reason": "не разобрать сигнатуру перехватчика"}
-    existing_name = m0.group(1)
+    # The block we are about to rewrite is the interceptor already in the extension, so it is
+    # its spelling — not the source module's — that the rewritten block must keep.
+    lang = bsl_lang(m0.group(1))
+    kw = BSL_KW[lang]
+    existing_name = m0.group(2)
     sig = read_signature(ext_lines, sig_line_idx)
     if not sig:
         return {"id": method_id, "status": "ОШИБКА", "ext_bsl": ext_bsl, "reason": "не разобрать сигнатуру"}
     ext_params_text, sig_end = sig
-    is_func = bool(re.match(r'^\s*(?:Асинх\s+)?Функция\b', ext_lines[sig_line_idx], re.IGNORECASE))
-    end_re = re.compile(r'^\s*КонецФункции\b' if is_func else r'^\s*КонецПроцедуры\b', re.IGNORECASE)
+    is_func = bool(re.match(r'^\s*(?:' + kw_alt("Async") + r'\s+)?' + kw_alt("Func") + r'\b',
+                            ext_lines[sig_line_idx], re.IGNORECASE))
+    end_re = re.compile(r'^\s*' + (kw_alt("EndFunc") if is_func else kw_alt("EndProc")) + r'\b', re.IGNORECASE)
     block_end = -1
     for j in range(sig_end + 1, len(ext_lines)):
         if end_re.match(ext_lines[j]):
@@ -1172,7 +1296,7 @@ def resync_one(ext_bsl, ext_lines, dup, method, logical_module, conflict_folder,
     if not params_drift and control_key(v1) == control_key(v2):
         return {"id": method_id, "status": "АКТУАЛЕН", "ext_bsl": ext_bsl}
 
-    insert_top = []; insert_after = {}; del_start = set(); del_end = set(); disputed = []; transferred = 0; absorbed = 0; absorbed_notes = []
+    insert_top = []; insert_after = {}; del_start = {}; del_end = {}; disputed = []; transferred = 0; absorbed = 0; absorbed_notes = []
     v2sig, v2map = significant_projection(v2norm)
     for op in ops:
         if op["kind"] == "insert":
@@ -1198,16 +1322,17 @@ def resync_one(ext_bsl, ext_lines, dup, method, logical_module, conflict_folder,
             elif k is None:
                 dbefore = v1[max(0, after - 2):after + 1] if after >= 0 else []
                 dafter = v1[after + 1:after + 4]
-                disputed.append({"kind": "insert", "lines": op["lines"], "before": dbefore, "after": dafter})
+                disputed.append({"kind": "insert", "lines": op["lines"], "open": op.get("open"),
+                                 "close": op.get("close"), "before": dbefore, "after": dafter})
             elif k < 0:
-                insert_top.append(op["lines"]); transferred += 1
+                insert_top.append(op); transferred += 1
             else:
-                insert_after.setdefault(k, []).append(op["lines"]); transferred += 1
+                insert_after.setdefault(k, []).append(op); transferred += 1
         else:
             keys = v1norm[op["start"]:op["end"] + 1]
             p = find_unique_run(v2norm, keys)
             if p >= 0:
-                del_start.add(p); del_end.add(p + len(keys) - 1); transferred += 1
+                del_start[p] = op.get("open"); del_end[p + len(keys) - 1] = op.get("close"); transferred += 1
             else:
                 # Nearest significant neighbours; adjacency in the significant projection means the
                 # block is already cut (blanks/comments left behind don't matter).
@@ -1239,18 +1364,25 @@ def resync_one(ext_bsl, ext_lines, dup, method, logical_module, conflict_folder,
         return {"id": method_id, "status": st, "ext_bsl": ext_bsl, "transferred": transferred,
                 "absorbed": absorbed, "disputed": len(disputed), "reason": rsn, "absorbed_notes": absorbed_notes}
 
+    # Marker lines come back as they were read (open/close); the keyword form is only a fallback
+    # for a block whose closing marker the module never had.
+    def mk(orig, key):
+        return ("#" + kw[key]) if not orig else orig
+
     new_body = []
     for blk in insert_top:
-        new_body.append("#Вставка"); new_body.extend(blk); new_body.append("#КонецВставки")
+        new_body.append(mk(blk.get("open"), "Insert")); new_body.extend(blk["lines"])
+        new_body.append(mk(blk.get("close"), "EndInsert"))
     for k in range(len(v2)):
         if k in del_start:
-            new_body.append("#Удаление")
+            new_body.append(mk(del_start[k], "Delete"))
         new_body.append(v2[k])
         if k in del_end:
-            new_body.append("#КонецУдаления")
+            new_body.append(mk(del_end[k], "EndDelete"))
         if k in insert_after:
             for blk in insert_after[k]:
-                new_body.append("#Вставка"); new_body.extend(blk); new_body.append("#КонецВставки")
+                new_body.append(mk(blk.get("open"), "Insert")); new_body.extend(blk["lines"])
+                new_body.append(mk(blk.get("close"), "EndInsert"))
     if disputed:
         new_body.append("\t// [РЕСИНК-КОНФЛИКТ] блоки ниже не легли автоматически — перенесите вручную (по № см. conflict.md / index.md в merge-воркспейсе, путь в выводе).")
         cn = 0
@@ -1258,19 +1390,20 @@ def resync_one(ext_bsl, ext_lines, dup, method, logical_module, conflict_folder,
             cn += 1
             if d["kind"] == "insert":
                 new_body.append("\t// [РЕСИНК-КОНФЛИКТ №%d] вставка — исходный якорь изменён в новом оригинале." % cn)
-                new_body.append("#Вставка"); new_body.extend(d["lines"]); new_body.append("#КонецВставки")
+                new_body.append(mk(d.get("open"), "Insert")); new_body.extend(d["lines"])
+                new_body.append(mk(d.get("close"), "EndInsert"))
             else:
                 new_body.append("\t// [РЕСИНК-КОНФЛИКТ №%d] удаление — строки не найдены в новом оригинале:" % cn)
                 for l in d["lines"]:
                     new_body.append("\t// " + l.strip())
 
-    async_prefix = "Асинх " if method["is_async"] else ""
-    keyword = "Функция" if method["is_function"] else "Процедура"
-    end_keyword = "КонецФункции" if method["is_function"] else "КонецПроцедуры"
+    async_prefix = (kw["Async"] + " ") if method["is_async"] else ""
+    keyword = kw["Func"] if method["is_function"] else kw["Proc"]
+    end_keyword = kw["EndFunc"] if method["is_function"] else kw["EndProc"]
     new_block = []
     if method["context"]:
         new_block.append(method["context"])
-    new_block.append('&ИзменениеИКонтроль("%s")' % method["canonical"])
+    new_block.append('&%s("%s")' % (kw["Control"], method["canonical"]))
     new_block.append("%s%s %s(%s)" % (async_prefix, keyword, existing_name, method["params_text"]))
     new_block.extend(new_body)
     new_block.append(end_keyword)
@@ -1284,7 +1417,7 @@ def resync_one(ext_bsl, ext_lines, dup, method, logical_module, conflict_folder,
     conflict_dir = None
     if disputed:
         conflict_dir = conflict_folder
-        write_conflict_folder(conflict_folder, method_id, ext_bsl, existing_name, method, v1, marked_body, v2, v1norm, v2norm, disputed)
+        write_conflict_folder(conflict_folder, method_id, ext_bsl, existing_name, method, v1, marked_body, v2, v1norm, v2norm, disputed, lang)
     if disputed:
         status = "ЧАСТИЧНО"
     elif transferred == 0 and absorbed > 0:

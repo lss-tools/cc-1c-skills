@@ -58,6 +58,12 @@
 	<calculatedField>
 		<dataPath>Служебное</dataPath>
 		<expression>""</expression>
+		<useRestriction>
+			<field>true</field>
+			<condition>true</condition>
+			<group>true</group>
+			<order>true</order>
+		</useRestriction>
 		<valueType>
 			<v8:Type>xs:string</v8:Type>
 			<v8:StringQualifiers>
@@ -65,12 +71,6 @@
 				<v8:AllowedLength>Variable</v8:AllowedLength>
 			</v8:StringQualifiers>
 		</valueType>
-		<useRestriction>
-			<field>true</field>
-			<condition>true</condition>
-			<group>true</group>
-			<order>true</order>
-		</useRestriction>
 	</calculatedField>
 	<totalField>
 		<dataPath>Цена</dataPath>
@@ -199,7 +199,18 @@
 		</dcsset:presentation>
 		<dcsset:settings xmlns:style="http://v8.1c.ru/8.1/data/ui/style" xmlns:sys="http://v8.1c.ru/8.1/data/ui/fonts/system" xmlns:web="http://v8.1c.ru/8.1/data/ui/colors/web" xmlns:win="http://v8.1c.ru/8.1/data/ui/colors/windows">
 			<dcsset:selection>
-				<dcsset:item xsi:type="dcsset:SelectedItemAuto"/>
+				<dcsset:item xsi:type="dcsset:SelectedItemField">
+					<dcsset:field>Цена</dcsset:field>
+				</dcsset:item>
+				<dcsset:item xsi:type="dcsset:SelectedItemField">
+					<dcsset:field>Закупка</dcsset:field>
+				</dcsset:item>
+				<dcsset:item xsi:type="dcsset:SelectedItemField">
+					<dcsset:field>Маржа</dcsset:field>
+				</dcsset:item>
+				<dcsset:item xsi:type="dcsset:SelectedItemField">
+					<dcsset:field>Наценка</dcsset:field>
+				</dcsset:item>
 			</dcsset:selection>
 			<dcsset:item xsi:type="dcsset:StructureItemGroup">
 				<dcsset:order>

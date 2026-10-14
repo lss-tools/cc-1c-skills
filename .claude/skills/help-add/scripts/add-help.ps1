@@ -1,4 +1,4 @@
-﻿# help-add v1.19 — Add built-in help to 1C object (+write_xml_file/write_utf8_bom: общий эталон записи)
+﻿# help-add v1.24 — Add built-in help to 1C object (+write_xml_file/write_utf8_bom: общий эталон записи)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 param(
 	[Parameter(Mandatory)]
@@ -172,8 +172,6 @@ function Detect-FormatVersion([string]$dir) {
 	return "2.17"
 }
 
-$formatVersion = Detect-FormatVersion (Resolve-Path $SrcDir).Path
-
 # --- Проверки ---
 
 $objectDir = Join-Path $SrcDir $ObjectName
@@ -181,6 +179,41 @@ $extDir = Join-Path $objectDir "Ext"
 
 if (-not (Test-Path $extDir)) {
 	Write-Error "Каталог объекта не найден: $extDir. Проверьте путь ObjectName (например Catalogs/МойСправочник)."
+	exit 1
+}
+
+# Справка — тело объекта, а тело и дескриптор платформа загружает только в одной версии формата.
+# Поэтому версию берём прежде всего из дескриптора <объект>.xml (объект может быть старше выгрузки после
+# мержа веток), и только без него — подъёмом от каталога объекта. Не от SrcDir: у внешней обработки
+# корень <Имя>.xml лежит В SrcDir, подъём его не видел, и справка обработки 2.20 писалась 2.17.
+$formatVersion = $null
+# Resolve-Path сохраняет завершающий разделитель («Обр/» → «…\Обр\»): без обрезки искался бы «…\Обр\.xml».
+$objectFull = (Resolve-Path $objectDir).Path.TrimEnd('\', '/')
+$ownerXml = "$objectFull.xml"
+if (Test-Path $ownerXml) {
+	$ownerHead = [System.IO.File]::ReadAllText($ownerXml, [System.Text.Encoding]::UTF8)
+	$ownerHead = $ownerHead.Substring(0, [Math]::Min(2000, $ownerHead.Length))
+	if ($ownerHead -match '<MetaDataObject[^>]+version="(\d+\.\d+)"') { $formatVersion = $Matches[1] }
+}
+if (-not $formatVersion) { $formatVersion = Detect-FormatVersion $objectFull }
+
+# Код языка идёт и в текст XML, и в имя файла страницы, поэтому проверяем его до записи:
+# пустое значение дало бы файл «.html» и пустой <Page></Page>, разделитель пути — запись мимо
+# каталога страниц, а зарезервированное имя устройства (nul, con, prn, aux, com1…, lpt1…) на
+# Windows уводит запись в само устройство. Все отказы платформы были бы тихими.
+#
+# Якоря `\A…\z`, а не `^…$`: последние в обоих языках допускают перевод строки в конце.
+#
+# Копия этой функции есть в template-add (навыки автономны, формат «дескриптор + страница»
+# у них общий). Держать копии одинаковыми — сознательно; за дрейфом следит check-inline-drift.
+function Test-LangCode([string]$code) {
+	if ($code -notmatch '\A[A-Za-z0-9_-]+\z') { return $false }
+	if ($code -match '\A(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])\z') { return $false }
+	return $true
+}
+
+if (-not (Test-LangCode $Lang)) {
+	Write-Error "Недопустимый код языка: '$Lang'`nОжидается код вида ru, en (буквы, цифры, дефис, подчёркивание; имена устройств Windows недопустимы)"
 	exit 1
 }
 
@@ -229,8 +262,8 @@ $helpHtml = @"
 <!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">
 <html>
 <head>
-    <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
-    <link rel="stylesheet" type="text/css" href="v8help://service_book/service_style"/>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8"></meta>
+    <link rel="stylesheet" type="text/css" href="v8help://service_book/service_style"></link>
 </head>
 <body>
     <h1>$ObjectName</h1>
@@ -239,7 +272,14 @@ $helpHtml = @"
 </html>
 "@
 
-[System.IO.File]::WriteAllText($helpHtmlPath, $helpHtml, $encBom)
+# Файл страницы НЕ перезаписываем: отказ выше смотрит только на Help.xml, а страница может
+# пережить его (удалённый дескриптор, частичная выгрузка, справка, сделанная руками) — и тогда
+# безусловная запись молча стирала бы текст справки с кодом 0.
+if (Test-Path $helpHtmlPath) {
+	Write-Host "[WARN] Страница $Lang.html уже лежала на диске — содержимое сохранено, создан только дескриптор."
+} else {
+	[System.IO.File]::WriteAllText($helpHtmlPath, $helpHtml, $encBom)
+}
 
 # --- 3. Проверка IncludeHelpInContents в метаданных форм ---
 

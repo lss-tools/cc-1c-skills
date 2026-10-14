@@ -1,6 +1,6 @@
 ---
 name: form-edit
-description: Добавление элементов, реквизитов и команд в существующую управляемую форму 1С. Используй когда нужно точечно модифицировать готовую форму
+description: Правка существующей управляемой формы 1С — элементы, реквизиты, команды и свойства самой формы. Используй, когда нужно точечно изменить готовую форму
 argument-hint: <FormPath> <JsonPath>
 allowed-tools:
   - Bash
@@ -9,134 +9,219 @@ allowed-tools:
   - Glob
 ---
 
-# /form-edit — Редактирование формы
+# /form-edit — Правка формы
 
-Добавляет элементы, реквизиты и/или команды в существующий Form.xml. Автоматически выделяет ID из правильного пула, генерирует companion-элементы (ContextMenu, ExtendedTooltip, и др.) и обработчики событий.
-
-## Использование
-
-```
-/form-edit <FormPath> <JsonPath>
-```
-
-## Параметры
-
-| Параметр  | Обязательный | Описание                         |
-|-----------|:------------:|----------------------------------|
-| FormPath  | да           | Путь к существующему Form.xml    |
-| JsonPath  | да           | Путь к JSON с описанием добавлений |
+Точечно меняет существующий `Form.xml` по описанию правок в JSON; остальное в файле не трогает. Перенесённый или изменённый элемент сохраняет свой id — обработчики и обращения из модуля продолжают работать.
 
 ## Команда
+
+| Параметр  | Обязательный | Описание                       |
+|-----------|:------------:|--------------------------------|
+| FormPath  | да           | Путь к существующему Form.xml  |
+| JsonPath  | да           | Путь к JSON с описанием правок |
 
 ```powershell
 powershell.exe -NoProfile -File "${CLAUDE_SKILL_DIR}/scripts/form-edit.ps1" -FormPath "<путь>" -JsonPath "<путь>"
 ```
 
-## JSON формат
+## Что можно править
+
+| Ключ | Правка |
+|------|--------|
+| `elements` | Элементы: добавить, перенести, изменить, удалить — список операций, по порядку |
+| `attributes` | Реквизиты: добавить; `{ "remove": "Имя" }` — удалить |
+| `commands` | Команды: добавить; `{ "remove": "Имя" }` — удалить |
+| `parameters` | Параметры формы: добавить; `{ "remove": "Имя" }` — удалить |
+| `title` | Заголовок формы (строка или `{ru, en}`); `null` — убрать |
+| `properties` | Свойства формы: `{ "windowOpeningMode": "LockOwnerWindow" }`; `null` у свойства — убрать (`references/form-properties.md`) |
+| `events` | Обработчики событий формы: `{ "OnOpen": "ПриОткрытии" }` |
+| `excludedCommands` | Исключить стандартные команды: `["Copy"]`; вернуть: `{ "remove": ["Copy"] }` |
+| `conditionalAppearance` | Добавить правила условного оформления (`references/appearance.md`) |
+| `commandInterface` | Добавить команды в панели формы (`references/command-interface.md`) |
+
+Все ключи необязательны, в одной правке можно сочетать любые. Имена элементов, реквизитов и команд — из `/form-info`. Процедуры обработчиков в модуле формы не создаются — их добавляют в `Module.bsl` отдельно.
+
+## Элементы
+
+Операцию задаёт ключ:
+
+| Ключ | Операция |
+|------|----------|
+| тип элемента: `input`, `group`, `table`, … | Добавить новый элемент |
+| `move` | Перенести: имя или список имён (встают подряд в этом порядке) вместе с содержимым |
+| `set` | Изменить свойства: имя или список имён |
+| `remove` | Удалить: имя или список имён; группа, страница, таблица — вместе с содержимым |
+
+Куда встаёт добавляемый или переносимый элемент:
+
+| Ключи | Куда |
+|-------|------|
+| `after: "X"` / `before: "X"` | Рядом с X, в его группе |
+| `into: "G"` | В конец G — группы, страницы, таблицы, командной панели |
+| `into: "G", first: true` | В начало G |
+
+Новый элемент без позиции встаёт в конец формы; следующий без позиции — за ним. У `move` позиция обязательна.
 
 ```json
 {
-  "into": "ГруппаШапка",
-  "after": "Контрагент",
+  "attributes": [ { "name": "Срочно", "type": "boolean" } ],
   "elements": [
-    { "input": "Склад", "path": "Объект.Склад", "on": ["OnChange"] }
-  ],
-  "attributes": [
-    { "name": "СуммаИтого", "type": "decimal(15,2)" }
-  ],
-  "commands": [
-    { "name": "Рассчитать", "action": "РассчитатьОбработка" }
+    { "group": "alwaysHorizontal", "name": "ГруппаОтгрузка", "after": "Контрагент" },
+    { "move": ["Склад", "Организация"], "into": "ГруппаОтгрузка" },
+    { "check": "Срочно", "path": "Срочно", "into": "ГруппаОтгрузка" },
+    { "move": "ТоварыСумма", "before": "ТоварыЦена" },
+    { "set": "Ответственный", "visible": false },
+    { "set": "Контрагент", "title": "Покупатель", "events": { "OnChange": null } },
+    { "remove": "Комментарий" }
   ]
 }
 ```
 
-### Расширения (extension-формы)
+### Изменение (`set`)
 
-Для заимствованных форм (с `<BaseForm>`) автоматически активируется extension-режим: ID начинаются с 1000000+. Доступны дополнительные секции:
+- Ключи — свойства элемента, те же, что при добавлении: заголовок, видимость, доступность, размеры, цвета и шрифт, кнопки поля, параметры выбора и т. д. (таблица ниже и справочники).
+- `null` возвращает свойству значение по умолчанию.
+- Строка в `title` меняет русский текст, переводы на другие языки остаются.
+- У группы ориентацию меняет `group`: `{ "set": "ГруппаШапка", "group": "vertical" }`.
+- `events` добавляет обработчики — как у нового элемента.
+- Имя, тип элемента, путь к данным и команду кнопки `set` не меняет: такой элемент удаляют и добавляют заново.
+
+### Удаление вместе с реквизитом
+
+Поле и реквизит, к которому оно привязано, удаляются в одной правке:
 
 ```json
 {
-  "formEvents": [
-    { "name": "OnCreateAtServer", "handler": "Расш1_ПриСозданииПосле", "callType": "After" },
-    { "name": "OnOpen", "handler": "Расш1_ПриОткрытии", "callType": "Before" }
-  ],
-  "elementEvents": [
-    { "element": "Банк", "name": "OnChange", "handler": "Расш1_БанкПриИзменении", "callType": "Before" }
+  "elements":   [ { "remove": "Срочно" } ],
+  "attributes": [ { "remove": "Срочно" } ]
+}
+```
+
+## Новый элемент
+
+Ключ — тип элемента, значение — имя; у `group` значение — ориентация, а имя задаётся в `name`.
+
+| Ключ | Элемент | Подробно |
+|------|---------|----------|
+| `input` | Поле ввода | `input-fields.md` |
+| `check` / `radio` | Флажок / переключатель | `input-fields.md` |
+| `labelField` | Поле-надпись (значение без редактирования) | `input-fields.md` |
+| `label` | Надпись, текст — в `title` | `tooltips-text.md` |
+| `group` | Группа: `vertical` / `horizontalIfPossible` / `alwaysHorizontal` | `groups-pages.md` |
+| `pages` / `page` | Страницы / страница | `groups-pages.md` |
+| `table` / `columnGroup` | Таблица / группа колонок | `table-advanced.md` |
+| `button` / `popup` / `buttonGroup` / `cmdBar` | Кнопка / подменю / группа кнопок / командная панель | `buttons-commands.md` |
+| `picture` / `picField` | Картинка / поле-картинка | `pictures.md` |
+
+Табличный документ, HTML, календарь, диаграммы и другие особые поля — по индексу ниже.
+
+| Ключ | Описание |
+|------|----------|
+| `name` | Имя, если отличается от значения ключа типа. Имена в форме уникальны |
+| `path` | Путь к данным: `"Объект.Склад"`, `"ИмяРеквизита"`; колонка таблицы — `"Объект.Товары.Сумма"` |
+| `title` / `tooltip` | Заголовок / подсказка (строка или `{ru, en}`) |
+| `visible: false` / `enabled: false` / `readOnly: true` | Скрыть / сделать недоступным / только чтение |
+| `events` | Обработчики: `{ "OnChange": "ИмяПроцедуры" }`; `null` вместо имени — имя по шаблону `<Элемент><Событие>` |
+| `children` / `columns` | Вложенные элементы группы или страницы / колонки таблицы |
+
+Поле на новом реквизите формы — реквизит и элемент в одной правке:
+
+```json
+{
+  "attributes": [ { "name": "СуммаИтого", "type": "decimal(15,2)" } ],
+  "elements": [ { "input": "СуммаИтого", "path": "СуммаИтого", "readOnly": true, "after": "Контрагент" } ]
+}
+```
+
+Колонка в существующую таблицу — элемент рядом с другой колонкой или `into` таблицы:
+
+```json
+{ "input": "ТоварыСкидка", "path": "Объект.Товары.Скидка", "after": "ТоварыЦена" }
+```
+
+Кнопка — в командную панель формы (`ФормаКоманднаяПанель`) или таблицы (`ТоварыКоманднаяПанель`); `command` — команда формы, `stdCommand` — стандартная (`"Close"`, у таблицы — `"Товары.Add"`):
+
+```json
+{
+  "commands": [ { "name": "Пересчитать", "action": "ПересчитатьОбработка" } ],
+  "elements": [ { "button": "Пересчитать", "command": "Пересчитать", "into": "ФормаКоманднаяПанель" } ]
+}
+```
+
+Свойства командной панели формы — операция `autoCmdBar`: `{ "autoCmdBar": "ФормаКоманднаяПанель", "autofill": false }` (без стандартных команд), `horizontalAlign`.
+
+### События
+
+Имена регистрозависимы.
+
+**Форма:** `OnCreateAtServer`, `OnOpen`, `BeforeClose`, `OnClose`, `NotificationProcessing`, `ChoiceProcessing`, `OnReadAtServer`, `BeforeWriteAtServer`, `OnWriteAtServer`, `AfterWriteAtServer`, `BeforeWrite`, `AfterWrite`, `FillCheckProcessingAtServer`, `BeforeLoadDataFromSettingsAtServer`, `OnLoadDataFromSettingsAtServer`, `ExternalEvent`, `Opening`
+
+**input:** `OnChange`, `StartChoice`, `ChoiceProcessing`, `AutoComplete`, `TextEditEnd`, `Clearing`, `Creating`, `EditTextChange`
+**check / radio:** `OnChange`
+**table:** `OnStartEdit`, `OnEditEnd`, `OnChange`, `Selection`, `ValueChoice`, `BeforeAddRow`, `BeforeDeleteRow`, `AfterDeleteRow`, `BeforeRowChange`, `BeforeEditEnd`, `OnActivateRow`, `OnActivateCell`
+**label / labelField:** `Click`, `URLProcessing`; у `labelField` также `OnChange`, `StartChoice`, `ChoiceProcessing`, `Clearing`
+**picture / button:** `Click`
+**pages:** `OnCurrentPageChange`
+
+### Реквизиты, команды, параметры
+
+```json
+"attributes": [ { "name": "Итого", "type": "decimal(15,2)", "title": "Итого" },
+                { "name": "Данные", "type": "ValueTable", "columns": [ { "name": "Сумма", "type": "decimal(15,2)" } ] } ],
+"commands":   [ { "name": "Загрузить", "action": "ЗагрузитьОбработка", "shortcut": "Ctrl+Enter" } ],
+"parameters": [ { "name": "Основание", "type": "DocumentRef.Заказ", "key": true } ]
+```
+
+Типы: `string`, `string(100)`, `decimal(15,2)`, `boolean`, `date`, `dateTime`, `CatalogRef.X`, `DocumentRef.X`, `EnumRef.X`, `ValueTable`, `ValueList`, `DynamicList`, `Тип1 | Тип2` — все типы в `references/type-system-advanced.md`. Остальные ключи реквизитов — `attributes-advanced.md`, команд — `buttons-commands.md`.
+
+## Форма расширения
+
+Форма расширения (с `<BaseForm>`) распознаётся сама. Свои элементы, реквизиты и команды расширения называют с префиксом расширения (`Расш1_Метка`) и задают им `title` — иначе заголовок возьмётся из имени вместе с префиксом. Обработчику указывают вид вызова — `callType`: `Before`, `After` или `Override`; без него — `Before`:
+
+```json
+{
+  "events": { "OnCreateAtServer": { "handler": "Расш1_ПриСозданииПосле", "callType": "After" } },
+  "elements": [
+    { "set": "Банк", "events": { "OnChange": { "handler": "Расш1_БанкПриИзменении", "callType": "Before" } } }
   ],
   "commands": [
     { "name": "Подбор", "action": "Расш1_ПодборПосле", "callType": "After" },
     { "name": "Запрос", "actions": [
-      { "callType": "Before", "handler": "Расш1_ЗапросПеред" },
-      { "callType": "After", "handler": "Расш1_ЗапросПосле" }
-    ]}
-  ],
-  "elements": [
-    { "input": "Поле", "path": "Объект.Поле", "on": [{ "event": "OnChange", "callType": "After" }] }
+      { "handler": "Расш1_ЗапросПеред", "callType": "Before" },
+      { "handler": "Расш1_ЗапросПосле", "callType": "After" } ] }
   ]
 }
 ```
 
-### Позиционирование элементов
+## Задача → справочник
 
-| Ключ | По умолчанию | Описание |
-|------|-------------|----------|
-| `into` | корневой ChildItems | Имя группы/таблицы/страницы, куда вставлять |
-| `after` | в конец | Имя элемента, после которого вставлять |
+Под задачу подгрузите файл из `references/`:
 
-### Типы элементов
-
-Те же DSL-ключи, что в `/form-compile`:
-
-| Ключ | XML тег | Companions |
-|------|---------|------------|
-| `input` | InputField | ContextMenu, ExtendedTooltip |
-| `check` | CheckBoxField | ContextMenu, ExtendedTooltip |
-| `label` | LabelDecoration | ContextMenu, ExtendedTooltip |
-| `labelField` | LabelField | ContextMenu, ExtendedTooltip |
-| `group` | UsualGroup | ExtendedTooltip |
-| `table` | Table | ContextMenu, AutoCommandBar, Search*, ViewStatus* |
-| `pages` | Pages | ExtendedTooltip |
-| `page` | Page | ExtendedTooltip |
-| `button` | Button | ExtendedTooltip |
-
-Группы и таблицы поддерживают `children`/`columns` для вложенных элементов.
-
-### Кнопки: command и stdCommand
-
-- `"command": "ИмяКоманды"` → `Form.Command.ИмяКоманды`
-- `"stdCommand": "Close"` → `Form.StandardCommand.Close`
-- `"stdCommand": "Товары.Add"` → `Form.Item.Товары.StandardCommand.Add` (стандартная команда элемента)
-
-### Допустимые события (`on`)
-
-Компилятор предупреждает об ошибках в именах событий. Основные:
-
-- **input**: `OnChange`, `StartChoice`, `ChoiceProcessing`, `Clearing`, `AutoComplete`, `TextEditEnd`
-- **check**: `OnChange`
-- **table**: `OnStartEdit`, `OnEditEnd`, `OnChange`, `Selection`, `BeforeAddRow`, `BeforeDeleteRow`, `OnActivateRow`
-- **label/picture**: `Click`, `URLProcessing`
-- **pages**: `OnCurrentPageChange`
-- **button**: `Click`
-
-### Система типов (для attributes)
-
-`string`, `string(100)`, `decimal(15,2)`, `boolean`, `date`, `dateTime`, `CatalogRef.XXX`, `DocumentObject.XXX`, `ValueTable`, `DynamicList`, `Type1 | Type2` (составной).
-
-### Секции расширений
-
-| Секция | Назначение |
+| Задача | Справочник |
 |--------|-----------|
-| `formEvents` | События уровня формы с `callType` (Before/After/Override) |
-| `elementEvents` | События на существующих элементах заимствованной формы |
-| `callType` на `commands` | callType на Action команды |
-| `callType` на `on` | callType на событиях новых элементов (объектный формат) |
-
-Все extension-секции опциональны — без них навык работает как с обычными формами.
+| Поле ввода, флажок, переключатель: кнопки, список выбора, быстрый выбор, своя форма выбора, маска, формат, пароль, выключатель/тумблер, поле составного типа | `input-fields.md` |
+| Ограничить выбор отбором, связать поле с другим полем, связь по типу | `choice-params.md` |
+| Группа и страницы: ориентация, рамка, свёрнутая группа, интервалы, заголовок из данных, значок закладки, мастер по шагам | `groups-pages.md` |
+| Таблица: колонки и группы колонок, итоги в подвале, дерево, выделение строк, закрепление колонок, поиск, перетаскивание | `table-advanced.md` |
+| Форма списка: источник данных, запрос, отбор, сортировка, группировка, иерархия | `dynamic-list.md` |
+| Кнопки, подменю, команды: картинка кнопки, переключатель в панели, команды таблицы в группе кнопок, своё контекстное меню у поля, команда для текущей строки | `buttons-commands.md` |
+| Подсветить цветом, шрифт, рамка, условное оформление (в форме списка — `dynamic-list.md`) | `appearance.md` |
+| Расширенная подсказка под полем, надпись с выделением или ссылкой | `tooltips-text.md` |
+| Картинка, значок в колонке, иконка по значению | `pictures.md` |
+| Табличный документ (печатная форма, отчёт на форме) | `spreadsheet.md` |
+| HTML, текстовый документ, индикатор, ползунок, календарь, период | `special-fields.md` |
+| Диаграмма, диаграмма Ганта, планировщик | `charts.md` |
+| Свойства формы: модальность, размер, прокрутка, Enter, время и проведение документа | `form-properties.md` |
+| Форма отчёта (СКД) | `report-form.md` |
+| Реквизиты: сохранение в настройках, проверка заполнения, функциональные опции | `attributes-advanced.md` |
+| Типы реквизитов, составные типы и наборы | `type-system-advanced.md` |
+| Видимость и доступ по ролям | `roles-access.md` |
+| Командный интерфейс формы (переходы, важные команды) | `command-interface.md` |
+| Размеры, выравнивание, фокус по умолчанию, узкие экраны | `layout-advanced.md` |
 
 ## Workflow
 
-1. `/form-info` — посмотреть текущую структуру формы
-2. Создать JSON с описанием добавлений
-3. `/form-edit` — добавить в форму
-4. `/form-validate` — проверить корректность
-5. `/form-info` — убедиться что добавилось правильно
+1. `/form-info` — структура формы: имена элементов, реквизиты, команды.
+2. Описать правки в JSON.
+3. `/form-edit` — применить; в выводе — что добавлено, перенесено, изменено и удалено.
+4. `/form-validate` — проверить форму.

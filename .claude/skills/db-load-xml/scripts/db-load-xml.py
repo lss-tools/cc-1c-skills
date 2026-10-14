@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# db-load-xml v1.28 — Load 1C configuration from XML files
+# db-load-xml v1.33 — Load 1C configuration from XML files
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 import argparse
@@ -37,8 +37,15 @@ def ci_parse_args(parser, argv=None):
 
 
 
-def _find_project_v8path():
-    """Walk up from CWD to find .v8-project.json and read its v8path."""
+def _find_project_v8path(args):
+    """Walk up from CWD to find .v8-project.json and read its v8path.
+
+    v8path записи базы сильнее корневого: в одном проекте базы живут на разных версиях
+    платформы, а версию формата выгрузки задаёт та платформа, которая выгружает.
+    """
+    db = find_project_database(args)
+    if db and db.get("v8path"):
+        return db["v8path"]
     d = os.getcwd()
     while True:
         pf = os.path.join(d, ".v8-project.json")
@@ -87,9 +94,10 @@ V8_SECRET_KEYS = ["/P", "/UC", "/WSP", "/AWSP", "/ConfigurationRepositoryP"]
 IBCMD_SECRET_KEYS = ["--password", "--token", "--db-pwd"]
 
 
-# --- Реквизиты хранилища из .v8-project.json ---
-# Модель их не передаёт: скрипт сопоставляет параметры соединения с записью в databases[]
-# и берёт repository оттуда. Тот же приём, что в cf-edit.py (сопоставление по configSrc).
+# --- Запись базы в .v8-project.json ---
+# Модель не передаёт ни путь к платформе конкретной базы, ни реквизиты хранилища: скрипт
+# сопоставляет параметры соединения с записью в databases[] и берёт их оттуда. Тот же приём,
+# что в cf-edit.py (сопоставление по configSrc).
 def _sg_find_v8project(start_dir):
     d = start_dir
     for _ in range(20):
@@ -349,10 +357,10 @@ def _version_key(p):
     return [int(x) for x in re.findall(r"\d+", _version_dir(p))]
 
 
-def resolve_v8path(v8path):
+def resolve_v8path(v8path, args):
     """Resolve path to a 1C executable (1cv8; ibcmd only when given explicitly)."""
     if not v8path:
-        v8path = _find_project_v8path()
+        v8path = _find_project_v8path(args)
     if not v8path:
         if os.name == "nt":
             candidates = (
@@ -483,6 +491,17 @@ def print_platform_output(result):
     print("--- Вывод платформы ---")
     print(text)
     print("--- End ---")
+
+
+def print_whole_config_scope_hint(file_list, extension=""):
+    """Список задаёт объекты метаданных, а не только файлы: вместе с объектом платформа грузит его
+    дочерние объекты. Корневой Configuration.xml — это объект «Конфигурация», поэтому список с ним
+    загружает конфигурацию целиком. Замерено на 1cv8 и ibcmd."""
+    if not any(x.replace("\\", "/").lower() == "configuration.xml" for x in file_list):
+        return
+    what = "расширения" if extension else "конфигурации"
+    print(f"[ВНИМАНИЕ] В списке Configuration.xml — платформа выполнит ПОЛНУЮ загрузку {what},")
+    print("  а не только перечисленных объектов.")
 
 
 def find_silent_rejections(log_text):
@@ -692,7 +711,7 @@ def main():
     args.ListFile = clean_path(args.ListFile, "-ListFile")
 
     # --- Resolve V8Path ---
-    v8path = resolve_v8path(args.V8Path)
+    v8path = resolve_v8path(args.V8Path, args)
 
     engine = "ibcmd" if os.path.basename(v8path).lower().startswith("ibcmd") else "1cv8"
 
@@ -734,6 +753,12 @@ def main():
     if args.Mode == "Partial" and not args.Files and not args.ListFile:
         print("Error: -Files or -ListFile required for Partial mode")
         sys.exit(1)
+    # Частями грузится одно расширение за раз: конфигуратор такое сочетание отвергает сам, а ibcmd
+    # молча загрузил бы все расширения целиком, не глядя в список.
+    if args.Mode == "Partial" and args.AllExtensions:
+        print("Error: -AllExtensions cannot be combined with a partial load (-Files/-ListFile)")
+        print("  Загружайте расширения по одному: -Extension <имя>, -ConfigDir — каталог этого расширения.")
+        sys.exit(1)
 
     # --- ibcmd branch (file infobase only; hierarchical full-directory import) ---
     if engine == "ibcmd":
@@ -757,6 +782,7 @@ def main():
             if not file_list:
                 print("Error: -Files or -ListFile required for partial import")
                 sys.exit(1)
+            print_whole_config_scope_hint(file_list, args.Extension)
             arguments = ["infobase", "config", "import", "files"] + file_list
             arguments += [f"--base-dir={args.ConfigDir}", f"--db-path={args.InfoBasePath}"]
             if args.Extension:
@@ -865,6 +891,7 @@ def main():
             if not file_list:
                 print("Error: после исключения служебных файлов поддержки загружать нечего. Для смены поддержки используйте -Mode Full.")
                 sys.exit(1)
+            print_whole_config_scope_hint(file_list, args.Extension)
             generated_list_file = os.path.join(temp_dir, "load_list.txt")
             with open(generated_list_file, "w", encoding="utf-8-sig") as f:
                 f.write("\n".join(file_list))
@@ -935,14 +962,16 @@ def main():
         # Поток — stdout, как у PS1-порта: предупреждение относится к содержимому загрузки, а не к
         # отказу навыка, и при code 0 остаётся предупреждением. Раньше py писал его в stderr —
         # наблюдаемое поведение портов расходилось, и один кейс не мог проверить оба.
-        if silent_failures:
+        # Только при успехе: при провале лог уже выведен целиком, а блок повторял бы его строки
+        # под заголовком «reported success» — неправдой рядом с «Error … (code: N)».
+        if exit_code == 0 and silent_failures:
             print(
                 f"[warning] platform reported success, but the log contains "
                 f"{len(silent_failures)} problem(s):"
             )
             for f in silent_failures:
                 print(f"  {f}")
-            if args.StrictLog and exit_code == 0:
+            if args.StrictLog:
                 exit_code = 1
 
         # Расширение могло загрузиться «успешно» и остаться неприменимым — спрашиваем платформу.

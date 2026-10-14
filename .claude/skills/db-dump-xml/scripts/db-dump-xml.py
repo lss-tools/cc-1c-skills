@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# db-dump-xml v1.21 — Dump 1C configuration to XML files
+# db-dump-xml v1.24 — Dump 1C configuration to XML files
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 import argparse
@@ -37,8 +37,15 @@ def ci_parse_args(parser, argv=None):
 
 
 
-def _find_project_v8path():
-    """Walk up from CWD to find .v8-project.json and read its v8path."""
+def _find_project_v8path(args):
+    """Walk up from CWD to find .v8-project.json and read its v8path.
+
+    v8path записи базы сильнее корневого: в одном проекте базы живут на разных версиях
+    платформы, а версию формата выгрузки задаёт та платформа, которая выгружает.
+    """
+    db = find_project_database(args)
+    if db and db.get("v8path"):
+        return db["v8path"]
     d = os.getcwd()
     while True:
         pf = os.path.join(d, ".v8-project.json")
@@ -87,9 +94,10 @@ V8_SECRET_KEYS = ["/P", "/UC", "/WSP", "/AWSP", "/ConfigurationRepositoryP"]
 IBCMD_SECRET_KEYS = ["--password", "--token", "--db-pwd"]
 
 
-# --- Реквизиты хранилища из .v8-project.json ---
-# Модель их не передаёт: скрипт сопоставляет параметры соединения с записью в databases[]
-# и берёт repository оттуда. Тот же приём, что в cf-edit.py (сопоставление по configSrc).
+# --- Запись базы в .v8-project.json ---
+# Модель не передаёт ни путь к платформе конкретной базы, ни реквизиты хранилища: скрипт
+# сопоставляет параметры соединения с записью в databases[] и берёт их оттуда. Тот же приём,
+# что в cf-edit.py (сопоставление по configSrc).
 def _sg_find_v8project(start_dir):
     d = start_dir
     for _ in range(20):
@@ -328,10 +336,10 @@ def _version_key(p):
     return [int(x) for x in re.findall(r"\d+", _version_dir(p))]
 
 
-def resolve_v8path(v8path):
+def resolve_v8path(v8path, args):
     """Resolve path to a 1C executable (1cv8; ibcmd only when given explicitly)."""
     if not v8path:
-        v8path = _find_project_v8path()
+        v8path = _find_project_v8path(args)
     if not v8path:
         if os.name == "nt":
             candidates = (
@@ -486,6 +494,27 @@ def dir_nonempty(path):
     return os.path.isdir(path) and any(os.scandir(path))
 
 
+def copy_tree_over(src, dst):
+    """Скопировать дерево поверх каталога: файлы заменяются, лишнее в приёмнике остаётся —
+    так пишет полную выгрузку конфигуратор (устаревшие объекты, .git и прочее не трогает).
+    Исключение на первой же ошибке. Пустые каталоги не переносятся."""
+    for base, _dirs, files in os.walk(src):
+        rel = os.path.relpath(base, src)
+        target = dst if rel == "." else os.path.join(dst, rel)
+        for name in files:
+            os.makedirs(target, exist_ok=True)
+            shutil.copy2(os.path.join(base, name), os.path.join(target, name))
+
+
+def print_format_mismatch_hint(text):
+    """Отказ инкрементальной выгрузки из-за версии формата: каталог выгружен другой платформой.
+    Тексты: 1cv8 — «версия формата платформы отличается от версии формата выгрузки»,
+    ibcmd — «Версия формат выгрузки и платформы не совпадают»."""
+    if re.search(r"верси\S* формат\S* .{0,40}(отличается|не совпадают)", text or "", re.IGNORECASE):
+        print("[подсказка] Каталог выгружен в другой версии формата. -Mode Full перевыгрузит конфигурацию")
+        print("  целиком в формате текущей платформы — изменятся все файлы каталога.")
+
+
 def _redact(text, *secrets):
     """Redact literal secret values (password, user) from a display string —
     precise, never touches lookalike paths."""
@@ -542,7 +571,7 @@ def main():
     args.ConfigDir = clean_path(args.ConfigDir, "-ConfigDir")
 
     # --- Resolve V8Path ---
-    v8path = resolve_v8path(args.V8Path)
+    v8path = resolve_v8path(args.V8Path, args)
     engine = "ibcmd" if os.path.basename(v8path).lower().startswith("ibcmd") else "1cv8"
 
     # --- Resolve additional arguments for the selected engine ---
@@ -596,6 +625,25 @@ def main():
         print("Error: -Objects or -ObjectsFile required for Partial mode")
         sys.exit(1)
 
+    # --- Changes: инкремент ведётся от файла версий прошлой выгрузки ---
+    # Без ConfigDumpInfo.xml платформа инкремент отвергает. Пустой каталог — первая выгрузка, она
+    # полная. Непустой без файла версий не трогаем: полная выгрузка перепишет его целиком, и это
+    # решение пользователя. У -AllExtensions файлы версий лежат в подкаталогах расширений — их
+    # проверяет платформа.
+    if args.Mode == "Changes":
+        if args.AllExtensions:
+            first_dump = not dir_nonempty(args.ConfigDir)
+        else:
+            first_dump = (not os.path.exists(os.path.join(args.ConfigDir, "ConfigDumpInfo.xml"))
+                          and not os.path.exists(os.path.join(args.ConfigDir, "Configuration.xml")))
+        if first_dump:
+            print("[note] выгрузки в каталоге ещё нет — первая выгрузка выполняется полностью")
+            args.Mode = "Full"
+        elif not args.AllExtensions and not os.path.exists(os.path.join(args.ConfigDir, "ConfigDumpInfo.xml")):
+            print(f"Error: no ConfigDumpInfo.xml in {args.ConfigDir} — incremental dump (Changes) is impossible")
+            print("  -Mode Full выгрузит конфигурацию целиком поверх каталога.")
+            sys.exit(1)
+
     # --- Create output dir if needed ---
     if not os.path.exists(args.ConfigDir):
         os.makedirs(args.ConfigDir, exist_ok=True)
@@ -606,11 +654,25 @@ def main():
         if args.Format == "Plain":
             print("Error: ibcmd config export supports hierarchical format only (use -Format Hierarchical or 1cv8)")
             sys.exit(1)
-        if args.AllExtensions:
-            arguments = ["infobase", "config", "export", "all-extensions", args.ConfigDir, f"--db-path={args.InfoBasePath}"]
-        elif args.Mode == "UpdateInfo":
+        # Полный экспорт ibcmd в непустой каталог отказывает («Каталог не пуст»), а конфигуратор
+        # пишет поверх. Чтобы движки вели себя одинаково, такой экспорт идёт во временный каталог
+        # и копируется поверх ConfigDir.
+        if args.AllExtensions and args.Mode == "Changes":
+            print("[note] ibcmd выгружает все расширения только полностью")
+        overlay = (args.Mode != "Partial" and (args.AllExtensions or args.Mode == "Full")
+                   and dir_nonempty(args.ConfigDir))
+        out_dir = args.ConfigDir
+        if overlay:
+            export_tmp = tempfile.mkdtemp(prefix="ibcmd_export_")
+            atexit.register(shutil.rmtree, export_tmp, ignore_errors=True)
+            out_dir = os.path.join(export_tmp, "export")
+        if args.Mode == "UpdateInfo":
+            # Раньше развилки по -AllExtensions: иначе вместо обновления файла версий ушла бы
+            # полная выгрузка всех расширений.
             print("Error: ibcmd config export does not support Mode UpdateInfo; use 1cv8")
             sys.exit(1)
+        elif args.AllExtensions:
+            arguments = ["infobase", "config", "export", "all-extensions", out_dir, f"--db-path={args.InfoBasePath}"]
         elif args.Mode == "Partial":
             obj_list = [o.strip() for o in args.Objects.split(",") if o.strip()]
             arguments = ["infobase", "config", "export", "objects"] + obj_list
@@ -621,7 +683,10 @@ def main():
             arguments = ["infobase", "config", "export", f"--db-path={args.InfoBasePath}"]
             if args.Extension:
                 arguments.append(f"--extension={args.Extension}")
-            arguments.append(args.ConfigDir)
+            # Инкремент — --sync; без --force: при другой версии формата ibcmd честно отказывает.
+            if args.Mode == "Changes":
+                arguments.append("--sync")
+            arguments.append(out_dir)
         ib_data = tempfile.mkdtemp(prefix="ibcmd_data_")
         atexit.register(shutil.rmtree, ib_data, ignore_errors=True)
         if args.UserName:
@@ -633,15 +698,28 @@ def main():
         print(f"Running: ibcmd {_redact(' '.join(format_args_for_display(arguments, engine)), args.Password, args.UserName)}")
         result = run_ibcmd([v8path] + arguments, bool(args.UserName))
         exit_code = result.returncode
-        out_missing = exit_code == 0 and not dir_nonempty(args.ConfigDir)
+        out_missing = exit_code == 0 and not dir_nonempty(out_dir)
         if out_missing:
             exit_code = 1
+        copy_error = None
+        if exit_code == 0 and overlay:
+            try:
+                copy_tree_over(out_dir, args.ConfigDir)
+            except OSError as e:
+                copy_error = str(e)
+                exit_code = 1
         if exit_code == 0:
             print(f"Configuration exported successfully to: {args.ConfigDir}")
+        elif copy_error:
+            print(f"Error: export succeeded, but copying it over {args.ConfigDir} failed: {copy_error}")
+            print("  Каталог мог остаться частично обновлённым — повторите выгрузку.")
         elif out_missing:
             print(f"Error: exit code 0 but no files under {args.ConfigDir} — configuration was not exported")
         else:
             print(f"Error exporting configuration (code: {exit_code})")
+        print_platform_output(result)
+        if exit_code != 0:
+            print_format_mismatch_hint((result.stdout or "") + (result.stderr or ""))
         sys.exit(exit_code)
 
     # --- Temp dir ---
@@ -674,8 +752,8 @@ def main():
             print("Executing full configuration dump...")
         elif args.Mode == "Changes":
             print("Executing incremental configuration dump...")
+            # Без -force: с ним при другой версии формата платформа молча выгружает всё заново.
             arguments.append("-update")
-            arguments.append("-force")
         elif args.Mode == "Partial":
             print("Executing partial configuration dump...")
             object_list = [obj.strip() for obj in args.Objects.split(",") if obj.strip()]
@@ -722,6 +800,7 @@ def main():
         else:
             print(f"Error dumping configuration (code: {exit_code})")
 
+        log_content = ""
         if os.path.isfile(out_file):
             try:
                 with open(out_file, "r", encoding="utf-8-sig") as f:
@@ -734,6 +813,8 @@ def main():
                 pass
 
         print_platform_output(result)
+        if exit_code != 0:
+            print_format_mismatch_hint(log_content + "\n" + (result.stdout or "") + (result.stderr or ""))
         sys.exit(exit_code)
 
     finally:

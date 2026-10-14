@@ -1,4 +1,4 @@
-﻿# template-add v1.23 — Add template to 1C object (+write_xml_file/write_utf8_bom: общий эталон записи)
+﻿# template-add v1.27 — Add template to 1C object (+write_xml_file/write_utf8_bom: общий эталон записи)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 param(
 	[Parameter(Mandatory)]
@@ -13,6 +13,8 @@ param(
 	[string]$TemplateType,
 
 	[string]$Synonym = $TemplateName,
+
+	[string]$Lang = "ru",
 
 	[string]$SrcDir = "src",
 
@@ -157,7 +159,7 @@ function Assert-EditAllowed([string]$targetPath, [string]$require) {
 # --- Маппинг типов ---
 
 $typeMap = @{
-	"HTML"                = @{ TemplateType = "HTMLDocument";        Ext = ".html" }
+	"HTML"                = @{ TemplateType = "HTMLDocument";        Ext = ".xml" }
 	"Text"                = @{ TemplateType = "TextDocument";        Ext = ".txt" }
 	"SpreadsheetDocument" = @{ TemplateType = "SpreadsheetDocument"; Ext = ".xml" }
 	"BinaryData"          = @{ TemplateType = "BinaryData";          Ext = ".bin" }
@@ -199,9 +201,45 @@ $processorDir = Join-Path $SrcDir $ObjectName
 $templatesDir = Join-Path $processorDir "Templates"
 $templateMetaPath = Join-Path $templatesDir "$TemplateName.xml"
 
-if (Test-Path $templateMetaPath) {
-	Write-Error "Макет уже существует: $templateMetaPath"
+# Код языка идёт и в текст XML, и в имя файла страницы, поэтому проверяем его до записи:
+# пустое значение дало бы файл «.html» и пустой <Page></Page>, разделитель пути — запись мимо
+# каталога страниц, а зарезервированное имя устройства (nul, con, prn, aux, com1…, lpt1…) на
+# Windows уводит запись в само устройство: py-порт при -Lang nul молча писал <Page>nul</Page>
+# и пустой каталог с кодом 0. Все отказы платформы были бы тихими.
+#
+# Якоря `\A…\z`, а не `^…$`: последние в обоих языках допускают перевод строки в конце.
+#
+# Копия этой функции есть в help-add (навыки автономны, формат «дескриптор + страница» у них
+# общий). Держать копии одинаковыми — сознательно; за дрейфом следит check-inline-drift.
+function Test-LangCode([string]$code) {
+	if ($code -notmatch '\A[A-Za-z0-9_-]+\z') { return $false }
+	if ($code -match '\A(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])\z') { return $false }
+	return $true
+}
+
+if (-not (Test-LangCode $Lang)) {
+	Write-Error "Недопустимый код языка: '$Lang'`nОжидается код вида ru, en (буквы, цифры, дефис, подчёркивание; имена устройств Windows недопустимы)"
 	exit 1
+}
+
+# Существующий HTML-макет — не всегда повод отказать: в один макет платформа кладёт
+# несколько языков (<Page> на каждый, страницы рядом), и повторный вызов с другим -Lang
+# добавляет страницу. Для остальных типов поведение прежнее — отказ.
+$addLangMode = $false
+if (Test-Path $templateMetaPath) {
+	$existingType = $null
+	$metaText = [System.IO.File]::ReadAllText((Resolve-Path $templateMetaPath).Path, [System.Text.Encoding]::UTF8)
+	if ($metaText -match '<TemplateType>([^<]+)</TemplateType>') { $existingType = $Matches[1] }
+
+	if ($TemplateType -eq "HTML" -and $existingType -eq "HTMLDocument") {
+		$addLangMode = $true
+	} elseif ($TemplateType -eq "HTML") {
+		Write-Error "Макет уже существует: $templateMetaPath`nЕго тип — $existingType, страницу на языке можно добавить только к HTML-макету"
+		exit 1
+	} else {
+		Write-Error "Макет уже существует: $templateMetaPath"
+		exit 1
+	}
 }
 
 Assert-EditAllowed $rootXmlPath 'editable'
@@ -214,6 +252,14 @@ New-Item -ItemType Directory -Path $templateExtDir -Force | Out-Null
 # --- Кодировка ---
 
 $encBom = New-Object System.Text.UTF8Encoding($true)
+
+# Скелет HTML-страницы макета — в том же виде, в каком его пишет редактор платформы
+# (одной строкой, парный </meta>): первое сохранение в Конфигураторе даст минимальный
+# дифф. Нужен в двух местах (новый макет и добавление языка) — поэтому одной переменной.
+$htmlSkeleton = @"
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN"><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"></meta></head><body>
+</body></html>
+"@
 
 # --- Detect format version ---
 
@@ -297,10 +343,94 @@ $templateMetaXml = @"
 # Копия этой функции есть в каждом навыке-эмиттере (навыки автономны). Держать
 # копии одинаковыми — сознательно: разошедшиеся копии сводят на нет весь смысл.
 #
-# HTML-макет сюда НЕ идёт — платформа хранит его с LF.
+# HTML-страница макета сюда НЕ идёт — платформа хранит её с LF.
 function Write-XmlFile([string]$path, [string]$text, $encoding) {
 	$t = ($text -replace "`r`n", "`n") -replace "`n", "`r`n"
 	[System.IO.File]::WriteAllText($path, $t.TrimEnd("`r", "`n"), $encoding)
+}
+
+# --- 1a. Добавление страницы на другом языке в существующий HTML-макет ---
+# Метаданные макета и ChildObjects здесь НЕ трогаем: и то и другое уже на месте,
+# перезапись сменила бы UUID. Язык, не объявленный в Languages/ конфигурации, платформа
+# принимает и возвращает при выгрузке (проверено на 8.3.27) — состав языков не проверяем.
+if ($addLangMode) {
+	$descPath = Join-Path $templateExtDir "Template.xml"
+	$pageDir = Join-Path $templateExtDir "Template"
+	$legacyPagePath = Join-Path $templateExtDir "Template.html"
+	$langs = @()
+	$descVersion = $formatVersion
+
+	# Сначала РАЗБОР состояния, и только в самом конце запись: иначе отказ на полпути
+	# оставляет макет разобранным (страница есть, дескриптора нет) — а такую раскладку
+	# платформа снова молча игнорирует.
+	$legacyPending = $false
+	$pagePath = Join-Path $pageDir "$Lang.html"
+
+	if (Test-Path $descPath) {
+		$descText = [System.IO.File]::ReadAllText((Resolve-Path $descPath).Path, [System.Text.Encoding]::UTF8)
+		# Версию берём из самого дескриптора: правка чужой выгрузки не должна менять формат.
+		if ($descText -match '<Help[^>]+version="(\d+\.\d+)"') { $descVersion = $Matches[1] }
+		$langs = @([regex]::Matches($descText, '<Page>([^<]+)</Page>') | ForEach-Object { $_.Groups[1].Value })
+		# Полумигрированное дерево: дескриптор уже есть, а старый Ext/Template.html остался рядом.
+		# Платформа его игнорирует, поэтому текст в нём пропадёт незаметно — говорим вслух.
+		if (Test-Path $legacyPagePath) {
+			Write-Host "[WARN] Рядом лежит старый Ext/Template.html — платформа его игнорирует."
+			Write-Host "       Перенесите нужное в Template/<язык>.html и удалите его."
+		}
+	} elseif (Test-Path $legacyPagePath) {
+		# Раскладка до v1.24 — одиночный Ext/Template.html, который платформа молча игнорирует.
+		# Языка у него нет, но создать его могла только версия навыка без параметра -Lang,
+		# то есть это страница на языке по умолчанию.
+		if (Test-Path (Join-Path $pageDir "ru.html")) {
+			Write-Error "Макет разобран: есть и старый Ext/Template.html, и Template/ru.html — что из них актуально, решать не навыку.`nОставьте один файл и повторите."
+			exit 1
+		}
+		$legacyPending = $true
+		$langs = @("ru")
+	}
+
+	# Файл страницы НИКОГДА не перезаписываем: в нём может лежать текст макета.
+	# Ошибка — только когда добавлять нечего: язык уже в дескрипторе И страница на диске.
+	# При миграции проверять нечего: langs там задан нами же, а страница появится переносом.
+	if (($langs -contains $Lang) -and (Test-Path $pagePath) -and -not $legacyPending) {
+		Write-Error "Страница макета на языке '$Lang' уже существует: $pagePath"
+		exit 1
+	}
+
+	# Порядок страниц — по коду языка (в выгрузке ERP так во всех 54 двуязычных макетах).
+	# Сравнение ordinal, а не культурное: иначе порты разойдутся на ровном месте.
+	if (-not ($langs -contains $Lang)) { $langs = @($langs + $Lang) }
+	[Array]::Sort($langs, [System.StringComparer]::Ordinal)
+
+	$pagesXml = ($langs | ForEach-Object { "`t<Page>$_</Page>" }) -join "`n"
+	$descXml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<Help xmlns="http://v8.1c.ru/8.3/xcf/extrnprops" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="$descVersion">
+$pagesXml
+</Help>
+"@
+
+	# --- запись ---
+	New-Item -ItemType Directory -Path $pageDir -Force | Out-Null
+	if ($legacyPending) {
+		Move-Item -LiteralPath $legacyPagePath -Destination (Join-Path $pageDir "ru.html")
+		Write-Host "[WARN] Макет был в старой раскладке (Ext/Template.html) — платформа её игнорирует."
+		Write-Host "       Страница считана как ru и перенесена в Template/ru.html."
+	}
+	Write-XmlFile $descPath $descXml $encBom
+	if (Test-Path $pagePath) {
+		# При миграции про сохранённое содержимое уже сказано выше — не повторяемся.
+		if (-not $legacyPending) {
+			Write-Host "[WARN] Страница $Lang.html уже лежала на диске — содержимое сохранено, дописан только <Page>."
+		}
+	} else {
+		[System.IO.File]::WriteAllText($pagePath, ($htmlSkeleton -replace "`r`n", "`n"), $encBom)
+	}
+
+	Write-Host "[OK] Добавлена страница макета: $TemplateName ($Lang)"
+	Write-Host "     Содержимое: $pagePath"
+	Write-Host "     Дескриптор: $descPath"
+	exit 0
 }
 
 Write-XmlFile $templateMetaPath $templateMetaXml $encBom
@@ -308,21 +438,31 @@ Write-XmlFile $templateMetaPath $templateMetaXml $encBom
 # --- 2. Содержимое макета (Templates/<TemplateName>/Ext/Template.<ext>) ---
 
 $templateFilePath = Join-Path $templateExtDir "Template$($tmpl.Ext)"
+# Куда класть текст макета. Совпадает с $templateFilePath у всех типов, кроме HTML:
+# там содержимое живёт в отдельной странице, а Template.xml — только дескриптор.
+$templateBodyPath = $templateFilePath
 
 switch ($TemplateType) {
 	"HTML" {
-		$content = @"
-<!DOCTYPE html>
-<html>
-<head>
-	<meta charset="UTF-8">
-	<title></title>
-</head>
-<body>
-</body>
-</html>
+		# HTML-макет платформа хранит парой, как справку: дескриптор Ext/Template.xml
+		# со списком страниц и сама страница Ext/Template/<язык>.html (картинки —
+		# рядом в _files/). Одиночный Ext/Template.html платформа молча игнорирует:
+		# загрузка проходит без ошибок, а макет в базе пустой.
+		$pageXml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<Help xmlns="http://v8.1c.ru/8.3/xcf/extrnprops" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="$formatVersion">
+	<Page>$Lang</Page>
+</Help>
 "@
-		[System.IO.File]::WriteAllText($templateFilePath, $content, $encBom)
+		Write-XmlFile $templateFilePath $pageXml $encBom
+
+		$pageDir = Join-Path $templateExtDir "Template"
+		New-Item -ItemType Directory -Path $pageDir -Force | Out-Null
+		$templateBodyPath = Join-Path $pageDir "$Lang.html"
+
+		# Страница — с LF: платформа хранит HTML именно так.
+		$content = ($htmlSkeleton -replace "`r`n", "`n")
+		[System.IO.File]::WriteAllText($templateBodyPath, $content, $encBom)
 	}
 	"Text" {
 		[System.IO.File]::WriteAllText($templateFilePath, "", $encBom)
@@ -463,7 +603,10 @@ if ($alreadyRegistered) {
 	Write-Host "     Already registered: <Template>$TemplateName</Template> in ChildObjects (skipped duplicate)"
 }
 Write-Host "     Метаданные: $templateMetaPath"
-Write-Host "     Содержимое: $templateFilePath"
+Write-Host "     Содержимое: $templateBodyPath"
+if ($TemplateType -eq "HTML") {
+	Write-Host "     Дескриптор: $templateFilePath"
+}
 if ($mainDCSUpdated) {
 	Write-Host "     MainDataCompositionSchema: $($mainDCS.InnerText)"
 }

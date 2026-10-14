@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# cfe-validate v1.16 — Validate 1C configuration extension XML structure (CFE)
+# cfe-validate v1.19 — Validate 1C configuration extension XML structure (CFE)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 """Validates extension Configuration.xml: root, InternalInfo, extension properties, ChildObjects, borrowed objects."""
 import sys, os, argparse, re
@@ -25,6 +25,42 @@ def ci_parse_args(parser, argv=None):
         if m and argv[i + 1].lower() in m:
             argv[i + 1] = m[argv[i + 1].lower()]
     return parser.parse_args(argv)
+
+
+# Built-in language keywords in both spellings. The platform accepts either one in any module
+# (pairs taken from the platform string tables), so a module written in English is ordinary
+# source, not a broken one: we must read both and emit the spelling we read.
+def bsl_keywords():
+    return {
+        "ru": {
+            "Async": "Асинх", "Proc": "Процедура", "EndProc": "КонецПроцедуры",
+            "Func": "Функция", "EndFunc": "КонецФункции", "Val": "Знач",
+            "Region": "Область", "EndRegion": "КонецОбласти",
+            "If": "Если", "Then": "Тогда", "ElsIf": "ИначеЕсли", "Else": "Иначе", "EndIf": "КонецЕсли",
+            # Platform spells the negation "Не"; we emit "НЕ" as this skill always has —
+            # the language is case-insensitive, and the lower case would churn every snapshot.
+            "And": "И", "Or": "Или", "Not": "НЕ",
+            "Insert": "Вставка", "EndInsert": "КонецВставки", "Delete": "Удаление", "EndDelete": "КонецУдаления",
+            "Before": "Перед", "After": "После", "Around": "Вместо", "Control": "ИзменениеИКонтроль",
+            "Proceed": "ПродолжитьВызов", "Return": "Возврат",
+            # Not a keyword: name of the local the generated Instead-stub declares. Lives here so
+            # that the language of emitted text is decided in exactly one place.
+            "ResultVar": "Результат",
+            "Directives": ["НаКлиенте", "НаСервере", "НаСервереБезКонтекста", "НаКлиентеНаСервереБезКонтекста", "НаКлиентеНаСервере"],
+        },
+        "en": {
+            "Async": "Async", "Proc": "Procedure", "EndProc": "EndProcedure",
+            "Func": "Function", "EndFunc": "EndFunction", "Val": "Val",
+            "Region": "Region", "EndRegion": "EndRegion",
+            "If": "If", "Then": "Then", "ElsIf": "ElsIf", "Else": "Else", "EndIf": "EndIf",
+            "And": "And", "Or": "Or", "Not": "Not",
+            "Insert": "Insert", "EndInsert": "EndInsert", "Delete": "Delete", "EndDelete": "EndDelete",
+            "Before": "Before", "After": "After", "Around": "Around", "Control": "ChangeAndValidate",
+            "Proceed": "ProceedWithCall", "Return": "Return",
+            "ResultVar": "Result",
+            "Directives": ["AtClient", "AtServer", "AtServerNoContext", "AtClientAtServerNoContext", "AtClientAtServer"],
+        },
+    }
 
 
 NS = {
@@ -197,6 +233,22 @@ def format_rank(ver):
     """"2.20" → 220, "2.9" → 209. Строковое сравнение неверно ("2.9" > "2.17")."""
     m = re.match(r'^(\d+)\.(\d+)$', ver or '')
     return int(m.group(1)) * 100 + int(m.group(2)) if m else 0
+
+
+# Штамп версии формата — атрибут version КОРНЕВОГО элемента файла. Копия общего эталона (семья
+# root_version, авторитет — meta-validate). Корневого: в Form.xml расширения ниже стоит <BaseForm version=…>.
+def root_version(xml_path):
+    if not os.path.isfile(xml_path):
+        return None
+    with open(xml_path, "rb") as f:
+        head = f.read(4096).decode("utf-8", errors="ignore")
+    m = re.search(r'<[A-Za-z_][\w.:-]*(\s[^>]*)?/?>', head)
+    if not m:
+        return None
+    v = re.search(r'(?:^|\s)version="([^"]*)"', m.group(1) or "")
+    if v:
+        return v.group(1)
+    return None
 
 
 class Reporter:
@@ -1044,6 +1096,18 @@ def main():
     elif check13_ok:
         r.ok('13. TypeLink: clean')
 
+    # Каталог конфигурации-источника из -ConfigPath (каталог или путь к Configuration.xml). Общий для
+    # проверок 14 и 18; есть ли там Configuration.xml, каждая проверка решает и сообщает сама.
+    def source_config_root():
+        root = config_path_arg
+        if not os.path.isabs(root):
+            root = os.path.join(os.getcwd(), root)
+        if os.path.exists(root) and not os.path.isdir(root):
+            root = os.path.dirname(root)
+        return root
+
+    src_root_warned = False
+
     # --- Check 14: пути Объект.* заимствованных форм против конфигурации-источника ---
     # Требует -ConfigPath: отличить живой путь от висячего можно только по исходному объекту.
     # «Объект.Партнер» валиден и без заимствования реквизита (наследуется от базы), а «Объект.Товары.Артикул»
@@ -1053,14 +1117,11 @@ def main():
         if not config_path_arg:
             r.out('[INFO]  14. Пути Объект.* против конфигурации-источника не проверялись: не задан -ConfigPath')
         else:
-            cfg_root = config_path_arg
-            if not os.path.isabs(cfg_root):
-                cfg_root = os.path.join(os.getcwd(), cfg_root)
-            if os.path.exists(cfg_root) and not os.path.isdir(cfg_root):
-                cfg_root = os.path.dirname(cfg_root)
+            cfg_root = source_config_root()
 
             if not os.path.isfile(os.path.join(cfg_root, 'Configuration.xml')):
                 r.warn(f"14. -ConfigPath '{config_path_arg}': Configuration.xml не найден — проверка путей пропущена")
+                src_root_warned = True
             else:
                 check14_ok = True
                 path_check_count = 0
@@ -1266,7 +1327,255 @@ def main():
                 for issue in state_issues:
                     r.warn(f'16. {issue}')
 
+    # --- Check 17: версия формата согласована внутри объектов расширения; сверка с Configuration.xml ---
+    # Дескриптор объекта и его штампованные тела X/Ext/*.xml, дескриптор формы/макета и его тело (и
+    # Configuration.xml с его Ext/*.xml) платформа загружает только в одной версии формата: «Версия формата
+    # загружаемого файла … отличается от версии формата ранее загруженных файлов». Объект целиком в другой
+    # версии, чем расширение, загружается — это лишь неоднородность выгрузки (типично после мержа веток,
+    # выгруженных разными платформами), поэтому такое расхождение только предупреждение.
+    if version:
+        ver_descriptors = [resolved_path]
+        if child_obj_node is not None:
+            for child in child_obj_node:
+                if not isinstance(child.tag, str):
+                    continue
+                type_name = etree.QName(child.tag).localname
+                if type_name not in CHILD_TYPE_DIR_MAP:
+                    continue
+                ver_obj_name = (child.text or '').strip()
+                if not ver_obj_name:
+                    continue
+                ver_type_dir = os.path.join(config_dir, CHILD_TYPE_DIR_MAP[type_name])
+                ver_obj_file = os.path.join(ver_type_dir, f'{ver_obj_name}.xml')
+                if not os.path.isfile(ver_obj_file):
+                    continue
+                ver_descriptors.append(ver_obj_file)
+                for sub in ('Forms', 'Templates'):
+                    sub_dir = os.path.join(ver_type_dir, ver_obj_name, sub)
+                    if not os.path.isdir(sub_dir):
+                        continue
+                    names = sorted(n for n in os.listdir(sub_dir)
+                                   if n.lower().endswith('.xml') and os.path.isfile(os.path.join(sub_dir, n)))
+                    for n in names:
+                        ver_descriptors.append(os.path.join(sub_dir, n))
+
+        def ver_rel(p):
+            return p[len(config_dir):].lstrip('\\/').replace('\\', '/')
+
+        ver_errors = 0
+        ver_bodies_ok = 0
+        ver_off = []
+        for desc in ver_descriptors:
+            if r.stopped:
+                break
+            is_root = desc == resolved_path
+            desc_ver = version if is_root else root_version(desc)
+            if not desc_ver:
+                continue
+            if not is_root and desc_ver != version:
+                ver_off.append(f'{ver_rel(desc)} {desc_ver}')
+            # Тела Configuration.xml лежат в <корень>/Ext, тела объекта X.xml — в X/Ext.
+            if is_root:
+                ext_dir = os.path.join(config_dir, 'Ext')
+            else:
+                ext_dir = os.path.join(os.path.dirname(desc), os.path.splitext(os.path.basename(desc))[0], 'Ext')
+            if not os.path.isdir(ext_dir):
+                continue
+            body_names = sorted(n for n in os.listdir(ext_dir)
+                                if n.lower().endswith('.xml') and os.path.isfile(os.path.join(ext_dir, n)))
+            for bn in body_names:
+                body = os.path.join(ext_dir, bn)
+                body_ver = root_version(body)
+                if not body_ver:
+                    continue
+                # У заимствованной формы второй штамп — <BaseForm version=…> внутри тела; платформа сверяет
+                # с дескриптором и его.
+                if bn == 'Form.xml':
+                    with open(body, 'r', encoding='utf-8-sig') as f:
+                        body_text = f.read()
+                    bfm = re.search(r'<BaseForm\s[^>]*?version="([^"]*)"', body_text)
+                    if bfm and bfm.group(1) != desc_ver:
+                        ver_errors += 1
+                        r.error(f'17. {ver_rel(body)} <BaseForm> is stamped {bfm.group(1)}, its descriptor '
+                                f'{ver_rel(desc)} {desc_ver} — the platform refuses to load parts of one object in different formats')
+                        if r.stopped:
+                            break
+                if body_ver == desc_ver:
+                    ver_bodies_ok += 1
+                    continue
+                ver_errors += 1
+                r.error(f'17. {ver_rel(body)} is stamped {body_ver}, its descriptor {ver_rel(desc)} {desc_ver} '
+                        '— the platform refuses to load parts of one object in different formats')
+                if r.stopped:
+                    break
+        if ver_off:
+            shown = ', '.join(ver_off[:5])
+            if len(ver_off) > 5:
+                shown += f', … (+{len(ver_off) - 5})'
+            r.warn(f'17. Format version differs from the extension ({version}): {shown} — the platform loads it, '
+                   'but the dump is no longer uniform (typical after merging branches dumped by different platforms)')
+        elif ver_errors == 0 and ver_bodies_ok > 0:
+            r.ok(f'17. Format version: {ver_bodies_ok} stamped part(s) agree with their descriptors and the extension')
+
+    # --- Check 18: заимствованные объекты и основной язык против конфигурации-источника ---
+    # ОбъектРасширяемойКонфигурации контролируется у самого объекта и у каждого заимствованного
+    # подобъекта (реквизит, ТЧ, колонка ТЧ, форма — замер 8.3.24), ОсновнойЯзык — у расширения.
+    # Расхождение платформа принимает при загрузке, а применять расширение отказывается, и по
+    # сообщению не видно, откуда взялся чужой UUID. Нулевой UUID (cfe-init без -ConfigPath) не
+    # совпадёт ни с чем — его видно и без источника.
+
+    # UUID, по которому подобъект связан с основной конфигурацией: в расширении —
+    # ExtendedConfigurationObject (у собственных подобъектов его нет), в источнике — атрибут uuid.
+    def md_id_value(el, from_extension):
+        if from_extension:
+            n = el.xpath("*[local-name()='Properties']/*[local-name()='ExtendedConfigurationObject']")
+            return (n[0].text or '').strip() if n else None
+        return el.get('uuid') or None
+
+    # Подобъекты, у которых в ChildObjects владельца только имя, а описание — в отдельном файле
+    # <каталог владельца>/<Имя владельца>/<Каталог>/<Имя>.xml.
+    nested_file_dirs = {'Form': 'Forms', 'Template': 'Templates', 'Subsystem': 'Subsystems', 'Recalculation': 'Recalculations'}
+
+    # Объект или подобъект из отдельного файла: сам файл и всё, что под ним. False — файла нет или он
+    # не читается.
+    def add_md_id_file(idx, obj_file, key, from_extension):
+        if not os.path.isfile(obj_file):
+            return False
+        try:
+            doc_root = etree.parse(obj_file).getroot()
+        except Exception:
+            return False
+        obj_el = None
+        for c in doc_root:
+            if isinstance(c.tag, str):
+                obj_el = c
+                break
+        if obj_el is None:
+            return False
+        v = md_id_value(obj_el, from_extension)
+        if v:
+            idx[key] = v
+        own_dir = os.path.join(os.path.dirname(obj_file), os.path.splitext(os.path.basename(obj_file))[0])
+        add_md_id_entries(idx, obj_el, key, from_extension, own_dir)
+        return True
+
+    # Подобъекты с собственными свойствами (реквизиты, ТЧ и их колонки, значения перечисления, команды
+    # и т.п.) лежат в ChildObjects целиком — обходим их рекурсивно. Формы, макеты, вложенные подсистемы
+    # и перерасчёты там — только имя: их UUID в отдельном файле под каталогом владельца.
+    def add_md_id_entries(idx, el, prefix, from_extension, own_dir):
+        co = el.xpath("*[local-name()='ChildObjects']")
+        if not co:
+            return
+        for sub in co[0]:
+            if not isinstance(sub.tag, str):
+                continue
+            sub_type = etree.QName(sub.tag).localname
+            name_node = sub.xpath("*[local-name()='Properties']/*[local-name()='Name']")
+            if name_node:
+                key = f'{prefix}.{sub_type}.{(name_node[0].text or "").strip()}'
+                v = md_id_value(sub, from_extension)
+                if v:
+                    idx[key] = v
+                add_md_id_entries(idx, sub, key, from_extension, '')
+            elif own_dir and sub_type in nested_file_dirs and (sub.text or '').strip():
+                sub_name = sub.text.strip()
+                sub_file = os.path.join(own_dir, nested_file_dirs[sub_type], f'{sub_name}.xml')
+                add_md_id_file(idx, sub_file, f'{prefix}.{sub_type}.{sub_name}', from_extension)
+
+    # Индекс «путь подобъекта → UUID связи» по файлу объекта; None — файла нет или он не читается.
+    # Ключи сравниваются с учётом регистра: имя заимствованного подобъекта платформа сверяет точно
+    # (контролируемое свойство «Имя», замер 8.3.24), хотя в коде 1С имена регистронезависимы.
+    def md_id_index(type_dir, type_name, obj_name, from_extension):
+        idx = {}
+        if not add_md_id_file(idx, os.path.join(type_dir, f'{obj_name}.xml'), f'{type_name}.{obj_name}', from_extension):
+            return None
+        return idx
+
+    if not r.stopped and child_obj_node is not None:
+        zero_guid = '00000000-0000-0000-0000-000000000000'
+        src_root = None
+        src_cfg_root = None
+        if config_path_arg:
+            src_root = source_config_root()
+            src_cfg_file = os.path.join(src_root, 'Configuration.xml')
+            if not os.path.isfile(src_cfg_file):
+                # Проверка 14 об этом уже сказала — второй раз не повторяем.
+                if not src_root_warned:
+                    r.warn(f"18. -ConfigPath '{config_path_arg}': Configuration.xml не найден — сверка с конфигурацией-источником пропущена")
+                src_root = None
+            else:
+                try:
+                    src_cfg_root = etree.parse(src_cfg_file).getroot()
+                except Exception:
+                    r.warn(f"18. -ConfigPath '{config_path_arg}': Configuration.xml не читается — сверка с конфигурацией-источником пропущена")
+                    src_root = None
+
+        check18_ok = True
+        check18_count = 0
+
+        if src_root:
+            src_def_lang_node = src_cfg_root.xpath("//*[local-name()='Configuration']/*[local-name()='Properties']/*[local-name()='DefaultLanguage']")
+            src_def_lang = (src_def_lang_node[0].text or '').strip() if src_def_lang_node else ''
+            ext_def_lang = (def_lang or '').strip()
+            if ext_def_lang and src_def_lang:
+                check18_count += 1
+                if ext_def_lang != src_def_lang:
+                    r.error(f'18. DefaultLanguage расширения "{def_lang}", а у конфигурации-источника "{src_def_lang}" — платформа загрузит расширение, но не применит («ОсновнойЯзык не совпадает»)')
+                    check18_ok = False
+
+        for child in child_obj_node:
+            if r.stopped:
+                break
+            if not isinstance(child.tag, str):
+                continue
+            type_name = etree.QName(child.tag).localname
+            if type_name not in CHILD_TYPE_DIR_MAP:
+                continue
+            obj_name18 = (child.text or '').strip()
+            if not obj_name18:
+                continue
+            dir_name = CHILD_TYPE_DIR_MAP[type_name]
+            ext_idx = md_id_index(os.path.join(config_dir, dir_name), type_name, obj_name18, True)
+            if not ext_idx:
+                continue
+
+            if not src_root:
+                for key, ext_id in ext_idx.items():
+                    check18_count += 1
+                    if ext_id == zero_guid:
+                        r.warn(f'18. {key}: ExtendedConfigurationObject нулевой — платформа загрузит расширение, но не применит. Создайте расширение и заимствуйте объекты с -ConfigPath')
+                continue
+
+            src_idx = md_id_index(os.path.join(src_root, dir_name), type_name, obj_name18, False)
+            if src_idx is None:
+                r.error(f'18. {type_name}.{obj_name18}: заимствованного объекта нет в конфигурации-источнике ({dir_name}/{obj_name18}.xml)')
+                check18_ok = False
+                continue
+            for key, ext_id in ext_idx.items():
+                check18_count += 1
+                src_id = src_idx.get(key)
+                if src_id is None:
+                    case_twin = next((sk for sk in src_idx if sk.upper() == key.upper()), None)
+                    if case_twin:
+                        r.error(f'18. {key}: в конфигурации-источнике имя в другом регистре ({case_twin}) — платформа загрузит расширение, но не применит («контролируемое свойство Имя не совпадает»)')
+                    else:
+                        r.error(f'18. {key}: заимствованного подобъекта нет в конфигурации-источнике')
+                    check18_ok = False
+                elif ext_id.lower() != src_id.lower():
+                    what = 'нулевой' if ext_id == zero_guid else ext_id
+                    r.error(f'18. {key}: ExtendedConfigurationObject {what}, а UUID в конфигурации-источнике {src_id} — платформа загрузит расширение, но не применит («ОбъектРасширяемойКонфигурации не совпадает»)')
+                    check18_ok = False
+                if r.stopped:
+                    break
+
+        if not config_path_arg:
+            r.out('[INFO]  18. Заимствованные объекты и основной язык против конфигурации-источника не сверялись: не задан -ConfigPath')
+        elif src_root and check18_ok and check18_count > 0:
+            r.ok(f'18. Source config: {check18_count} link(s) agree (DefaultLanguage, ExtendedConfigurationObject)')
+
     # --- Breadcrumb: controlled methods (&ИзменениеИКонтроль) drift is not checked here ---
+    ctrl_kw = bsl_keywords()
+    ctrl_re = re.compile(r'^\s*&(?:' + ctrl_kw["ru"]["Control"] + '|' + ctrl_kw["en"]["Control"] + r')\(', re.IGNORECASE)
     ctrl_count = 0
     for dp, _dn, files in os.walk(config_dir):
         for fn in files:
@@ -1274,7 +1583,7 @@ def main():
                 try:
                     with open(os.path.join(dp, fn), 'r', encoding='utf-8-sig') as f:
                         for ln in f:
-                            if re.match(r'^\s*&ИзменениеИКонтроль\(', ln):
+                            if ctrl_re.match(ln):
                                 ctrl_count += 1
                 except OSError:
                     pass

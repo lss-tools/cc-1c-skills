@@ -31,6 +31,10 @@ __pycache__/
 # на чистом клоне не сойдётся с результатом прогона.
 !tests/skills/cases/**/.v8-project.json
 
+# XSD-схемы платформы (/v8-xsd-fetch) — собственность 1С, не распространяем
+.v8-xsd/*
+!.v8-xsd/README.md
+
 # web-test: Node.js зависимости и runtime-артефакты
 .claude/skills/web-test/scripts/node_modules/
 .claude/skills/web-test/.browser-session.json
@@ -41,6 +45,8 @@ tests/web-test/_suite-root/prepare-ran.txt
 # Скриншоты и видео (артефакты тестирования web-test)
 *.png
 *.mp4
+# ...кроме кейсов навыков: там картинка — вход теста или эталон (картинки элементов формы)
+!tests/skills/cases/**/*.png
 
 # Навыки, скопированные для других AI-платформ (генерируются scripts/switch.py)
 .agents/skills/

@@ -12,6 +12,7 @@ import { tmpdir, cpus } from 'os';
 // есть не-ASCII символы — кириллическое имя пользователя в %TEMP%, кириллическое имя объекта 1С
 // в deletePath. Подробности и таблица сборок — в самом модуле.
 import { removePathSync, copyTreeSync } from '../common/fsutil.mjs';
+import { runGitStep } from '../common/git-step.mjs';
 
 // ─── Paths ──────────────────────────────────────────────────────────────────
 
@@ -274,6 +275,25 @@ function cleanupWorkspace(ws) {
 
 // ─── Arg building ───────────────────────────────────────────────────────────
 
+// Плейсхолдеры кейса: {workDir} — абсолютный путь рабочего каталога, {fakePlatform} — путь к
+// фейковой платформе, которую раскладывает writeFakePlatform (имя зависит от ОС, поэтому кейс
+// адресует её плейсхолдером и остаётся кроссплатформенным). Подстановка нужна не только в
+// аргументах: путь к фейку кладут и ВНУТРЬ подложенного .v8-project.json — иначе кейс про
+// выбор платформы пришлось бы писать двумя копиями под osOnly.
+function substPlaceholders(s, workDir) {
+  const fakePath = join(workDir, process.platform === 'win32' ? 'fake.cmd' : 'fake.sh');
+  return s.replaceAll('{workDir}', workDir).replaceAll('{fakePlatform}', fakePath).replaceAll('{repoRoot}', REPO_ROOT);
+}
+
+function substDeep(value, workDir) {
+  if (typeof value === 'string') return substPlaceholders(value, workDir);
+  if (Array.isArray(value)) return value.map(v => substDeep(v, workDir));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, substDeep(v, workDir)]));
+  }
+  return value;
+}
+
 // Байты входного файла в заданной кодировке. Нужно для кейсов про кодировку: writeFileSync
 // пишет только UTF-8, а навык обязан одинаково вести себя на UTF-16 с BOM (принять) и на
 // cp1251 (отвергнуть, а не молча подменить кириллицу на U+FFFD). cp1251 в Node нет — кодируем
@@ -355,13 +375,8 @@ function buildArgs(skillConfig, caseData, workDir, inputFilePath, runtime) {
   }
 
   // Append extra args from case (for optional params like -Vendor, -Version).
-  // Supports {workDir} substitution for tests that need absolute paths inside the workspace,
-  // and {fakePlatform} — путь к фейковой платформе, которую раскладывает writeFakePlatform.
   if (caseData.args_extra) {
-    const fakePath = join(workDir, process.platform === 'win32' ? 'fake.cmd' : 'fake.sh');
-    args.push(...caseData.args_extra.map(a => typeof a === 'string'
-      ? a.replace('{workDir}', workDir).replace('{fakePlatform}', fakePath)
-      : a));
+    args.push(...caseData.args_extra.map(a => typeof a === 'string' ? substPlaceholders(a, workDir) : a));
   }
 
   return { scriptPath, args };
@@ -486,7 +501,7 @@ function checkFileContains(workDir, spec, expectPresent) {
 // который молча ничего не проверяет (так уже было с 9 кейсами meta-edit) —
 // поэтому он ошибка, а не игнор.
 const KNOWN_EXPECT_KEYS = new Set([
-  'files', 'filesAbsent', 'stdoutContains', 'stdoutNotContains', 'stderrContains', 'preserves',
+  'files', 'filesAbsent', 'stdoutContains', 'stdoutNotContains', 'stderrContains', 'stderrNotContains', 'preserves',
   'fileContains', 'fileNotContains', 'filesEqual',
 ]);
 
@@ -624,6 +639,15 @@ function listFilesRecursive(dir, base = '') {
   return result.sort();
 }
 
+// Двоичный файл (встроенная картинка элемента формы и т.п.) пишется и сверяется байт в байт:
+// текстовый путь через UTF-8 портит его (невалидные последовательности → U+FFFD), и сверка
+// испорченного с испорченным проходит при любом содержимом. Признак — NUL-байт или байты,
+// не переживающие декодирование UTF-8 туда-обратно.
+function isBinaryBuffer(buf) {
+  if (buf.includes(0)) return true;
+  return !Buffer.from(buf.toString('utf8'), 'utf8').equals(buf);
+}
+
 // Строгий режим: отсутствие эталона НЕ проходит молча. Кейс либо сверяется со снэпшотом,
 // либо явно объявляет `"noSnapshot": "<причина>"`. Иначе потерянный (или не созданный при
 // добавлении кейса) эталон неотличим от намеренного отсутствия — тест зелёный, а не проверяет ничего.
@@ -654,8 +678,17 @@ function compareSnapshot(workDir, snapshotDir, snapshotConfig, caseData) {
       continue;
     }
 
-    const actualRaw = readFileSync(actualPath, 'utf8');
-    const snapshotRaw = readFileSync(snapshotPath, 'utf8');
+    const actualBuf = readFileSync(actualPath);
+    const snapshotBuf = readFileSync(snapshotPath);
+    if (isBinaryBuffer(actualBuf) || isBinaryBuffer(snapshotBuf)) {
+      if (!actualBuf.equals(snapshotBuf)) {
+        diffs.push({ file: relFile, type: 'content', line: '<двоичный>',
+          expected: `<двоичный файл, ${snapshotBuf.length} байт>`, actual: `<двоичный файл, ${actualBuf.length} байт>` });
+      }
+      continue;
+    }
+    const actualRaw = actualBuf.toString('utf8');
+    const snapshotRaw = snapshotBuf.toString('utf8');
 
     const actual = normalizeContent(actualRaw, snapshotConfig, relFile);
     const expected = normalizeContent(snapshotRaw, snapshotConfig, relFile);
@@ -727,7 +760,9 @@ function updateSnapshot(workDir, snapshotDir, snapshotConfig, caseData) {
     const dst = join(snapshotDir, relFile);
     mkdirSync(dirname(dst), { recursive: true });
 
-    const raw = readFileSync(src, 'utf8');
+    const buf = readFileSync(src);
+    if (isBinaryBuffer(buf)) { writeFileSync(dst, buf); continue; }
+    const raw = buf.toString('utf8');
     const normalized = normalizeContent(raw, snapshotConfig, relFile);
     writeFileSync(dst, normalized, 'utf8');
   }
@@ -800,6 +835,13 @@ async function runCaseAsync(testCase, opts) {
     return { id: testCase.id, skill: testCase.skillDir, name: testCase.name, passed: true, skipped: true, errors: [], elapsed: '0.0s' };
   }
 
+  // requires: кейс опирается на локальные данные, которые в репозиторий не входят (XSD-схемы 1С
+  // в .v8-xsd — их правообладатель 1С). Пути от корня репозитория; нет хотя бы одного — skipped.
+  // Не external: тот отдаёт каталог на месте только для чтения, а кейсу нужно разложить свои файлы.
+  if (caseData.requires && ![].concat(caseData.requires).every(p => existsSync(resolve(REPO_ROOT, p)))) {
+    return { id: testCase.id, skill: testCase.skillDir, name: testCase.name, passed: true, skipped: true, errors: [], elapsed: '0.0s' };
+  }
+
   try {
     const skillCasesDir = join(CASES, testCase.skillDir);
     const fixturePath = ensureSetup(setupName, opts.runtime, skillCasesDir);
@@ -837,9 +879,11 @@ async function runCaseAsync(testCase, opts) {
         // writeFile step — записать произвольный файл в workDir перед запуском скрипта
         if (step.writeFile) {
           const wfPath = join(workDir, step.writeFile.path);
+          // Плейсхолдеры подставляются и здесь. В объектной форме — ДО JSON.stringify: иначе
+          // обратные слэши windows-пути попали бы в готовый JSON неэкранированными.
           const wfContent = typeof step.writeFile.content === 'string'
-            ? step.writeFile.content
-            : JSON.stringify(step.writeFile.content, null, 2);
+            ? substPlaceholders(step.writeFile.content, workDir)
+            : JSON.stringify(substDeep(step.writeFile.content, workDir), null, 2);
           mkdirSync(dirname(wfPath), { recursive: true });
           writeFileSync(wfPath, wfContent, 'utf8');
           // Бит исполнения: на *nix навык запускает платформу через exec, и фейк без +x
@@ -851,6 +895,12 @@ async function runCaseAsync(testCase, opts) {
         // которое навыки сами не создают (например, пометка свойства без файла модуля).
         if (step.deletePath) {
           removePathSync(join(workDir, step.deletePath));
+          continue;
+        }
+        // git step — git-команда в workDir: так строится репозиторий для навыков, читающих
+        // изменения из git (общая реализация с verify-snapshots — tests/common/git-step.mjs).
+        if (step.git) {
+          runGitStep(workDir, step.git);
           continue;
         }
         const preScript = resolveScript(step.script, opts.runtime);
@@ -945,6 +995,14 @@ async function runCaseAsync(testCase, opts) {
           ? caseData.expect.stderrContains : [caseData.expect.stderrContains];
         for (const needle of needles) {
           if (!stderr.includes(needle)) errors.push(`stderr does not contain "${needle}"`);
+        }
+      }
+      // Отсутствие текста в stderr — для «лишних» предупреждений: навык отработал, но пожаловался зря.
+      if (caseData.expect?.stderrNotContains) {
+        const needles = Array.isArray(caseData.expect.stderrNotContains)
+          ? caseData.expect.stderrNotContains : [caseData.expect.stderrNotContains];
+        for (const needle of needles) {
+          if (stderr.includes(needle)) errors.push(`stderr unexpectedly contains "${needle}"`);
         }
       }
       // Отсутствие файла — тоже утверждение, и нужно оно чаще всего НЕГАТИВНОМУ кейсу:
@@ -1188,6 +1246,14 @@ function runCase(testCase, opts) {
           ? caseData.expect.stderrContains : [caseData.expect.stderrContains];
         for (const needle of needles) {
           if (!stderr.includes(needle)) errors.push(`stderr does not contain "${needle}"`);
+        }
+      }
+      // Отсутствие текста в stderr — для «лишних» предупреждений: навык отработал, но пожаловался зря.
+      if (caseData.expect?.stderrNotContains) {
+        const needles = Array.isArray(caseData.expect.stderrNotContains)
+          ? caseData.expect.stderrNotContains : [caseData.expect.stderrNotContains];
+        for (const needle of needles) {
+          if (stderr.includes(needle)) errors.push(`stderr unexpectedly contains "${needle}"`);
         }
       }
       // Отсутствие файла — тоже утверждение, и нужно оно чаще всего НЕГАТИВНОМУ кейсу:

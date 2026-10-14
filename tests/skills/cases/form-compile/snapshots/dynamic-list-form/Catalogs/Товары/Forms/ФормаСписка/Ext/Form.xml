@@ -6,15 +6,15 @@
 			<v8:content>Товары</v8:content>
 		</v8:item>
 	</Title>
-	<AutoTitle>false</AutoTitle>
 	<SaveWindowSettings>false</SaveWindowSettings>
-	<CollapseItemsByImportanceVariant>DontUse</CollapseItemsByImportanceVariant>
+	<AutoTitle>false</AutoTitle>
 	<GroupList>2:UUID-001</GroupList>
+	<CollapseItemsByImportanceVariant>DontUse</CollapseItemsByImportanceVariant>
 	<AutoCommandBar name="ФормаКоманднаяПанель" id="-1"/>
 	<ChildItems>
 		<Table name="Список" id="1">
-			<DataPath>Список</DataPath>
 			<CommandBarLocation>None</CommandBarLocation>
+			<DataPath>Список</DataPath>
 			<RowPictureDataPath>Список.DefaultPicture</RowPictureDataPath>
 			<RefreshRequest>PullFromTop</RefreshRequest>
 			<AutoRefresh>false</AutoRefresh>

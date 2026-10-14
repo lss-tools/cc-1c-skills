@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# epf-validate v1.6 — Validate 1C external data processor / report structure
+# epf-validate v1.9 — Validate 1C external data processor / report structure
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 # Works for both EPF (ExternalDataProcessor) and ERF (ExternalReport) — auto-detects
 
@@ -49,14 +49,14 @@ CLASS_IDS = {
     "ExternalReport": "e41aff26-25cf-4bb6-b6c1-3f478a75f374",
 }
 
-ALLOWED_CHILD_TYPES = {"Attribute", "TabularSection", "Form", "Template", "Command"}
+# Команд объекта у внешней обработки/отчёта нет: платформа выбрасывает их при сборке (#108).
+ALLOWED_CHILD_TYPES = {"Attribute", "TabularSection", "Form", "Template"}
 
 CHILD_TYPE_ORDER = {
     "Attribute": 0,
     "TabularSection": 1,
     "Form": 2,
     "Template": 3,
-    "Command": 4,
 }
 
 
@@ -73,6 +73,22 @@ def format_rank(ver):
     """"2.20" → 220, "2.9" → 209. Строковое сравнение неверно ("2.9" > "2.17")."""
     m = re.match(r'^(\d+)\.(\d+)$', ver or '')
     return int(m.group(1)) * 100 + int(m.group(2)) if m else 0
+
+
+# Штамп версии формата — атрибут version КОРНЕВОГО элемента файла. Копия общего эталона (семья
+# root_version, авторитет — meta-validate).
+def root_version(xml_path):
+    if not os.path.isfile(xml_path):
+        return None
+    with open(xml_path, "rb") as f:
+        head = f.read(4096).decode("utf-8", errors="ignore")
+    m = re.search(r'<[A-Za-z_][\w.:-]*(\s[^>]*)?/?>', head)
+    if not m:
+        return None
+    v = re.search(r'(?:^|\s)version="([^"]*)"', m.group(1) or "")
+    if v:
+        return v.group(1)
+    return None
 
 
 def localname(el):
@@ -381,6 +397,10 @@ def main():
                 continue
             child_tag = localname(child)
 
+            if child_tag == "Command":
+                report_error("4. ChildObjects: Command — у внешней обработки/отчёта команд объекта нет, платформа выбросит его при сборке")
+                check4_ok = False
+                continue
             if child_tag not in ALLOWED_CHILD_TYPES:
                 report_error(f"4. ChildObjects: disallowed element '{child_tag}'")
                 check4_ok = False
@@ -390,7 +410,7 @@ def main():
 
             this_order = CHILD_TYPE_ORDER.get(child_tag, -1)
             if this_order < last_order and order_ok:
-                report_warn(f"4. ChildObjects: '{child_tag}' appears after higher-order elements (expected: Attribute, TabularSection, Form, Template, Command)")
+                report_warn(f"4. ChildObjects: '{child_tag}' appears after higher-order elements (expected: Attribute, TabularSection, Form, Template)")
                 order_ok = False
             last_order = this_order
 
@@ -597,7 +617,6 @@ def main():
         name_kinds = [
             ("Attribute", f"{{{MD_NS}}}Attribute"),
             ("TabularSection", f"{{{MD_NS}}}TabularSection"),
-            ("Command", f"{{{MD_NS}}}Command"),
         ]
 
         for kind, xpath in name_kinds:
@@ -678,6 +697,12 @@ def main():
     if os.path.isfile(obj_module):
         files_checked += 1
 
+    # Модуля менеджера у внешней обработки/отчёта нет: платформа выбрасывает файл без сообщения.
+    mgr_module = os.path.join(obj_dir, "Ext", "ManagerModule.bsl")
+    if os.path.isfile(mgr_module):
+        report_error("9. Ext/ManagerModule.bsl — у внешней обработки/отчёта нет модуля менеджера, платформа выбросит его молча")
+        check9_ok = False
+
     if check9_ok:
         if files_checked > 0:
             report_ok(f"9. File existence: {files_checked} files verified")
@@ -739,6 +764,65 @@ def main():
             report_ok(f"10. Form descriptors: {forms_checked} checked")
         else:
             pass  # no form descriptors to check
+
+    # --- Check 11: версия формата согласована внутри объектов обработки; сверка с корнем ---
+    # Корень обработки и его штампованные тела (Ext/Help.xml), дескриптор формы/макета и его тело платформа
+    # загружает только в одной версии: «Версия формата загружаемого файла … отличается от версии формата
+    # ранее загруженных файлов» — сборка отменяется. Форма или макет целиком в другой версии, чем корень,
+    # собирается — это лишь неоднородность исходников (типично после мержа веток, выгруженных разными
+    # платформами), поэтому такое расхождение только предупреждение.
+    if version:
+        ver_obj_dir = os.path.join(src_dir, os.path.splitext(os.path.basename(resolved_path))[0])
+        ver_descriptors = [resolved_path]
+        for sub in ("Forms", "Templates"):
+            sub_dir = os.path.join(ver_obj_dir, sub)
+            if not os.path.isdir(sub_dir):
+                continue
+            names = sorted(n for n in os.listdir(sub_dir)
+                           if n.lower().endswith(".xml") and os.path.isfile(os.path.join(sub_dir, n)))
+            for n in names:
+                ver_descriptors.append(os.path.join(sub_dir, n))
+
+        def ver_rel(p):
+            return p[len(src_dir):].lstrip("\\/").replace("\\", "/")
+
+        ver_errors = 0
+        ver_bodies_ok = 0
+        ver_off = []
+        for desc in ver_descriptors:
+            if stopped:
+                break
+            desc_ver = version if desc == resolved_path else root_version(desc)
+            if not desc_ver:
+                continue
+            if desc != resolved_path and desc_ver != version:
+                ver_off.append(f"{ver_rel(desc)} {desc_ver}")
+            ext_dir = os.path.join(os.path.dirname(desc), os.path.splitext(os.path.basename(desc))[0], "Ext")
+            if not os.path.isdir(ext_dir):
+                continue
+            body_names = sorted(n for n in os.listdir(ext_dir)
+                                if n.lower().endswith(".xml") and os.path.isfile(os.path.join(ext_dir, n)))
+            for bn in body_names:
+                body = os.path.join(ext_dir, bn)
+                body_ver = root_version(body)
+                if not body_ver:
+                    continue
+                if body_ver == desc_ver:
+                    ver_bodies_ok += 1
+                    continue
+                ver_errors += 1
+                report_error(f"11. {ver_rel(body)} is stamped {body_ver}, its descriptor {ver_rel(desc)} {desc_ver} "
+                             "— the platform refuses to load parts of one object in different formats")
+                if stopped:
+                    break
+        if ver_off:
+            shown = ", ".join(ver_off[:5])
+            if len(ver_off) > 5:
+                shown += f", … (+{len(ver_off) - 5})"
+            report_warn(f"11. Format version differs from the processor root ({version}): {shown} — the platform builds it, "
+                        "but the sources are no longer uniform (typical after merging branches dumped by different platforms)")
+        elif ver_errors == 0 and ver_bodies_ok > 0:
+            report_ok(f"11. Format version: {ver_bodies_ok} stamped part(s) agree with their descriptors and the root")
 
     # --- Final output ---
     finalize()

@@ -103,7 +103,7 @@ ClassId — фиксированные идентификаторы классо
 | `SynchronousPlatformExtensionAndAddInCallUseMode` | enum | Синхр. вызовы (`DontUse` / `Use`) |
 | `InterfaceCompatibilityMode` | enum | Совместимость интерфейса (`Taxi` / `TaxiEnableVersion8_2`) |
 | `DatabaseTablespacesUseMode` | enum | Табличные пространства (`DontUse` / `Use`) |
-| `MainClientApplicationWindowMode` | enum | Режим окна (`Normal` / `Fullscreen` / `Kiosk`) |
+| `MainClientApplicationWindowMode` | enum | Режим окна (`Normal` / `Workplace` / `FullscreenWorkplace` / `Kiosk` / `EmbeddedWorkplace`) |
 
 #### Назначение и использование
 
@@ -607,7 +607,7 @@ ClassId — фиксированные идентификаторы классо
 
 | Свойство | Тип | Описание |
 |----------|-----|----------|
-| `TemplateType` | enum | Тип макета: `SpreadsheetDocument`, `BinaryData`, `HTMLDocument`, `TextDocument`, `ActiveDocument`, `DataCompositionSchema`, `DataCompositionAppearanceTemplate`, `GraphicalSchema`, `AddIn` |
+| `TemplateType` | enum | Тип макета: `SpreadsheetDocument`, `BinaryData`, `HTMLDocument`, `TextDocument`, `ActiveDocument`, `DataCompositionSchema`, `DataCompositionAppearanceTemplate`, `GraphicalSchema`, `GeographicalSchema`, `AddIn` |
 
 ### 6.3. CommonAttribute — общий реквизит
 
@@ -1032,6 +1032,18 @@ ChildObjects содержат `IntegrationServiceChannel` (каналы) — inl
 «Замерено» = создана пустая ИБ этой платформой и выгружена ею же; результат прочитан из `ConfigDumpInfo.xml` и корня `Configuration.xml`. Строки «нет» — интерполяция по шагу лестницы: платформ 8.3.21 и 8.3.22 в наличии не было. Замеренные крайние точки жёстко ограничивают этот пробел: 2.13 на 8.3.20 и 2.16 на 8.3.23 — ровно +3 версии на 3 релиза.
 
 **Проверенный диапазон навыков — `2.17`–`2.21`.** Ниже 2.17 навыки работать не запрещают, но и не обещают: `*-init` выпустят скаффолд с предупреждением, валидаторы отметят версию как непроверенную. Дельты форматов 2.13–2.16 не изучались.
+
+**Версия согласована внутри объекта, а не во всей выгрузке.** Штамп `version` стоит в корне каждого XML выгрузки, кроме тел макетов табличного документа и СКД, `WSDefinition.xml` и `ClientApplicationInterface.xml`. Платформа при загрузке сверяет штамп тела `X/Ext/*.xml` с его дескриптором `X.xml` и отвергает объект, чьи части в разных версиях: «Версия формата загружаемого файла … отличается от версии формата ранее загруженных файлов». У заимствованной формы расширения сверяется и вложенный `<BaseForm version=…>`. Форма и макет — отдельные объекты (`Forms/F.xml` + `Forms/F/Ext/Form.xml`), от владельца не зависят. Конфигурация — такой же объект: `Configuration.xml` + `Ext/*.xml` (`CommandInterface`, `MainSectionCommandInterface`, `HomePageWorkArea`, `Splash`, `MainSectionPicture`, `Logo`). Объекты разных версий между собой платформа грузит, если ни один не новее её самой («Неизвестная версия формата N загружаемого файла»); обратная выгрузка перештамповывает всё версией платформы. Измерено на 8.3.27.1859, Full и Partial, конфигурация, расширение и внешняя обработка:
+
+| Расхождение | Загрузка |
+|---|---|
+| Тело `X/Ext/*.xml` ≠ дескриптор `X.xml` (Form, Rights, Help, Predefined, ExchangePlanContent, JobSchedule, Style, ExtPicture, CommandInterface, тела макетов GraphicalSchema и HTML) — в любую сторону | отказ |
+| `Ext/*.xml` конфигурации ≠ `Configuration.xml` | отказ |
+| `<BaseForm version>` заимствованной формы ≠ дескриптор формы | отказ |
+| Объект со всеми своими частями в `2.18` в выгрузке `2.20` (типично после мержа веток, выгруженных разными платформами) | грузится |
+| `Configuration.xml` со своими `Ext/*.xml` в `2.18`, объекты в `2.20` | грузится |
+
+Отсюда уровни в валидаторах: расхождение части со своим дескриптором — ошибка (`meta-validate` 24 обходит объект с формами и макетами, `cf-validate` 10, `cfe-validate` 17, `epf-validate` 11, `form-validate` 14, `interface-validate` 14, `subsystem-validate` 14, `role-validate`); расхождение с якорем выгрузки (`Configuration.xml` или корень EPF/ERF) — предупреждение о неоднородной выгрузке. Генераторы тела берут версию из дескриптора объекта, если он есть (`template-add`, `help-add`).
 
 ```xml
 <MetaDataObject ... version="2.17">

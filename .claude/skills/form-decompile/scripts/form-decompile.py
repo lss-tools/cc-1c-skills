@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# form-decompile v0.150 — Decompile 1C managed Form.xml to JSON DSL (draft)
+# form-decompile v0.153 — Decompile 1C managed Form.xml to JSON DSL (draft)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 # ВНИМАНИЕ: раундтрип не гарантируется. Навык исключён из авто-использования моделью.
 #
@@ -460,15 +460,11 @@ def title_from_name(name):
     s = re.sub(r'([А-ЯA-Z])([А-ЯA-Z][а-яa-z])', r'\1 \2', name)
     s = re.sub(r'([а-яa-z0-9])([А-ЯA-Z])', r'\1 \2', s)
     parts = s.split(' ')
-    if len(parts) == 0:
+    if not parts:
         return s
     out = [parts[0]]
-    for i in range(1, len(parts)):
-        p = parts[i]
-        if len(p) > 1 and p == p.upper():
-            out.append(p)
-        else:
-            out.append(p.lower())
+    for p in parts[1:]:
+        out.append(p if (len(p) > 1 and p.isupper()) else p.lower())
     return ' '.join(out)
 
 
@@ -481,7 +477,7 @@ def test_has_real_markup(text):
         return False
     vals = list(text.values()) if isinstance(text, dict) else [str(text)]
     for v in vals:
-        if re.search(FMT_MARKUP_RE, str(v)):
+        if re.search(FMT_MARKUP_RE, str(v), re.I):  # как -match в PS: без учёта регистра
             return True
     return False
 
@@ -616,12 +612,6 @@ def _ps_truthy(v):
             return _ps_truthy(v[0])
         return True
     return True
-
-
-# Зеркало PowerShell -eq/-ne для строк: регистронезависимое сравнение (PS по умолчанию ignore-case).
-# Нужно там, где сравниваются произвольно-регистровые строки (заголовок vs авто-вывод из имени).
-def _ps_ieq(a, b):
-    return a.lower() == b.lower()
 
 
 # Зеркало PowerShell "$v" (строковая интерполяция): bool→True/False, float без хвостового .0,
@@ -1687,10 +1677,16 @@ def build_dl_parameter(p_node):
     # title — опускаем, если совпадает с авто-выводом из имени (ru-only)
     title_node = p_node.find('dcssch:title', NS)
     if title_node is not None:
-        t = get_lang_text(title_node)
+        # get_lang_text_ws, а не get_lang_text: заголовком-пробелом гасят подпись, а обычное
+        # чтение схлопывает whitespace-only в '' — и компилятор подставил бы авто-вывод.
+        t = get_lang_text_ws(title_node)
         if t is not None:
+            # Сравнение байт в байт (в ps1 — [string]::Equals(..., Ordinal)): эталон — компилятор,
+            # он пишет заголовок как есть. Регистронезависимое сравнение теряло заголовок,
+            # отличающийся от авто-вывода только регистром («Организации ВетИС» при авто
+            # «Организации ВЕТИС»).
             auto = title_from_name(name)
-            if not (isinstance(t, str) and _ps_ieq(t, auto)):
+            if not (isinstance(t, str) and t == auto):
                 o['title'] = t
     vt_node = p_node.find('dcssch:valueType', NS)
     type_val = None
@@ -3333,7 +3329,10 @@ def main():
             if t_node is not None:
                 t = get_lang_text_ws(t_node)
                 if t is not None:
-                    if is_main or not isinstance(t, str) or not _ps_ieq(t, title_from_name(ao['name'])):
+                    # Заголовок опускаем только при ТОЧНОМ, побайтовом совпадении с авто-выводом
+                    # (в ps1 — [string]::Equals(..., Ordinal)): компилятор восстановит его как есть,
+                    # значим и регистр, и мягкий перенос, и форма нормализации.
+                    if is_main or not isinstance(t, str) or t != title_from_name(ao['name']):
                         ao['title'] = t
             elif not is_main:
                 ao['title'] = ''

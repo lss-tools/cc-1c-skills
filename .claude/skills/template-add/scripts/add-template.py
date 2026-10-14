@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# template-add v1.23 — Add template to 1C object (+write_xml_file/write_utf8_bom: общий эталон записи)
+# template-add v1.27 — Add template to 1C object (+write_xml_file/write_utf8_bom: общий эталон записи)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 import argparse
@@ -212,7 +212,7 @@ def assert_edit_allowed(target_path, require):
         return
 
 TYPE_MAP = {
-    "HTML": {"TemplateType": "HTMLDocument", "Ext": ".html"},
+    "HTML": {"TemplateType": "HTMLDocument", "Ext": ".xml"},
     "Text": {"TemplateType": "TextDocument", "Ext": ".txt"},
     "SpreadsheetDocument": {"TemplateType": "SpreadsheetDocument", "Ext": ".xml"},
     "BinaryData": {"TemplateType": "BinaryData", "Ext": ".bin"},
@@ -276,13 +276,33 @@ def write_utf8_bom(path, content):
 
 
 
+def is_valid_lang(code):
+    """Код языка идёт и в текст XML, и в имя файла страницы.
+
+    Пустое значение дало бы файл «.html» и пустой <Page></Page>, разделитель пути — запись
+    мимо каталога страниц, а зарезервированное имя устройства (nul, con, prn, aux, com1…, lpt1…)
+    на Windows уводит запись в само устройство: при -Lang nul этот порт молча писал
+    <Page>nul</Page> и пустой каталог с кодом 0. Все отказы платформы были бы тихими.
+
+    fullmatch, а не match: последний с `$` допускает перевод строки в конце.
+
+    Копия этой функции есть в help-add (навыки автономны, формат «дескриптор + страница»
+    у них общий). Держать копии одинаковыми — сознательно; за дрейфом следит check-inline-drift.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", code):
+        return False
+    if re.fullmatch(r"(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])", code):
+        return False
+    return True
+
+
 def write_xml_file(path, content):
     """XML в каноне выгрузки Конфигуратора: CRLF в разделителях, без перевода в конце.
 
     Копия этой функции есть в каждом навыке-эмиттере (навыки автономны). Держать
     копии одинаковыми — сознательно: разошедшиеся копии сводят на нет весь смысл.
 
-    HTML-макет сюда НЕ идёт — платформа хранит его с LF.
+    HTML-страница макета сюда НЕ идёт — платформа хранит её с LF.
     """
     text = content.replace('\r\n', '\n').replace('\n', '\r\n').rstrip('\r\n')
     write_utf8_bom(path, text)
@@ -329,6 +349,7 @@ def main():
     parser.add_argument("-TemplateType", required=True,
                         choices=["HTML", "Text", "SpreadsheetDocument", "BinaryData", "DataCompositionSchema"])
     parser.add_argument("-Synonym", default=None)
+    parser.add_argument("-Lang", default="ru")
     parser.add_argument("-SrcDir", default="src")
     parser.add_argument("-SetMainSKD", action="store_true")
     args = ci_parse_args(parser)
@@ -337,6 +358,7 @@ def main():
     template_name = args.TemplateName
     template_type = args.TemplateType
     synonym = args.Synonym if args.Synonym is not None else template_name
+    lang = args.Lang
     src_dir = args.SrcDir
     set_main_skd = args.SetMainSKD
 
@@ -377,9 +399,30 @@ def main():
     templates_dir = os.path.join(processor_dir, "Templates")
     template_meta_path = os.path.join(templates_dir, f"{template_name}.xml")
 
-    if os.path.exists(template_meta_path):
-        print(f"Макет уже существует: {template_meta_path}", file=sys.stderr)
+    if not is_valid_lang(lang):
+        print(f"Недопустимый код языка: '{lang}'", file=sys.stderr)
+        print("Ожидается код вида ru, en (буквы, цифры, дефис, подчёркивание; имена устройств Windows недопустимы)", file=sys.stderr)
         sys.exit(1)
+
+    # Существующий HTML-макет — не всегда повод отказать: в один макет платформа кладёт
+    # несколько языков (<Page> на каждый, страницы рядом), и повторный вызов с другим -Lang
+    # добавляет страницу. Для остальных типов поведение прежнее — отказ.
+    add_lang_mode = False
+    if os.path.exists(template_meta_path):
+        with open(template_meta_path, "r", encoding="utf-8-sig") as f:
+            meta_text = f.read()
+        m_type = re.search(r"<TemplateType>([^<]+)</TemplateType>", meta_text)
+        existing_type = m_type.group(1) if m_type else None
+
+        if template_type == "HTML" and existing_type == "HTMLDocument":
+            add_lang_mode = True
+        elif template_type == "HTML":
+            print(f"Макет уже существует: {template_meta_path}", file=sys.stderr)
+            print(f"Его тип — {existing_type}, страницу на языке можно добавить только к HTML-макету", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print(f"Макет уже существует: {template_meta_path}", file=sys.stderr)
+            sys.exit(1)
 
     assert_edit_allowed(root_xml_path, "editable")
 
@@ -429,6 +472,108 @@ def main():
     template_ext_dir = os.path.join(templates_dir, template_name, "Ext")
     os.makedirs(template_ext_dir, exist_ok=True)
 
+    # Скелет HTML-страницы макета — в том же виде, в каком его пишет редактор платформы
+    # (одной строкой, парный </meta>): первое сохранение в Конфигураторе даст минимальный
+    # дифф. Нужен в двух местах (новый макет и добавление языка) — поэтому одной переменной.
+    html_skeleton = (
+        '<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">'
+        '<html><head>'
+        '<meta http-equiv="Content-Type" content="text/html; charset=utf-8"></meta>'
+        '</head><body>\n'
+        '</body></html>'
+    )
+
+    # --- 1a. Добавление страницы на другом языке в существующий HTML-макет ---
+    # Метаданные макета и ChildObjects здесь НЕ трогаем: и то и другое уже на месте,
+    # перезапись сменила бы UUID. Язык, не объявленный в Languages/ конфигурации, платформа
+    # принимает и возвращает при выгрузке (проверено на 8.3.27) — состав языков не проверяем.
+    if add_lang_mode:
+        desc_path = os.path.join(template_ext_dir, "Template.xml")
+        page_dir = os.path.join(template_ext_dir, "Template")
+        legacy_page_path = os.path.join(template_ext_dir, "Template.html")
+        langs = []
+        desc_version = format_version
+
+        # Сначала РАЗБОР состояния, и только в самом конце запись: иначе отказ на полпути
+        # оставляет макет разобранным (страница есть, дескриптора нет) — а такую раскладку
+        # платформа снова молча игнорирует.
+        legacy_pending = False
+        page_path = os.path.join(page_dir, f"{lang}.html")
+
+        if os.path.exists(desc_path):
+            with open(desc_path, "r", encoding="utf-8-sig") as f:
+                desc_text = f.read()
+            # Версию берём из самого дескриптора: правка чужой выгрузки не должна менять формат.
+            m_dv = re.search(r'<Help[^>]+version="(\d+\.\d+)"', desc_text)
+            if m_dv:
+                desc_version = m_dv.group(1)
+            langs = re.findall(r"<Page>([^<]+)</Page>", desc_text)
+            # Полумигрированное дерево: дескриптор уже есть, а старый Ext/Template.html остался рядом.
+            # Платформа его игнорирует, поэтому текст в нём пропадёт незаметно — говорим вслух.
+            if os.path.exists(legacy_page_path):
+                print("[WARN] Рядом лежит старый Ext/Template.html — платформа его игнорирует.")
+                print("       Перенесите нужное в Template/<язык>.html и удалите его.")
+        elif os.path.exists(legacy_page_path):
+            # Раскладка до v1.24 — одиночный Ext/Template.html, который платформа молча игнорирует.
+            # Языка у него нет, но создать его могла только версия навыка без параметра -Lang,
+            # то есть это страница на языке по умолчанию.
+            if os.path.exists(os.path.join(page_dir, "ru.html")):
+                print("Макет разобран: есть и старый Ext/Template.html, и Template/ru.html — что из них актуально, решать не навыку.", file=sys.stderr)
+                print("Оставьте один файл и повторите.", file=sys.stderr)
+                sys.exit(1)
+            legacy_pending = True
+            langs = ["ru"]
+
+        # Файл страницы НИКОГДА не перезаписываем: в нём может лежать текст макета.
+        # Ошибка — только когда добавлять нечего: язык уже в дескрипторе И страница на диске.
+        # Сравнение без учёта регистра — зеркало -contains в PS, который регистр не различает.
+        lang_known = lang.lower() in [x.lower() for x in langs]
+        # Существование страницы — тоже без учёта регистра: os.path.exists на Linux различает
+        # регистр, а PS -contains и Test-Path на Windows — нет, и порты разошлись бы на -Lang RU.
+        page_exists = False
+        if os.path.isdir(page_dir):
+            want = f"{lang}.html".lower()
+            page_exists = any(f.lower() == want for f in os.listdir(page_dir))
+        # При миграции проверять нечего: langs там задан нами же, а страница появится переносом.
+        if lang_known and page_exists and not legacy_pending:
+            print(f"Страница макета на языке '{lang}' уже существует: {page_path}", file=sys.stderr)
+            sys.exit(1)
+
+        # Порядок страниц — по коду языка (в выгрузке ERP так во всех 54 двуязычных макетах).
+        if not lang_known:
+            langs = langs + [lang]
+        langs = sorted(langs)
+
+        pages_xml = '\n'.join(f"\t<Page>{x}</Page>" for x in langs)
+        desc_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<Help xmlns="http://v8.1c.ru/8.3/xcf/extrnprops"'
+            ' xmlns:xs="http://www.w3.org/2001/XMLSchema"'
+            ' xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
+            f' version="{desc_version}">\n'
+            f'{pages_xml}\n'
+            '</Help>'
+        )
+
+        # --- запись ---
+        os.makedirs(page_dir, exist_ok=True)
+        if legacy_pending:
+            os.replace(legacy_page_path, os.path.join(page_dir, "ru.html"))
+            print("[WARN] Макет был в старой раскладке (Ext/Template.html) — платформа её игнорирует.")
+            print("       Страница считана как ru и перенесена в Template/ru.html.")
+        write_xml_file(desc_path, desc_xml)
+        if os.path.exists(page_path):
+            # При миграции про сохранённое содержимое уже сказано выше — не повторяемся.
+            if not legacy_pending:
+                print(f"[WARN] Страница {lang}.html уже лежала на диске — содержимое сохранено, дописан только <Page>.")
+        else:
+            write_utf8_bom(page_path, html_skeleton)
+
+        print(f"[OK] Добавлена страница макета: {template_name} ({lang})")
+        print(f"     Содержимое: {page_path}")
+        print(f"     Дескриптор: {desc_path}")
+        sys.exit(0)
+
     # --- 1. Template metadata (Templates/<TemplateName>.xml) ---
 
     template_uuid = str(uuid.uuid4())
@@ -457,20 +602,34 @@ def main():
     # --- 2. Template content (Templates/<TemplateName>/Ext/Template.<ext>) ---
 
     template_file_path = os.path.join(template_ext_dir, f"Template{tmpl['Ext']}")
+    # Куда класть текст макета. Совпадает с template_file_path у всех типов, кроме HTML:
+    # там содержимое живёт в отдельной странице, а Template.xml — только дескриптор.
+    template_body_path = template_file_path
 
     if template_type == "HTML":
-        content = (
-            '<!DOCTYPE html>\n'
-            '<html>\n'
-            '<head>\n'
-            '\t<meta charset="UTF-8">\n'
-            '\t<title></title>\n'
-            '</head>\n'
-            '<body>\n'
-            '</body>\n'
-            '</html>'
+        # HTML-макет платформа хранит парой, как справку: дескриптор Ext/Template.xml
+        # со списком страниц и сама страница Ext/Template/<язык>.html (картинки —
+        # рядом в _files/). Одиночный Ext/Template.html платформа молча игнорирует:
+        # загрузка проходит без ошибок, а макет в базе пустой.
+        page_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<Help xmlns="http://v8.1c.ru/8.3/xcf/extrnprops"'
+            ' xmlns:xs="http://www.w3.org/2001/XMLSchema"'
+            ' xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
+            f' version="{format_version}">\n'
+            f'\t<Page>{lang}</Page>\n'
+            '</Help>'
         )
-        write_utf8_bom(template_file_path, content)
+        write_xml_file(template_file_path, page_xml)
+
+        page_dir = os.path.join(template_ext_dir, "Template")
+        os.makedirs(page_dir, exist_ok=True)
+        template_body_path = os.path.join(page_dir, f"{lang}.html")
+
+        # Шапка — в том же виде, в каком её пишет редактор платформы (одной строкой,
+        # парный </meta>): первое сохранение в Конфигураторе даст минимальный дифф.
+        # Страница — с LF: платформа хранит HTML именно так.
+        write_utf8_bom(template_body_path, html_skeleton)
 
     elif template_type == "Text":
         write_utf8_bom(template_file_path, "")
@@ -584,7 +743,9 @@ def main():
     if already_registered:
         print(f"     Already registered: <Template>{template_name}</Template> in ChildObjects (skipped duplicate)")
     print(f"     Метаданные: {template_meta_path}")
-    print(f"     Содержимое: {template_file_path}")
+    print(f"     Содержимое: {template_body_path}")
+    if template_type == "HTML":
+        print(f"     Дескриптор: {template_file_path}")
     if main_dcs_updated:
         print(f"     MainDataCompositionSchema: {main_dcs.text}")
 

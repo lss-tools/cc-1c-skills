@@ -1,4 +1,4 @@
-﻿# stub-db-create v1.11 — Create temp 1C infobase with metadata stubs for EPF/ERF build
+﻿# stub-db-create v1.14 — Create temp 1C infobase with metadata stubs for EPF/ERF build
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 param(
 	[Parameter(Mandatory)]
@@ -13,10 +13,19 @@ param(
 	# смогла проверить его штатными проверками. Без параметра стаб работает как раньше.
 	[string]$EmbedSourceFile,
 
+	# Выгрузка целевой конфигурации: общие модули, к которым обращается код, получают в заглушке
+	# пустых двойников с настоящими флагами контекста.
+	[string]$ConfigSrc,
+
 	[string[]]$AdditionalV8Arguments = @(),
 
 	[string[]]$AdditionalIbcmdArguments = @()
 )
+
+# Необработанная ошибка (напр. привязка параметра) внутри try/finally без catch завершала
+# скрипт с кодом 0 — ложный успех без запуска платформы. Любая такая ошибка — код 1.
+# py-порт: необработанное исключение и так даёт код 1.
+trap { Write-Host "Error: $($_.Exception.Message) ($($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber))" -ForegroundColor Red; exit 1 }
 
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -43,6 +52,7 @@ function ConvertTo-CleanPath {
 $SourceDir = ConvertTo-CleanPath $SourceDir '-SourceDir'
 $V8Path = ConvertTo-CleanPath $V8Path '-V8Path'
 $TempBasePath = ConvertTo-CleanPath $TempBasePath '-TempBasePath'
+$ConfigSrc = ConvertTo-CleanPath $ConfigSrc '-ConfigSrc'
 
 # --- Additional platform arguments ---
 $script:V8OwnedKeys = @(
@@ -353,14 +363,71 @@ foreach ($f in $xmlFiles) {
 	}
 }
 
+# --- 1c. Общие модули целевой конфигурации, к которым обращается код ---
+# Проверка модулей (замер 8.3.24, 8.3.27) требует от общего модуля только двух вещей: чтобы он
+# существовал и был доступен в контексте вызова. Методы, их экспорт и число параметров она не
+# сверяет. Поэтому двойнику хватает имени и флагов контекста из настоящей выгрузки, тело пустое,
+# и зависимости модуля за ним не тянутся. Двойник получает только имя, которое есть в выгрузке:
+# неизвестное имя остаётся ошибкой проверки, а не угадывается.
+
+# Код без строковых литералов и комментариев: слова в них — не обращения к модулям.
+function Remove-BslNoise {
+	param([string]$Code)
+	$out = New-Object System.Text.StringBuilder
+	foreach ($line in ($Code -split "`r?`n")) {
+		# Продолжение многострочной строки («|ВЫБРАТЬ …»): литерал до закрывающей кавычки, после
+		# неё может идти код («|ГДЕ …"; Х = Модуль.Метод();»).
+		$l = [regex]::Replace($line, '^\s*\|(?:[^"]|"")*("|$)', '""')
+		# Литерал до закрывающей кавычки или, если строка продолжится ниже, до конца строки.
+		$l = [regex]::Replace($l, '"(?:[^"]|"")*("|$)', '""')
+		$ci = $l.IndexOf('//')
+		if ($ci -ge 0) { $l = $l.Substring(0, $ci) }
+		[void]$out.AppendLine($l)
+	}
+	return $out.ToString()
+}
+
+$commonModuleFlags = @('Global', 'ClientManagedApplication', 'Server', 'ExternalConnection', 'ClientOrdinaryApplication', 'ServerCall', 'Privileged')
+$commonModules = [ordered]@{}   # имя из выгрузки -> @{ флаг = 'true'|'false' }
+if ($ConfigSrc) {
+	$cmDir = Join-Path $ConfigSrc "CommonModules"
+	if (-not (Test-Path -LiteralPath $cmDir -PathType Container)) {
+		Write-Host "WARNING: в -ConfigSrc нет каталога CommonModules: $ConfigSrc" -ForegroundColor Yellow
+	} else {
+		# Идентификаторы 1С регистронезависимы — и имена модулей в коде тоже.
+		$known = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+		foreach ($f in (Get-ChildItem -LiteralPath $cmDir -Filter "*.xml" -File)) { $known[$f.BaseName] = $f.FullName }
+		$used = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+		foreach ($f in (Get-ChildItem -LiteralPath $SourceDir -Filter "*.bsl" -Recurse -File)) {
+			$code = Remove-BslNoise ([System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8))
+			foreach ($m in [regex]::Matches($code, '(?<![\w.])([^\W\d]\w*)\s*\.')) { [void]$used.Add($m.Groups[1].Value) }
+		}
+		$names = @($used | Where-Object { $known.ContainsKey($_) } | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($known[$_]) })
+		[Array]::Sort($names, [StringComparer]::Ordinal)
+		foreach ($n in $names) {
+			$t = [System.IO.File]::ReadAllText($known[$n], [System.Text.Encoding]::UTF8)
+			$flags = @{}
+			foreach ($fl in $commonModuleFlags) {
+				$flags[$fl] = if ($t -match "<$fl>(true|false)</$fl>") { $Matches[1].ToLower() } else { 'false' }
+			}
+			$commonModules[$n] = $flags
+		}
+		if ($commonModules.Count -gt 0) {
+			Write-Host "Общие модули из configSrc: $(@($commonModules.Keys) -join ', ')"
+		} else {
+			Write-Host "Общие модули из configSrc: не понадобились"
+		}
+	}
+}
+
 $hasRefTypes = $typeMap.Count -gt 0
 # Конфигурация нужна и тогда, когда ссылочных типов нет: в неё кладётся сам объект.
 $embedRequested = -not [string]::IsNullOrWhiteSpace($EmbedSourceFile)
-$needCfg = $hasRefTypes -or $embedRequested
+$needCfg = $hasRefTypes -or $embedRequested -or $commonModules.Count -gt 0
 
 # --- 2. Determine TempBasePath ---
 if (-not $TempBasePath) {
-	$TempBasePath = Join-Path $env:TEMP "epf_stub_db_$(Get-Random)"
+	$TempBasePath = Join-Path ([IO.Path]::GetTempPath()) "epf_stub_db_$(Get-Random)"
 }
 
 # --- 3. If registers need a registrator, add stub document ---
@@ -673,6 +740,7 @@ if ($needCfg) {
 
 	# ChildObjects entries
 	$childXml = "`r`n`t`t`t<Language>Русский</Language>"
+	foreach ($cmName in $commonModules.Keys) { $childXml += "`r`n`t`t`t<CommonModule>$cmName</CommonModule>" }
 	foreach ($metaType in $typeMap.Keys) {
 		if (-not $metaInfo.ContainsKey($metaType)) { continue }
 		$tag = $metaInfo[$metaType].tag
@@ -778,6 +846,34 @@ if ($needCfg) {
 </MetaDataObject>
 "@
 	[System.IO.File]::WriteAllText((Join-Path $langDir "Русский.xml"), $langXml, $enc)
+
+	# --- 4b'. Common modules: пустые двойники с флагами контекста из выгрузки ---
+	if ($commonModules.Count -gt 0) {
+		$cmOutDir = Join-Path $cfgDir "CommonModules"
+		New-Item -ItemType Directory -Path $cmOutDir -Force | Out-Null
+		foreach ($cmName in $commonModules.Keys) {
+			$flags = $commonModules[$cmName]
+			$flagXml = ""
+			foreach ($fl in $commonModuleFlags) { $flagXml += "`r`n`t`t`t<$fl>$($flags[$fl])</$fl>" }
+			$cmXml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject $ns>
+	<CommonModule uuid="$([guid]::NewGuid().ToString())">
+		<Properties>
+			<Name>$cmName</Name>
+			<Synonym/>
+			<Comment/>$flagXml
+			<ReturnValuesReuse>DontUse</ReturnValuesReuse>
+		</Properties>
+	</CommonModule>
+</MetaDataObject>
+"@
+			[System.IO.File]::WriteAllText((Join-Path $cmOutDir "$cmName.xml"), $cmXml, $enc)
+			$cmExt = Join-Path $cmOutDir (Join-Path $cmName "Ext")
+			New-Item -ItemType Directory -Path $cmExt -Force | Out-Null
+			[System.IO.File]::WriteAllText((Join-Path $cmExt "Module.bsl"), "", $enc)
+		}
+	}
 
 	# --- 4c. Metadata object stubs ---
 	foreach ($metaType in $typeMap.Keys) {
@@ -1660,7 +1756,7 @@ function Format-ArgToken {
 $extraArgString = -join ($extraArgs | ForEach-Object { Format-ArgToken $_ })
 if ($stubEngine -eq "ibcmd") {
 	Write-Host "Creating infobase (ibcmd): $TempBasePath"
-	$ibData = Join-Path $env:TEMP "stub_data_$(Get-Random)"
+	$ibData = Join-Path ([IO.Path]::GetTempPath()) "stub_data_$(Get-Random)"
 	New-Item -ItemType Directory -Path $ibData -Force | Out-Null
 	$ibArgs = @("infobase", "create", "--db-path=$TempBasePath", "--create-database")
 	if ($needCfg) { $ibArgs += "--import=$(Join-Path $TempBasePath 'cfg')", "--apply", "--force" }
@@ -1696,7 +1792,7 @@ if ($needCfg) {
 	$cfgDir = Join-Path $TempBasePath "cfg"
 	# LoadConfigFromFiles
 	Write-Host "Loading configuration from files..."
-	$loadLog = Join-Path $env:TEMP "stub_load_log.txt"
+	$loadLog = Join-Path $TempBasePath "load_log.txt"
 	$loadArgs = "DESIGNER /F`"$TempBasePath`" /LoadConfigFromFiles `"$cfgDir`" /Out `"$loadLog`" /DisableStartupDialogs" + $extraArgString
 	$proc = Invoke-PlatformProcess $V8Path @($loadArgs) -PreQuoted
 	if ($proc.ExitCode -ne 0) {
@@ -1708,7 +1804,7 @@ if ($needCfg) {
 
 	# UpdateDBCfg
 	Write-Host "Updating database configuration..."
-	$updateLog = Join-Path $env:TEMP "stub_update_log.txt"
+	$updateLog = Join-Path $TempBasePath "update_log.txt"
 	$updateArgs = "DESIGNER /F`"$TempBasePath`" /UpdateDBCfg /Out `"$updateLog`" /DisableStartupDialogs" + $extraArgString
 	$proc = Invoke-PlatformProcess $V8Path @($updateArgs) -PreQuoted
 	if ($proc.ExitCode -ne 0) {

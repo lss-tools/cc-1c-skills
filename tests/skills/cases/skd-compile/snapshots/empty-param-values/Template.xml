@@ -165,11 +165,11 @@
 		<name>СоставнойТип</name>
 		<valueType>
 			<v8:Type>xs:string</v8:Type>
+			<v8:Type xmlns:d5p1="http://v8.1c.ru/8.1/data/enterprise/current-config">d5p1:CatalogRef.ПлоскийПростой</v8:Type>
 			<v8:StringQualifiers>
 				<v8:Length>10</v8:Length>
 				<v8:AllowedLength>Fixed</v8:AllowedLength>
 			</v8:StringQualifiers>
-			<v8:Type xmlns:d5p1="http://v8.1c.ru/8.1/data/enterprise/current-config">d5p1:CatalogRef.ПлоскийПростой</v8:Type>
 		</valueType>
 		<value xsi:nil="true"/>
 		<useRestriction>false</useRestriction>
@@ -184,7 +184,9 @@
 		</dcsset:presentation>
 		<dcsset:settings xmlns:style="http://v8.1c.ru/8.1/data/ui/style" xmlns:sys="http://v8.1c.ru/8.1/data/ui/fonts/system" xmlns:web="http://v8.1c.ru/8.1/data/ui/colors/web" xmlns:win="http://v8.1c.ru/8.1/data/ui/colors/windows">
 			<dcsset:selection>
-				<dcsset:item xsi:type="dcsset:SelectedItemAuto"/>
+				<dcsset:item xsi:type="dcsset:SelectedItemField">
+					<dcsset:field>Поле1</dcsset:field>
+				</dcsset:item>
 			</dcsset:selection>
 			<dcsset:item xsi:type="dcsset:StructureItemGroup">
 				<dcsset:order>

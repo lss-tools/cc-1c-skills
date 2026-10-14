@@ -65,6 +65,20 @@
 			</v8:item>
 		</dcsset:presentation>
 		<dcsset:settings xmlns:style="http://v8.1c.ru/8.1/data/ui/style" xmlns:sys="http://v8.1c.ru/8.1/data/ui/fonts/system" xmlns:web="http://v8.1c.ru/8.1/data/ui/colors/web" xmlns:win="http://v8.1c.ru/8.1/data/ui/colors/windows">
+			<dcsset:selection>
+				<dcsset:item xsi:type="dcsset:SelectedItemField">
+					<dcsset:field>Счет</dcsset:field>
+				</dcsset:item>
+				<dcsset:item xsi:type="dcsset:SelectedItemField">
+					<dcsset:field>Поступление1</dcsset:field>
+				</dcsset:item>
+				<dcsset:item xsi:type="dcsset:SelectedItemField">
+					<dcsset:field>Поступление2</dcsset:field>
+				</dcsset:item>
+				<dcsset:item xsi:type="dcsset:SelectedItemField">
+					<dcsset:field>Выбытие1</dcsset:field>
+				</dcsset:item>
+			</dcsset:selection>
 			<dcsset:item xsi:type="dcsset:StructureItemGroup">
 				<dcsset:name>ДанныеОтчета</dcsset:name>
 				<dcsset:groupItems>
@@ -104,9 +118,6 @@
 					</dcsset:item>
 				</dcsset:selection>
 			</dcsset:item>
-			<dcsset:selection>
-				<dcsset:item xsi:type="dcsset:SelectedItemAuto"/>
-			</dcsset:selection>
 		</dcsset:settings>
 	</settingsVariant>
 </DataCompositionSchema>

@@ -1,0 +1,34 @@
+{
+  "name": "Шаблон вне выгрузки — версия формата неизвестна, пометка в итоговой строке",
+  "setup": "fixture:xsd-no-anchor",
+  "preRun": [
+    {
+      "writeFile": {
+        "path": ".v8-project.json",
+        "content": {
+          "xsdPath": "xsd"
+        }
+      }
+    },
+    {
+      "writeFile": {
+        "path": "xsd/2.20/README.txt",
+        "content": "каталог версии"
+      }
+    }
+  ],
+  "params": {
+    "templatePath": "Template.xml"
+  },
+  "args_extra": [
+    "-Detailed"
+  ],
+  "expect": {
+    "stdoutContains": "checks; XSD not checked: template outside a dump) ===",
+    "stdoutNotContains": [
+      "[ERROR]",
+      "[WARN]"
+    ]
+  },
+  "noSnapshot": "результат — только вывод"
+}

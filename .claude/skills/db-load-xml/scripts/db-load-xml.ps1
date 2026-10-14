@@ -1,4 +1,4 @@
-﻿# db-load-xml v1.28 — Load 1C configuration from XML files
+﻿# db-load-xml v1.33 — Load 1C configuration from XML files
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 # NB: *nix-раскладку платформы (/opt/1cv8/<ver>/1cv8, без .exe) знает только .py-порт — PS на *nix не исполняется.
 <#
@@ -132,12 +132,18 @@ param(
     [string[]]$AdditionalIbcmdArguments = @()
 )
 
+# Необработанная ошибка (напр. привязка параметра) внутри try/finally без catch завершала
+# скрипт с кодом 0 — ложный успех без запуска платформы. Любая такая ошибка — код 1.
+# py-порт: необработанное исключение и так даёт код 1.
+trap { Write-Host "Error: $($_.Exception.Message) ($($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber))" -ForegroundColor Red; exit 1 }
+
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# --- Реквизиты хранилища из .v8-project.json ---
-# Модель их не передаёт: скрипт сопоставляет параметры соединения с записью в databases[]
-# и берёт repository оттуда. Тот же приём, что в cf-edit.ps1 (сопоставление по configSrc).
+# --- Запись базы в .v8-project.json ---
+# Модель не передаёт ни путь к платформе конкретной базы, ни реквизиты хранилища: скрипт
+# сопоставляет параметры соединения с записью в databases[] и берёт их оттуда. Тот же приём,
+# что в cf-edit.ps1 (сопоставление по configSrc).
 function Find-V8Project([string]$startDir) {
 	$d = $startDir
 	for ($i = 0; $i -lt 20 -and $d; $i++) {
@@ -448,6 +454,10 @@ Assert-InfoBaseExists $InfoBasePath
 
 # --- Resolve V8Path ---
 function Find-ProjectV8Path {
+    # v8path записи базы сильнее корневого: в одном проекте базы живут на разных версиях
+    # платформы, а версию формата выгрузки задаёт та платформа, которая выгружает.
+    $dbRec = Find-ProjectDatabase
+    if ($dbRec -and $dbRec.v8path) { return [string]$dbRec.v8path }
     $dir = (Get-Location).Path
     while ($dir) {
         $pf = Join-Path $dir ".v8-project.json"
@@ -559,6 +569,18 @@ function Write-PlatformOutput {
     Write-Host "--- End ---"
 }
 
+function Write-WholeConfigScopeHint {
+    # Список задаёт объекты метаданных, а не только файлы: вместе с объектом платформа грузит его
+    # дочерние объекты. Корневой Configuration.xml — это объект «Конфигурация», поэтому список с ним
+    # загружает конфигурацию целиком. Замерено на 1cv8 и ibcmd; см. docs по навыку.
+    param([string[]]$FileList, [string]$Extension)
+    $hasRoot = @($FileList | Where-Object { ($_ -replace '\\', '/') -ieq 'Configuration.xml' }).Count -gt 0
+    if (-not $hasRoot) { return }
+    $what = if ($Extension) { "расширения" } else { "конфигурации" }
+    Write-Host "[ВНИМАНИЕ] В списке Configuration.xml — платформа выполнит ПОЛНУЮ загрузку $what," -ForegroundColor Yellow
+    Write-Host "  а не только перечисленных объектов." -ForegroundColor Yellow
+}
+
 # Строки лога, о которых платформа сообщает, НЕ поднимая код возврата: метаданные отброшены или
 # конфигурация нерабочая, а операция при этом «успешна». Возвращает подошедшие строки.
 #
@@ -610,7 +632,7 @@ function Invoke-ApplyCheck {
     $exeLeaf = Split-Path $Exe -Leaf
     $v8 = if ($exeLeaf -match '^ibcmd') { Join-Path $exeDir ("1cv8" + [System.IO.Path]::GetExtension($Exe)) } else { $Exe }
     if (-not (Test-Path $v8)) { return @{ Skipped = $true; Reason = "1cv8 not found at $v8"; ExitCode = 0; Lines = @() } }
-    $dir = Join-Path $env:TEMP "apply_check_$(Get-Random)"
+    $dir = Join-Path ([IO.Path]::GetTempPath()) "apply_check_$(Get-Random)"
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
     try {
         $a = @("DESIGNER") + $ConnArgs + @("/CheckCanApplyConfigurationExtensions")
@@ -626,7 +648,7 @@ function Invoke-ApplyCheck {
         }
         return @{ Skipped = $false; Reason = ''; ExitCode = $res.ExitCode; Lines = $lines }
     } finally {
-        if (Test-Path $dir) { Remove-Item -Path $dir -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($dir -and (Test-Path $dir)) { Remove-Item -Path $dir -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -700,9 +722,16 @@ if ($Mode -eq "Partial" -and -not $Files -and -not $ListFile) {
     Write-Host "Error: -Files or -ListFile required for Partial mode" -ForegroundColor Red
     exit 1
 }
+# Частями грузится одно расширение за раз: конфигуратор такое сочетание отвергает сам, а ibcmd
+# молча загрузил бы все расширения целиком, не глядя в список.
+if ($Mode -eq "Partial" -and $AllExtensions) {
+    Write-Host "Error: -AllExtensions cannot be combined with a partial load (-Files/-ListFile)" -ForegroundColor Red
+    Write-Host "  Загружайте расширения по одному: -Extension <имя>, -ConfigDir — каталог этого расширения." -ForegroundColor Yellow
+    exit 1
+}
 
 # --- Temp dir ---
-$tempDir = Join-Path $env:TEMP "db_load_xml_$(Get-Random)"
+$tempDir = Join-Path ([IO.Path]::GetTempPath()) "db_load_xml_$(Get-Random)"
 New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
 try {
@@ -730,6 +759,7 @@ try {
                 Write-Host "Error: -Files or -ListFile required for partial import" -ForegroundColor Red
                 exit 1
             }
+            Write-WholeConfigScopeHint -FileList $fileList -Extension $Extension
             $arguments = @("infobase", "config", "import", "files") + $fileList
             $arguments += "--base-dir=$ConfigDir", "--db-path=$InfoBasePath"
             if ($Extension) { $arguments += "--extension=$Extension" }
@@ -834,6 +864,7 @@ try {
             Write-Host "Error: после исключения служебных файлов поддержки загружать нечего. Для смены поддержки используйте -Mode Full." -ForegroundColor Red
             exit 1
         }
+        Write-WholeConfigScopeHint -FileList $fileList -Extension $Extension
         $generatedListFile = Join-Path $tempDir "load_list.txt"
         $utf8Bom = New-Object System.Text.UTF8Encoding($true)
         [System.IO.File]::WriteAllLines($generatedListFile, $fileList, $utf8Bom)
@@ -900,10 +931,12 @@ try {
     # Причину не называем: строки лога печатаются следом и говорят за себя, а класс проблемы
     # разный — от отброшенного свойства до нерабочей на этой платформе конфигурации. Подсказку
     # про -StrictLog не даём: загрузка уже выполнена, повторять её ради того же текста незачем.
-    if ($silentFailures.Count -gt 0) {
+    # Только при успехе: при провале лог уже выведен целиком, а блок повторял бы его строки
+    # под заголовком «reported success» — неправдой рядом с «Error … (code: N)».
+    if ($exitCode -eq 0 -and $silentFailures.Count -gt 0) {
         Write-Host "[warning] platform reported success, but the log contains $($silentFailures.Count) problem(s):" -ForegroundColor Yellow
         foreach ($f in $silentFailures) { Write-Host "  $f" -ForegroundColor Yellow }
-        if ($StrictLog -and $exitCode -eq 0) { $exitCode = 1 }
+        if ($StrictLog) { $exitCode = 1 }
     }
 
     # Расширение могло загрузиться «успешно» и при этом остаться неприменимым — спрашиваем платформу.
@@ -914,7 +947,7 @@ try {
     exit $exitCode
 
 } finally {
-    if (Test-Path $tempDir) {
+    if ($tempDir -and (Test-Path $tempDir)) {
         Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

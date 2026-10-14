@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# help-add v1.19 — Add built-in help to 1C object (+write_xml_file/write_utf8_bom: общий эталон записи)
+# help-add v1.24 — Add built-in help to 1C object (+write_xml_file/write_utf8_bom: общий эталон записи)
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 import argparse
@@ -293,6 +293,26 @@ def write_utf8_bom(path, content):
 
 
 
+def is_valid_lang(code):
+    """Код языка идёт и в текст XML, и в имя файла страницы.
+
+    Пустое значение дало бы файл «.html» и пустой <Page></Page>, разделитель пути — запись
+    мимо каталога страниц, а зарезервированное имя устройства (nul, con, prn, aux, com1…, lpt1…)
+    на Windows уводит запись в само устройство: при -Lang nul этот порт молча писал
+    <Page>nul</Page> и пустой каталог с кодом 0. Все отказы платформы были бы тихими.
+
+    fullmatch, а не match: последний с `$` допускает перевод строки в конце.
+
+    Копия этой функции есть в template-add (навыки автономны, формат «дескриптор + страница»
+    у них общий). Держать копии одинаковыми — сознательно; за дрейфом следит check-inline-drift.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", code):
+        return False
+    if re.fullmatch(r"(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])", code):
+        return False
+    return True
+
+
 def write_xml_file(path, content):
     """XML в каноне выгрузки Конфигуратора: CRLF в разделителях, без перевода в конце.
 
@@ -318,8 +338,6 @@ def main():
     lang = args.Lang
     src_dir = args.SrcDir
 
-    format_version = detect_format_version(os.path.abspath(src_dir))
-
     # --- Checks ---
 
     object_dir = os.path.join(src_dir, object_name)
@@ -327,6 +345,26 @@ def main():
 
     if not os.path.isdir(ext_dir):
         print(f"Каталог объекта не найден: {ext_dir}. Проверьте путь ObjectName (например Catalogs/МойСправочник).", file=sys.stderr)
+        sys.exit(1)
+
+    # Справка — тело объекта, а тело и дескриптор платформа загружает только в одной версии формата.
+    # Поэтому версию берём прежде всего из дескриптора <объект>.xml (объект может быть старше выгрузки после
+    # мержа веток), и только без него — подъёмом от каталога объекта. Не от SrcDir: у внешней обработки
+    # корень <Имя>.xml лежит В SrcDir, подъём его не видел, и справка обработки 2.20 писалась 2.17.
+    format_version = None
+    owner_xml = os.path.abspath(object_dir) + ".xml"
+    if os.path.isfile(owner_xml):
+        with open(owner_xml, "r", encoding="utf-8-sig") as f:
+            owner_head = f.read(2000)
+        m = re.search(r'<MetaDataObject[^>]+version="(\d+\.\d+)"', owner_head)
+        if m:
+            format_version = m.group(1)
+    if not format_version:
+        format_version = detect_format_version(os.path.abspath(object_dir))
+
+    if not is_valid_lang(lang):
+        print(f"Недопустимый код языка: '{lang}'", file=sys.stderr)
+        print("Ожидается код вида ru, en (буквы, цифры, дефис, подчёркивание; имена устройств Windows недопустимы)", file=sys.stderr)
         sys.exit(1)
 
     help_xml_path = os.path.join(ext_dir, "Help.xml")
@@ -361,8 +399,8 @@ def main():
         '<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">\n'
         '<html>\n'
         '<head>\n'
-        '    <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>\n'
-        '    <link rel="stylesheet" type="text/css" href="v8help://service_book/service_style"/>\n'
+        '    <meta http-equiv="Content-Type" content="text/html; charset=utf-8"></meta>\n'
+        '    <link rel="stylesheet" type="text/css" href="v8help://service_book/service_style"></link>\n'
         '</head>\n'
         '<body>\n'
         f'    <h1>{object_name}</h1>\n'
@@ -371,7 +409,13 @@ def main():
         '</html>'
     )
 
-    write_utf8_bom(help_html_path, help_html)
+    # Файл страницы НЕ перезаписываем: отказ выше смотрит только на Help.xml, а страница может
+    # пережить его (удалённый дескриптор, частичная выгрузка, справка, сделанная руками) — и тогда
+    # безусловная запись молча стирала бы текст справки с кодом 0.
+    if os.path.exists(help_html_path):
+        print(f"[WARN] Страница {lang}.html уже лежала на диске — содержимое сохранено, создан только дескриптор.")
+    else:
+        write_utf8_bom(help_html_path, help_html)
 
     # --- 3. Check IncludeHelpInContents in form metadata ---
 

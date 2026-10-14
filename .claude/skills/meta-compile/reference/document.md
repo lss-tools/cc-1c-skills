@@ -22,8 +22,8 @@
 | `posting` | `Allow` | `Allow` / `Deny` (проведение) |
 | `realTimePosting` | `Deny` | `Allow` / `Deny` (оперативное проведение) |
 | `registerRecordsDeletion` | `AutoDelete` | `AutoDelete` / `AutoDeleteOnUnpost` / `AutoDeleteOff` |
-| `registerRecordsWritingOnPost` | `WriteSelected` | `WriteModified` / `WriteSelected` / `WriteAll` |
-| `sequenceFilling` | `AutoFill` | заполнение последовательностей |
+| `registerRecordsWritingOnPost` | `WriteSelected` | `WriteModified` / `WriteSelected` |
+| `sequenceFilling` | `AutoFill` | `AutoFill` / `AutoFillOff` (заполнение последовательностей) |
 | `postInPrivilegedMode` | `true` | bool |
 | `unpostInPrivilegedMode` | `true` | bool |
 | `createOnInput` | `Use` | `Auto` / `Use` / `DontUse` |
@@ -60,7 +60,7 @@
 
 | Ключ | Умолчание | Значения |
 |------|-----------|----------|
-| `moveBoundaryOnPosting` | `DontMove` | сдвиг границы при проведении |
+| `moveBoundaryOnPosting` | `DontMove` | `DontMove` / `Move` (сдвиг границы при проведении) |
 | `documents` | `[]` | документы последовательности (список ссылок) |
 | `registerRecords` | `[]` | движения (список ссылок) |
 | `dataLockControlMode` | `Managed` | `Automatic` / `Managed` |

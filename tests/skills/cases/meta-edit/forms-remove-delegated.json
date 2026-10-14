@@ -1,0 +1,38 @@
+{
+  "name": "Форму meta-edit не удаляет — отсылает к form-remove",
+  "preRun": [
+    {
+      "script": "meta-compile/scripts/meta-compile",
+      "input": {
+        "type": "Catalog",
+        "name": "Контрагенты"
+      },
+      "args": {
+        "-JsonPath": "{inputFile}",
+        "-OutputDir": "{workDir}"
+      }
+    }
+  ],
+  "params": {
+    "objectPath": "Catalogs/Контрагенты"
+  },
+  "input": {
+    "remove": {
+      "forms": [
+        "ФормаСписка"
+      ]
+    }
+  },
+  "expect": {
+    "fileNotContains": [
+      {
+        "file": "Catalogs/Контрагенты.xml",
+        "text": [
+          "<Form",
+          "<Template"
+        ]
+      }
+    ]
+  },
+  "expectError": "form-remove"
+}

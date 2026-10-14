@@ -558,7 +558,7 @@ Ext/                               # Расширение конфигураци
 |---|---|---|
 | `name` | атрибут | Имя стандартного реквизита |
 | `LinkByType` | элемент | Связь по типу (обычно пустой) |
-| `FillChecking` | enum | `DontCheck` \| `ShowWarning` \| `ShowError` |
+| `FillChecking` | enum | `DontCheck` \| `ShowError` |
 | `MultiLine` | boolean | Многострочное поле |
 | `FillFromFillingValue` | boolean | Заполнять из значения заполнения |
 | `CreateOnInput` | enum | `Auto` \| `Use` \| `DontUse` |
@@ -770,12 +770,12 @@ Ext/                               # Расширение конфигураци
         <Name>ФормаЭлемента</Name>
         <Synonym>...</Synonym>
         <Comment/>
-        <FormType>Ordinary</FormType>   <!-- Ordinary = управляемая форма -->
+        <FormType>Managed</FormType>   <!-- Managed = управляемая форма, Ordinary = обычная (толстый клиент) -->
     </Properties>
 </Form>
 ```
 
-Содержимое формы хранится в отдельных файлах: `Forms/<Имя>/<Имя>.xml` и `Forms/<Имя>/Ext/Form.xml`.
+Форма хранится двумя файлами: дескриптор `Forms/<Имя>.xml` и тело `Forms/<Имя>/Ext/Form.xml` — оба в одной версии формата (см. 1c-configuration-spec.md, §7.1).
 
 ### 6.4. Макет (Template)
 
@@ -785,7 +785,7 @@ Ext/                               # Расширение конфигураци
         <Name>ОсновнаяСхемаКомпоновкиДанных</Name>
         <Synonym>...</Synonym>
         <Comment/>
-        <TemplateType>DataCompositionSchema</TemplateType>  <!-- DataCompositionSchema | SpreadsheetDocument | HTMLDocument | TextDocument | BinaryData | ActiveDocument -->
+        <TemplateType>DataCompositionSchema</TemplateType>  <!-- SpreadsheetDocument | BinaryData | HTMLDocument | TextDocument | ActiveDocument | DataCompositionSchema | DataCompositionAppearanceTemplate | GraphicalSchema | GeographicalSchema | AddIn — см. 1c-configuration-spec.md, «Template» -->
     </Properties>
 </Template>
 ```
@@ -848,7 +848,7 @@ XML-элемент: `<Catalog>`. Категория InternalInfo: CatalogObject,
 <DescriptionLength>150</DescriptionLength>
 <CheckUnique>true</CheckUnique>
 <Autonumbering>true</Autonumbering>
-<DefaultPresentation>AsDescription</DefaultPresentation>  <!-- AsDescription | AsCode -->
+<DefaultPresentation>AsDescription</DefaultPresentation>  <!-- AsDescription | AsCode; у задачи AsDescription | AsNumber -->
 ```
 
 **Владелец:**
@@ -924,7 +924,7 @@ XML-элемент: `<Document>`. Категория InternalInfo: DocumentObjec
     <xr:Item xsi:type="xr:MDObjectRef">AccountingRegister.Хозрасчетный</xr:Item>
 </RegisterRecords>
 <RegisterRecordsDeletion>AutoDeleteOnUnpost</RegisterRecordsDeletion>   <!-- AutoDeleteOnUnpost | AutoDeleteOff -->
-<RegisterRecordsWritingOnPost>WriteSelected</RegisterRecordsWritingOnPost>  <!-- WriteSelected | WriteAll -->
+<RegisterRecordsWritingOnPost>WriteSelected</RegisterRecordsWritingOnPost>  <!-- WriteSelected | WriteModified -->
 <SequenceFilling>AutoFill</SequenceFilling>                              <!-- AutoFill | AutoFillOff -->
 ```
 

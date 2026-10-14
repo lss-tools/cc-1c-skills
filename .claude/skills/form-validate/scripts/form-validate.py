@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# form-validate v1.19 — Validate 1C managed form
+# form-validate v1.24 — Validate 1C managed form
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 
 import argparse
@@ -88,32 +88,54 @@ def _sg_is_external_root(xml_path):
     return False
 
 
-# Версия формата выгрузки. Копия общего эталона (семья detect_format_version, авторитет —
-# form-compile): та же ветка для автономной EPF/ERF, где версию несёт корень обработки.
-def detect_format_version(d):
-    while d:
-        # Автономная внешняя обработка/отчёт: своего Configuration.xml у неё нет, версию несёт
-        # корень самой обработки. Без этого форма и макет внутри обработки 2.21 писались бы 2.17.
-        ext_path = d + ".xml"
-        if os.path.isfile(ext_path):
-            with open(ext_path, "r", encoding="utf-8-sig") as f:
-                ext_head = f.read(2000)
-            if re.search(r'<(ExternalDataProcessor|ExternalReport)[ >]', ext_head):
-                m = re.search(r'<MetaDataObject[^>]+version="(\d+\.\d+)"', ext_head)
-                if m:
-                    return m.group(1)
-        cfg_path = os.path.join(d, "Configuration.xml")
-        if os.path.isfile(cfg_path):
-            with open(cfg_path, "r", encoding="utf-8-sig") as f:
-                head = f.read(2000)
-            m = re.search(r'<MetaDataObject[^>]+version="(\d+\.\d+)"', head)
-            if m:
-                return m.group(1)
+# Штамп версии формата — атрибут version КОРНЕВОГО элемента файла. Копия общего эталона (семья
+# root_version, авторитет — meta-validate).
+def root_version(xml_path):
+    if not os.path.isfile(xml_path):
+        return None
+    with open(xml_path, "rb") as f:
+        head = f.read(4096).decode("utf-8", errors="ignore")
+    m = re.search(r'<[A-Za-z_][\w.:-]*(\s[^>]*)?/?>', head)
+    if not m:
+        return None
+    v = re.search(r'(?:^|\s)version="([^"]*)"', m.group(1) or "")
+    if v:
+        return v.group(1)
+    return None
+
+
+# Якорь выгрузки: корень автономной EPF/ERF либо Configuration.xml, ближайший вверх. Копия общего
+# эталона (семья find_dump_anchor, авторитет — meta-validate).
+def find_dump_anchor(start_dir):
+    d = start_dir
+    for _ in range(15):
+        if not d:
+            break
+        if _sg_is_external_root(d + ".xml"):
+            return d + ".xml"
+        cfg = os.path.join(d, "Configuration.xml")
+        if os.path.exists(cfg):
+            return cfg
         parent = os.path.dirname(d)
-        if parent == d:
+        if not parent or parent == d:
             break
         d = parent
-    return "2.17"
+    return None
+
+
+# Владелец тела X/Ext/<файл>.xml — дескриптор X.xml рядом с каталогом X. У тел конфигурации (и
+# расширения) соседа-дескриптора нет, владелец — Configuration.xml внутри X. Иначе — не определён.
+def ext_body_owner(body_path):
+    ext_dir = os.path.dirname(body_path)
+    if os.path.basename(ext_dir) != "Ext":
+        return None
+    obj_dir = os.path.dirname(ext_dir)
+    if os.path.isfile(obj_dir + ".xml"):
+        return obj_dir + ".xml"
+    cfg = os.path.join(obj_dir, "Configuration.xml")
+    if os.path.isfile(cfg):
+        return cfg
+    return None
 
 
 # ── Format version ───────────────────────────────────────────
@@ -133,6 +155,680 @@ def format_rank(ver):
 
 def localname(el):
     return etree.QName(el.tag).localname
+
+
+# --- Перечисления свойств формы (генерируется) ---
+# Значения свойств-перечислений элементов формы и корня (ключ «Тип.Свойство» или общий «Свойство»).
+# Источник — XSD xcf-logform 2.10–2.21, сверено с корпусом БП/ERP 8.3.24 (17036 форм, расхождений нет)
+# и загрузкой в 8.3.24. Перегенерировать: python debug/form-dsl-revision/gen_enum_table.py
+valid_enum_values = {
+    "AppearanceInCard": ["Auto", "Extended"],
+    "AppearanceMode": ["Auto", "CommandBar", "UsualGroup"],
+    "AutoAddIncomplete": ["true", "false", "auto"],
+    "AutoCapitalizationOnTextInput": ["Auto", "None", "Words", "Sentences", "AllCharacters"],
+    "AutoChoiceIncomplete": ["true", "false", "auto"],
+    "AutoCorrectionOnTextInput": ["Auto", "Use", "DontUse"],
+    "AutoMarkIncomplete": ["true", "false", "auto"],
+    "AutoSaveDataInSettings": ["DontUse", "Use"],
+    "AutoShowClearButtonMode": ["Auto", "Always", "FilledOnly"],
+    "AutoShowOpenButtonMode": ["Auto", "Always", "FilledOnly"],
+    "AutoShowState": ["Auto", "DontShow", "Show", "ShowOnComposition"],
+    "AutoTime": ["DontUse", "Last", "First", "CurrentOrLast", "CurrentOrFirst"],
+    "AutoWidthInTable": ["Auto", "ByData", "None", "ByDataAndTitle"],
+    "AutofillHint": ["DontUse", "FullName", "GivenName", "FamilyName", "MiddleName", "NamePrefix", "NameSuffix", "Street", "City", "Region", "Country", "PostalCode", "UserName", "Password", "NewPassword", "OneTimeCode", "Email", "PhoneNumber", "CreditCardNumber"],
+    "BackPictureEffect": ["Auto", "None", "Semitransparency", "SemitransparencyAndBlur"],
+    "BackgroundShowMode": ["Auto", "DontShow", "ShowAndIncreaseSize", "ShowAndDontIncreaseSize"],
+    "Behavior": ["Usual", "Collapsible", "PopUp", "Auto"],
+    "BehaviorOnHorizontalCompression": ["Auto", "HideItemsByImportance", "MoveItemsByImportance"],
+    "ButtonImportance": ["Main", "Normal", "Supplementary"],
+    "CardBehaviorOnVerticalCompression": ["Auto", "MoveItemsToSwipeablePages", "HideItems"],
+    "CardPictureAndTitleAlign": ["Auto", "LeftHorizontallySidesVertically", "CenterHorizontallySidesVertically", "CenterHorizontallyCenterVertically"],
+    "CardRepresentationType": ["Usual", "Group"],
+    "CellActionsButtonViewMode": ["Auto", "DontShow", "ShowOnHover"],
+    "CellHyperlinkDisplayVariant": ["Auto", "Always", "OnRowHover"],
+    "CellHyperlinkRepresentation": ["Auto", "Show", "DontShow"],
+    "CellHyperlinksRepresentation": ["Auto", "AutoForSingle", "ForAll", "DontShow"],
+    "CellMark": ["None", "ShapeUnderTextOval", "IconCircle"],
+    "CheckBoxType": ["Auto", "CheckBox", "Tumbler", "Switcher"],
+    "ChildItemsTitleLocation": ["Auto", "Left", "LeftIfPossible", "Top"],
+    "ChildItemsWidth": ["Auto", "Equal", "LeftWide", "LeftWidest", "LeftNarrow", "LeftNarrowest"],
+    "ChildrenAlign": ["Auto", "None", "ItemsLeftTitlesLeft", "ItemsRightTitlesLeft", "ItemsLeftTitlesRight", "ItemsRightTitlesRight", "TitlesLeftDataLeft", "TitlesLeftDataRight", "TitlesRightDataLeft", "TitlesRightDataRight", "TitlesLeftDataAuto"],
+    "ChoiceButton": ["true", "false", "auto"],
+    "ChoiceButtonRepresentation": ["Auto", "ShowInDropList", "ShowInDropListAndInInputField", "ShowInInputField"],
+    "InputField.ChoiceFoldersAndItems": ["Items", "Folders", "FoldersAndItems", "Auto"],
+    "Table.ChoiceFoldersAndItems": ["Items", "Folders", "FoldersAndItems"],
+    "ChoiceHistoryOnInput": ["Auto", "DontUse"],
+    "ChoiceListButton": ["true", "false", "auto"],
+    "ClearButton": ["true", "false", "auto"],
+    "CollapseItemsByImportanceVariant": ["Auto", "Use", "DontUse"],
+    "CommandBarLocation": ["None", "Auto", "Top", "Bottom"],
+    "ComplexSettingsViewMode": ["Show", "DontShow"],
+    "ControlRepresentation": ["TitleHyperlink", "Picture", "Button", "ButtonInParentElement"],
+    "ConversationsRepresentation": ["Auto", "Show", "DontShow"],
+    "CreateButton": ["true", "false", "auto"],
+    "Pages.CurrentRowUse": ["Use", "DontUse", "Auto"],
+    "Table.CurrentRowUse": ["Auto", "Choice", "SelectionPresentation", "SelectionPresentationAndChoice"],
+    "UsualGroup.CurrentRowUse": ["Use", "DontUse", "Auto"],
+    "DisplayImportance": ["Auto", "VeryHigh", "High", "Usual", "Low", "VeryLow"],
+    "DrawingSelectionShowMode": ["Show", "DontShow", "Auto"],
+    "DropListButton": ["true", "false", "auto"],
+    "EditMode": ["Directly", "Enter", "EnterOnInput", "Auto"],
+    "EditTextUpdate": ["Auto", "DontUse", "OnValueChange", "Always"],
+    "EnterKeyBehavior": ["ControlNavigation", "DefaultButton"],
+    "EqualColumnsWidth": ["true", "false", "auto"],
+    "EqualItemsWidth": ["true", "false", "auto"],
+    "ExtendedEdit": ["true", "false", "auto"],
+    "FileDragMode": ["AsFile", "AsFileRef"],
+    "FixInCard": ["true", "false", "auto"],
+    "FixingInTable": ["None", "Left", "Right"],
+    "FooterHorizontalAlign": ["Left", "Center", "Right", "Auto"],
+    "ColumnGroup.Group": ["Horizontal", "Vertical", "InCell"],
+    "Form.Group": ["Horizontal", "Vertical", "HorizontalIfPossible", "AlwaysHorizontal", "Auto", "AutoScreenTypeSensitive"],
+    "Page.Group": ["Horizontal", "Vertical", "HorizontalIfPossible", "AlwaysHorizontal", "Auto", "AutoScreenTypeSensitive"],
+    "UsualGroup.Group": ["Horizontal", "Vertical", "HorizontalIfPossible", "AlwaysHorizontal", "Auto", "AutoScreenTypeSensitive"],
+    "GroupHorizontalAlign": ["Left", "Center", "Right", "Auto"],
+    "GroupVerticalAlign": ["Top", "Center", "Bottom", "Auto"],
+    "HeaderHorizontalAlign": ["Left", "Center", "Right", "Auto"],
+    "InputField.HeightControlVariant": ["Auto", "UseHeightInFormRows", "UseContentHeight"],
+    "Table.HeightControlVariant": ["Auto", "UseHeightInFormRows", "UseHeightInTableRows", "UseContentHeight"],
+    "HierarchyPanelLocation": ["Auto", "None"],
+    "HorizontalAlign": ["Left", "Center", "Right", "Auto"],
+    "HorizontalLinesBWA": ["true", "false", "auto"],
+    "HorizontalLocation": ["Left", "Center", "Right", "Auto"],
+    "Table.HorizontalScrollBar": ["DontUse", "UseAlways", "AutoUse"],
+    "HorizontalSpacing": ["Auto", "None", "Half", "Single", "OneAndHalf", "Double"],
+    "AutoCommandBar.HorizontalStretch": ["true", "false", "auto"],
+    "ButtonGroup.HorizontalStretch": ["true", "false", "auto"],
+    "CheckBoxField.HorizontalStretch": ["true", "false", "auto"],
+    "ColumnGroup.HorizontalStretch": ["true", "false", "auto"],
+    "CommandBar.HorizontalStretch": ["true", "false", "auto"],
+    "ContextMenu.HorizontalStretch": ["true", "false", "auto"],
+    "InputField.HorizontalStretch": ["true", "false", "auto"],
+    "LabelDecoration.HorizontalStretch": ["true", "false", "auto"],
+    "LabelField.HorizontalStretch": ["true", "false", "auto"],
+    "Page.HorizontalStretch": ["true", "false", "auto"],
+    "Pages.HorizontalStretch": ["true", "false", "auto"],
+    "PictureDecoration.HorizontalStretch": ["true", "false", "auto"],
+    "Popup.HorizontalStretch": ["true", "false", "auto"],
+    "RadioButtonField.HorizontalStretch": ["true", "false", "auto"],
+    "UsualGroup.HorizontalStretch": ["true", "false", "auto"],
+    "Importance": ["Main", "Normal", "Supplementary"],
+    "IncompleteChoiceMode": ["OnEnterPressed", "OnActivate"],
+    "InitialListView": ["Beginning", "End", "Auto"],
+    "InitialRowActivation": ["Auto", "Activate", "NoActivate"],
+    "InitialTreeView": ["NoExpand", "ExpandTopLevel", "ExpandAllLevels"],
+    "IntervalsSelectionMode": ["Auto", "Multiple", "Single", "None"],
+    "LocationInCommandBar": ["Auto", "InAdditionalSubmenu", "InCommandBar", "InCommandBarAndInAdditionalSubmenu"],
+    "MarkNegatives": ["true", "false", "auto"],
+    "MarkRequiredComplete": ["true", "false", "auto"],
+    "MarkingAppearance": ["DontShow", "TopLeft", "BottomRight", "BothSides"],
+    "MobileDeviceTableType": ["Auto", "List", "Cards"],
+    "MultiLine": ["true", "false", "auto"],
+    "MultipleValuePictureShape": ["Auto", "Rect", "Circle", "Square"],
+    "MultipleValuePictureSize": ["Auto", "Small", "Medium", "Large"],
+    "MultipleValuesHyperlink": ["true", "false", "auto"],
+    "OnMainServerUnavalableBehavior": ["Auto", "MakeDisable", "DontChangeBehavior"],
+    "OnScreenKeyboardReturnKeyText": ["Auto", "Return", "Go", "Join", "Next", "Search", "Send", "Done", "Continue"],
+    "OnlyInAllActions": ["true", "false", "auto"],
+    "OpenButton": ["true", "false", "auto"],
+    "Orientation": ["Horizontal", "Vertical", "HorizontalIfPossible"],
+    "Output": ["Auto", "Enable", "Disable"],
+    "PagesRepresentation": ["None", "TabsOnTop", "TabsOnBottom", "TabsOnLeftHorizontal", "TabsOnRightHorizontal", "Swipe", "Auto"],
+    "PasswordMode": ["true", "false", "auto"],
+    "PictureLocation": ["Auto", "Left", "Right", "Top", "Bottom"],
+    "PictureSize": ["RealSize", "Stretch", "Proportionally", "Tile", "AutoSize", "RealSizeIgnoreScale", "AutoSizeIgnoreScale", "ByFontSize"],
+    "PlacementArea": ["mainCmdsLeft", "autoCmds", "userCmds", "mainCmdsRight"],
+    "PointerType": ["Special", "Regular"],
+    "QuickChoice": ["true", "false", "auto"],
+    "RadioButtonType": ["Auto", "RadioButtons", "Tumbler"],
+    "RefreshRequest": ["None", "PullFromTop", "PullFromBottom", "PullFromTopOrBottom"],
+    "ReportFormType": ["Main", "Settings", "Variant"],
+    "ReportResultViewMode": ["Auto", "Default", "Compact"],
+    "Button.Representation": ["Text", "Picture", "PictureAndText", "Auto"],
+    "ButtonGroup.Representation": ["Auto", "Usual", "Compact"],
+    "Popup.Representation": ["Text", "Picture", "PictureAndText", "Auto"],
+    "ProgressBarField.Representation": ["Smooth", "Broken", "BrokenTilt"],
+    "Table.Representation": ["List", "HierarchicalList", "Tree"],
+    "UsualGroup.Representation": ["Auto", "None", "StrongSeparation", "WeakSeparation", "NormalSeparation", "GroupBox", "Line", "Margin"],
+    "RepresentationInContextMenu": ["None", "AdditionalInContextMenu", "OnlyInContextMenu", "Auto"],
+    "RowActionsShowType": ["Auto", "DontShow", "ShowOnHover", "ShowAlways"],
+    "RowInputMode": ["EndOfList", "EndOfWindow", "AfterCurrentRow", "BeforeCurrentRow"],
+    "RowSelectionMode": ["Auto", "Cell", "Row"],
+    "SaveColors": ["Auto", "ForUser", "ByKeyForUser", "DontUse"],
+    "SaveDataInSettings": ["DontUse", "UseList"],
+    "ScaleVariant": ["Auto", "Normal", "Compact", "NormalIfPossible"],
+    "ScalingMode": ["Auto", "Normal", "Compact"],
+    "Page.ScrollOnCompress": ["true", "false", "auto"],
+    "UsualGroup.ScrollOnCompress": ["true", "false", "auto"],
+    "SearchControlLocation": ["Auto", "None", "CommandBar"],
+    "SearchOnInput": ["Use", "DontUse", "Auto"],
+    "SearchStringLocation": ["Auto", "None", "CommandBar", "Top", "Bottom", "FormCaption", "PullFromTop"],
+    "CalendarField.SelectionMode": ["Single", "Multiple", "Interval"],
+    "Table.SelectionMode": ["SingleRow", "MultiRow"],
+    "SelectionShowMode": ["WhenActive", "Always", "DontShow", "WhenMultipleCellsSelected", "WhenMultipleCellsSelectedWhenActive"],
+    "Shape": ["Auto", "Usual", "Oval"],
+    "ShapeRepresentation": ["Auto", "Always", "WhenActive", "None"],
+    "ShowCheckBoxesInDropList": ["true", "false", "auto"],
+    "ShowCommandBar": ["true", "false", "auto"],
+    "ShowHorizontalLinesFlag": ["true", "false", "auto"],
+    "ColumnGroup.ShowTitle": ["true", "false", "auto"],
+    "Form.ShowTitle": ["true", "false", "auto"],
+    "Page.ShowTitle": ["true", "false", "auto"],
+    "UsualGroup.ShowTitle": ["true", "false", "auto"],
+    "ShowTitleInCard": ["true", "false", "auto"],
+    "ShowVerticalLinesFlag": ["true", "false", "auto"],
+    "SkipOnInput": ["true", "false", "auto"],
+    "SpecialTextInputMode": ["Auto", "None", "DigitsAndPunctuation", "URL", "Email", "PhoneNumber", "Digits"],
+    "SpellCheckingOnTextInput": ["Auto", "Use", "DontUse"],
+    "SpinButton": ["true", "false", "auto"],
+    "SpreadsheetDocumentMultipleSelectionPanelViewMode": ["Auto", "DontShow", "ShowOnMultipleSelection", "ShowAlways"],
+    "TableLocation": ["Auto", "Left", "Right", "None"],
+    "TextSize": ["Enlarged", "Normal", "Reduced"],
+    "ThroughAlign": ["Use", "DontUse", "Auto"],
+    "TimeChoiceMode": ["Auto", "DontChoose", "CustomTime", "Interval1Minute", "Interval5Minutes", "Interval10Minutes", "Interval15Minutes", "Interval15And20Minutes", "Interval20Minutes", "Interval30Minutes", "Interval60Minutes"],
+    "TitleLocation": ["None", "Auto", "Left", "Top", "Right", "Bottom"],
+    "ToolTipRepresentation": ["Auto", "None", "Balloon", "Button", "ShowAuto", "ShowTop", "ShowLeft", "ShowBottom", "ShowRight"],
+    "TumblerRepresentation": ["Text", "Picture", "Auto"],
+    "Type": ["CommandBarButton", "UsualButton", "Hyperlink", "CommandBarHyperlink"],
+    "UpdateOnDataChange": ["Auto", "DontUpdate"],
+    "UseAlternationRowColorBWA": ["true", "false", "auto"],
+    "UseCopy": ["true", "false", "auto"],
+    "UseForFoldersAndItems": ["Items", "Folders", "FoldersAndItems"],
+    "UsePostingMode": ["Regular", "RealTime", "Ask", "Auto"],
+    "ValuesSelectionMode": ["Auto", "Multiple", "Single", "None"],
+    "VerticalAlign": ["Top", "Center", "Bottom", "Auto"],
+    "VerticalLinesBWA": ["true", "false", "auto"],
+    "VerticalScroll": ["auto", "use", "useIfNecessary", "useWithoutStretch"],
+    "Table.VerticalScrollBar": ["DontUse", "UseAlways", "AutoUse"],
+    "VerticalSpacing": ["Auto", "None", "Half", "Single", "OneAndHalf", "Double"],
+    "AutoCommandBar.VerticalStretch": ["true", "false", "auto"],
+    "ButtonGroup.VerticalStretch": ["true", "false", "auto"],
+    "ColumnGroup.VerticalStretch": ["true", "false", "auto"],
+    "CommandBar.VerticalStretch": ["true", "false", "auto"],
+    "ContextMenu.VerticalStretch": ["true", "false", "auto"],
+    "InputField.VerticalStretch": ["true", "false", "auto"],
+    "LabelDecoration.VerticalStretch": ["true", "false", "auto"],
+    "LabelField.VerticalStretch": ["true", "false", "auto"],
+    "Page.VerticalStretch": ["true", "false", "auto"],
+    "Pages.VerticalStretch": ["true", "false", "auto"],
+    "PictureDecoration.VerticalStretch": ["true", "false", "auto"],
+    "Popup.VerticalStretch": ["true", "false", "auto"],
+    "UsualGroup.VerticalStretch": ["true", "false", "auto"],
+    "ViewMode": ["All", "QuickAccess"],
+    "ViewModeApplicationOnSetReportResult": ["Auto", "Apply", "DontApply"],
+    "ViewScalingMode": ["Auto", "Normal", "Large"],
+    "ViewStatusLocation": ["Auto", "None", "Top", "Bottom"],
+    "WarningOnEditRepresentation": ["Show", "DontShow", "Auto"],
+    "WidthInCard": ["Auto", "Full", "Half"],
+    "WindowOpeningMode": ["Auto", "DontBlock", "LockOwner", "LockWholeInterface", "Independent", "LockOwnerWindow"],
+}
+# Старые имена значений, которые платформа принимает и переводит в современные (замер выгрузки 8.3.24)
+enum_value_aliases = {
+    "TitlesLeftDataLeft": "ItemsLeftTitlesLeft",
+    "TitlesLeftDataRight": "ItemsRightTitlesLeft",
+    "TitlesRightDataLeft": "ItemsLeftTitlesRight",
+    "TitlesRightDataRight": "ItemsRightTitlesRight",
+    "GroupBox": "StrongSeparation",
+    "Margin": "NormalSeparation",
+    "Square": "Rect",
+}
+# Умолчания: значение, которое платформа у этого типа не пишет (выброшено при загрузке-выгрузке 8.3.24
+# и ни разу не встречается в корпусе) — тег с ним не пишется
+enum_default_values = {
+    "AutoCommandBar.GroupHorizontalAlign": "Auto",
+    "AutoCommandBar.GroupVerticalAlign": "Auto",
+    "AutoCommandBar.HorizontalAlign": "Left",
+    "AutoCommandBar.HorizontalStretch": "auto",
+    "AutoCommandBar.ToolTipRepresentation": "Auto",
+    "AutoCommandBar.VerticalStretch": "auto",
+    "Button.GroupHorizontalAlign": "Auto",
+    "Button.GroupVerticalAlign": "Auto",
+    "Button.LocationInCommandBar": "Auto",
+    "Button.OnMainServerUnavalableBehavior": "Auto",
+    "Button.PictureLocation": "Auto",
+    "Button.PlacementArea": "userCmds",
+    "Button.Representation": "Auto",
+    "Button.RepresentationInContextMenu": "Auto",
+    "Button.Shape": "Auto",
+    "Button.ShapeRepresentation": "Auto",
+    "Button.SkipOnInput": "auto",
+    "Button.ToolTipRepresentation": "Auto",
+    "ButtonGroup.GroupHorizontalAlign": "Auto",
+    "ButtonGroup.GroupVerticalAlign": "Auto",
+    "ButtonGroup.HorizontalStretch": "auto",
+    "ButtonGroup.PlacementArea": "userCmds",
+    "ButtonGroup.Representation": "Auto",
+    "ButtonGroup.ToolTipRepresentation": "Auto",
+    "ButtonGroup.VerticalStretch": "auto",
+    "CalendarField.EditMode": "Enter",
+    "CalendarField.FixingInTable": "None",
+    "CalendarField.FooterHorizontalAlign": "Auto",
+    "CalendarField.GroupHorizontalAlign": "Auto",
+    "CalendarField.GroupVerticalAlign": "Auto",
+    "CalendarField.HeaderHorizontalAlign": "Left",
+    "CalendarField.HorizontalAlign": "Auto",
+    "CalendarField.OnMainServerUnavalableBehavior": "Auto",
+    "CalendarField.SelectionMode": "Single",
+    "CalendarField.SkipOnInput": "auto",
+    "CalendarField.TitleLocation": "Auto",
+    "CalendarField.ToolTipRepresentation": "Auto",
+    "CalendarField.VerticalAlign": "Auto",
+    "CalendarField.WarningOnEditRepresentation": "Auto",
+    "ChartField.EditMode": "Enter",
+    "ChartField.FixingInTable": "None",
+    "ChartField.FooterHorizontalAlign": "Auto",
+    "ChartField.GroupHorizontalAlign": "Auto",
+    "ChartField.GroupVerticalAlign": "Auto",
+    "ChartField.HeaderHorizontalAlign": "Left",
+    "ChartField.HorizontalAlign": "Auto",
+    "ChartField.OnMainServerUnavalableBehavior": "Auto",
+    "ChartField.SkipOnInput": "auto",
+    "ChartField.TitleLocation": "Auto",
+    "ChartField.ToolTipRepresentation": "Auto",
+    "ChartField.VerticalAlign": "Auto",
+    "ChartField.WarningOnEditRepresentation": "Auto",
+    "CheckBoxField.EditMode": "Enter",
+    "CheckBoxField.EqualItemsWidth": "auto",
+    "CheckBoxField.FixingInTable": "None",
+    "CheckBoxField.FooterHorizontalAlign": "Auto",
+    "CheckBoxField.GroupHorizontalAlign": "Auto",
+    "CheckBoxField.GroupVerticalAlign": "Auto",
+    "CheckBoxField.HeaderHorizontalAlign": "Left",
+    "CheckBoxField.HorizontalAlign": "Auto",
+    "CheckBoxField.OnMainServerUnavalableBehavior": "Auto",
+    "CheckBoxField.SkipOnInput": "auto",
+    "CheckBoxField.TitleLocation": "Auto",
+    "CheckBoxField.ToolTipRepresentation": "Auto",
+    "CheckBoxField.VerticalAlign": "Auto",
+    "CheckBoxField.WarningOnEditRepresentation": "Auto",
+    "ColumnGroup.FixingInTable": "None",
+    "ColumnGroup.Group": "Vertical",
+    "ColumnGroup.GroupHorizontalAlign": "Auto",
+    "ColumnGroup.GroupVerticalAlign": "Auto",
+    "ColumnGroup.HeaderHorizontalAlign": "Auto",
+    "ColumnGroup.HorizontalStretch": "auto",
+    "ColumnGroup.ToolTipRepresentation": "Auto",
+    "ColumnGroup.VerticalStretch": "auto",
+    "CommandBar.GroupHorizontalAlign": "Auto",
+    "CommandBar.GroupVerticalAlign": "Auto",
+    "CommandBar.HorizontalLocation": "Left",
+    "CommandBar.HorizontalStretch": "auto",
+    "CommandBar.ToolTipRepresentation": "Auto",
+    "CommandBar.VerticalStretch": "auto",
+    "ContextMenu.GroupHorizontalAlign": "Auto",
+    "ContextMenu.GroupVerticalAlign": "Auto",
+    "ContextMenu.HorizontalStretch": "auto",
+    "ContextMenu.ToolTipRepresentation": "Auto",
+    "ContextMenu.VerticalStretch": "auto",
+    "Form.AutoSaveDataInSettings": "DontUse",
+    "Form.ChildItemsWidth": "Auto",
+    "Form.ChildrenAlign": "Auto",
+    "Form.CollapseItemsByImportanceVariant": "Auto",
+    "Form.CommandBarLocation": "Auto",
+    "Form.ConversationsRepresentation": "Auto",
+    "Form.EnterKeyBehavior": "ControlNavigation",
+    "Form.Group": "Vertical",
+    "Form.HorizontalAlign": "Auto",
+    "Form.HorizontalSpacing": "Auto",
+    "Form.SaveDataInSettings": "DontUse",
+    "Form.ScalingMode": "Auto",
+    "Form.VerticalAlign": "Auto",
+    "Form.VerticalScroll": "auto",
+    "Form.VerticalSpacing": "Auto",
+    "Form.WindowOpeningMode": "Independent",
+    "FormattedDocumentField.EditMode": "Enter",
+    "FormattedDocumentField.FixingInTable": "None",
+    "FormattedDocumentField.FooterHorizontalAlign": "Auto",
+    "FormattedDocumentField.GroupHorizontalAlign": "Auto",
+    "FormattedDocumentField.GroupVerticalAlign": "Auto",
+    "FormattedDocumentField.HeaderHorizontalAlign": "Left",
+    "FormattedDocumentField.HorizontalAlign": "Auto",
+    "FormattedDocumentField.OnMainServerUnavalableBehavior": "Auto",
+    "FormattedDocumentField.Output": "Auto",
+    "FormattedDocumentField.SkipOnInput": "auto",
+    "FormattedDocumentField.TitleLocation": "Auto",
+    "FormattedDocumentField.ToolTipRepresentation": "Auto",
+    "FormattedDocumentField.VerticalAlign": "Auto",
+    "FormattedDocumentField.WarningOnEditRepresentation": "Auto",
+    "GraphicalSchemaField.EditMode": "Enter",
+    "GraphicalSchemaField.FixingInTable": "None",
+    "GraphicalSchemaField.FooterHorizontalAlign": "Auto",
+    "GraphicalSchemaField.GroupHorizontalAlign": "Auto",
+    "GraphicalSchemaField.GroupVerticalAlign": "Auto",
+    "GraphicalSchemaField.HeaderHorizontalAlign": "Left",
+    "GraphicalSchemaField.HorizontalAlign": "Auto",
+    "GraphicalSchemaField.OnMainServerUnavalableBehavior": "Auto",
+    "GraphicalSchemaField.Output": "Auto",
+    "GraphicalSchemaField.SkipOnInput": "auto",
+    "GraphicalSchemaField.TitleLocation": "Auto",
+    "GraphicalSchemaField.ToolTipRepresentation": "Auto",
+    "GraphicalSchemaField.VerticalAlign": "Auto",
+    "GraphicalSchemaField.WarningOnEditRepresentation": "Auto",
+    "HTMLDocumentField.EditMode": "Enter",
+    "HTMLDocumentField.FixingInTable": "None",
+    "HTMLDocumentField.FooterHorizontalAlign": "Auto",
+    "HTMLDocumentField.GroupHorizontalAlign": "Auto",
+    "HTMLDocumentField.GroupVerticalAlign": "Auto",
+    "HTMLDocumentField.HeaderHorizontalAlign": "Left",
+    "HTMLDocumentField.HorizontalAlign": "Auto",
+    "HTMLDocumentField.OnMainServerUnavalableBehavior": "Auto",
+    "HTMLDocumentField.Output": "Auto",
+    "HTMLDocumentField.SkipOnInput": "auto",
+    "HTMLDocumentField.TitleLocation": "Auto",
+    "HTMLDocumentField.ToolTipRepresentation": "Auto",
+    "HTMLDocumentField.VerticalAlign": "Auto",
+    "HTMLDocumentField.WarningOnEditRepresentation": "Auto",
+    "InputField.AutoCapitalizationOnTextInput": "Auto",
+    "InputField.AutoChoiceIncomplete": "auto",
+    "InputField.AutoCorrectionOnTextInput": "Auto",
+    "InputField.AutoMarkIncomplete": "auto",
+    "InputField.AutoShowClearButtonMode": "Auto",
+    "InputField.AutoShowOpenButtonMode": "Auto",
+    "InputField.AutofillHint": "DontUse",
+    "InputField.ChoiceButton": "auto",
+    "InputField.ChoiceButtonRepresentation": "Auto",
+    "InputField.ChoiceFoldersAndItems": "Auto",
+    "InputField.ChoiceHistoryOnInput": "Auto",
+    "InputField.ChoiceListButton": "auto",
+    "InputField.ClearButton": "auto",
+    "InputField.CreateButton": "auto",
+    "InputField.DropListButton": "auto",
+    "InputField.EditMode": "Enter",
+    "InputField.EditTextUpdate": "Auto",
+    "InputField.ExtendedEdit": "auto",
+    "InputField.FixingInTable": "None",
+    "InputField.FooterHorizontalAlign": "Auto",
+    "InputField.GroupHorizontalAlign": "Auto",
+    "InputField.GroupVerticalAlign": "Auto",
+    "InputField.HeaderHorizontalAlign": "Left",
+    "InputField.HeightControlVariant": "Auto",
+    "InputField.HorizontalAlign": "Auto",
+    "InputField.HorizontalStretch": "auto",
+    "InputField.IncompleteChoiceMode": "OnEnterPressed",
+    "InputField.MarkNegatives": "auto",
+    "InputField.MultiLine": "auto",
+    "InputField.MultipleValuePictureShape": "Auto",
+    "InputField.MultipleValuePictureSize": "Auto",
+    "InputField.MultipleValuesHyperlink": "auto",
+    "InputField.OnMainServerUnavalableBehavior": "Auto",
+    "InputField.OnScreenKeyboardReturnKeyText": "Auto",
+    "InputField.OpenButton": "auto",
+    "InputField.PasswordMode": "auto",
+    "InputField.QuickChoice": "auto",
+    "InputField.ShowCheckBoxesInDropList": "auto",
+    "InputField.SkipOnInput": "auto",
+    "InputField.SpecialTextInputMode": "Auto",
+    "InputField.SpellCheckingOnTextInput": "Auto",
+    "InputField.SpinButton": "auto",
+    "InputField.TitleLocation": "Auto",
+    "InputField.ToolTipRepresentation": "Auto",
+    "InputField.VerticalAlign": "Auto",
+    "InputField.VerticalStretch": "auto",
+    "InputField.WarningOnEditRepresentation": "Auto",
+    "LabelDecoration.GroupHorizontalAlign": "Auto",
+    "LabelDecoration.GroupVerticalAlign": "Auto",
+    "LabelDecoration.HorizontalAlign": "Left",
+    "LabelDecoration.HorizontalStretch": "auto",
+    "LabelDecoration.OnMainServerUnavalableBehavior": "Auto",
+    "LabelDecoration.SkipOnInput": "auto",
+    "LabelDecoration.ToolTipRepresentation": "Auto",
+    "LabelDecoration.VerticalAlign": "Auto",
+    "LabelDecoration.VerticalStretch": "auto",
+    "LabelField.EditMode": "Enter",
+    "LabelField.FixingInTable": "None",
+    "LabelField.FooterHorizontalAlign": "Auto",
+    "LabelField.GroupHorizontalAlign": "Auto",
+    "LabelField.GroupVerticalAlign": "Auto",
+    "LabelField.HeaderHorizontalAlign": "Left",
+    "LabelField.HorizontalAlign": "Auto",
+    "LabelField.HorizontalStretch": "auto",
+    "LabelField.MarkNegatives": "auto",
+    "LabelField.OnMainServerUnavalableBehavior": "Auto",
+    "LabelField.PasswordMode": "auto",
+    "LabelField.SkipOnInput": "auto",
+    "LabelField.TitleLocation": "Auto",
+    "LabelField.ToolTipRepresentation": "Auto",
+    "LabelField.VerticalAlign": "Auto",
+    "LabelField.VerticalStretch": "auto",
+    "LabelField.WarningOnEditRepresentation": "Auto",
+    "Page.ChildItemsWidth": "Auto",
+    "Page.ChildrenAlign": "Auto",
+    "Page.Group": "Vertical",
+    "Page.GroupHorizontalAlign": "Auto",
+    "Page.GroupVerticalAlign": "Auto",
+    "Page.HorizontalAlign": "Auto",
+    "Page.HorizontalSpacing": "Auto",
+    "Page.HorizontalStretch": "auto",
+    "Page.ToolTipRepresentation": "Auto",
+    "Page.VerticalAlign": "Auto",
+    "Page.VerticalSpacing": "Auto",
+    "Page.VerticalStretch": "auto",
+    "Pages.CurrentRowUse": "Auto",
+    "Pages.GroupHorizontalAlign": "Auto",
+    "Pages.GroupVerticalAlign": "Auto",
+    "Pages.HorizontalStretch": "auto",
+    "Pages.PagesRepresentation": "Auto",
+    "Pages.ToolTipRepresentation": "Auto",
+    "Pages.VerticalStretch": "auto",
+    "PeriodField.EditMode": "Enter",
+    "PeriodField.FixingInTable": "None",
+    "PeriodField.FooterHorizontalAlign": "Auto",
+    "PeriodField.GroupHorizontalAlign": "Auto",
+    "PeriodField.GroupVerticalAlign": "Auto",
+    "PeriodField.HeaderHorizontalAlign": "Left",
+    "PeriodField.HorizontalAlign": "Auto",
+    "PeriodField.OnMainServerUnavalableBehavior": "Auto",
+    "PeriodField.SkipOnInput": "auto",
+    "PeriodField.TitleLocation": "Auto",
+    "PeriodField.ToolTipRepresentation": "Auto",
+    "PeriodField.VerticalAlign": "Auto",
+    "PeriodField.WarningOnEditRepresentation": "Auto",
+    "PictureDecoration.FileDragMode": "AsFileRef",
+    "PictureDecoration.GroupHorizontalAlign": "Auto",
+    "PictureDecoration.GroupVerticalAlign": "Auto",
+    "PictureDecoration.HorizontalStretch": "auto",
+    "PictureDecoration.OnMainServerUnavalableBehavior": "Auto",
+    "PictureDecoration.PictureSize": "RealSize",
+    "PictureDecoration.SkipOnInput": "auto",
+    "PictureDecoration.ToolTipRepresentation": "Auto",
+    "PictureDecoration.VerticalStretch": "auto",
+    "PictureField.EditMode": "Enter",
+    "PictureField.FileDragMode": "AsFileRef",
+    "PictureField.FixingInTable": "None",
+    "PictureField.FooterHorizontalAlign": "Auto",
+    "PictureField.GroupHorizontalAlign": "Auto",
+    "PictureField.GroupVerticalAlign": "Auto",
+    "PictureField.HeaderHorizontalAlign": "Left",
+    "PictureField.HorizontalAlign": "Auto",
+    "PictureField.OnMainServerUnavalableBehavior": "Auto",
+    "PictureField.PictureSize": "RealSize",
+    "PictureField.SkipOnInput": "auto",
+    "PictureField.TitleLocation": "Auto",
+    "PictureField.ToolTipRepresentation": "Auto",
+    "PictureField.VerticalAlign": "Auto",
+    "PictureField.WarningOnEditRepresentation": "Auto",
+    "PlannerField.EditMode": "Enter",
+    "PlannerField.FixingInTable": "None",
+    "PlannerField.FooterHorizontalAlign": "Auto",
+    "PlannerField.GroupHorizontalAlign": "Auto",
+    "PlannerField.GroupVerticalAlign": "Auto",
+    "PlannerField.HeaderHorizontalAlign": "Left",
+    "PlannerField.HorizontalAlign": "Auto",
+    "PlannerField.OnMainServerUnavalableBehavior": "Auto",
+    "PlannerField.SkipOnInput": "auto",
+    "PlannerField.TitleLocation": "Auto",
+    "PlannerField.ToolTipRepresentation": "Auto",
+    "PlannerField.VerticalAlign": "Auto",
+    "PlannerField.WarningOnEditRepresentation": "Auto",
+    "Popup.GroupHorizontalAlign": "Auto",
+    "Popup.GroupVerticalAlign": "Auto",
+    "Popup.HorizontalStretch": "auto",
+    "Popup.PlacementArea": "userCmds",
+    "Popup.Representation": "Auto",
+    "Popup.Shape": "Auto",
+    "Popup.ShapeRepresentation": "Auto",
+    "Popup.ToolTipRepresentation": "Auto",
+    "Popup.VerticalStretch": "auto",
+    "ProgressBarField.EditMode": "Enter",
+    "ProgressBarField.FixingInTable": "None",
+    "ProgressBarField.FooterHorizontalAlign": "Auto",
+    "ProgressBarField.GroupHorizontalAlign": "Auto",
+    "ProgressBarField.GroupVerticalAlign": "Auto",
+    "ProgressBarField.HeaderHorizontalAlign": "Left",
+    "ProgressBarField.HorizontalAlign": "Auto",
+    "ProgressBarField.OnMainServerUnavalableBehavior": "Auto",
+    "ProgressBarField.Orientation": "Horizontal",
+    "ProgressBarField.Representation": "Smooth",
+    "ProgressBarField.SkipOnInput": "auto",
+    "ProgressBarField.TitleLocation": "Auto",
+    "ProgressBarField.ToolTipRepresentation": "Auto",
+    "ProgressBarField.VerticalAlign": "Auto",
+    "ProgressBarField.WarningOnEditRepresentation": "Auto",
+    "RadioButtonField.EditMode": "Enter",
+    "RadioButtonField.EqualColumnsWidth": "auto",
+    "RadioButtonField.FixingInTable": "None",
+    "RadioButtonField.FooterHorizontalAlign": "Auto",
+    "RadioButtonField.GroupHorizontalAlign": "Auto",
+    "RadioButtonField.GroupVerticalAlign": "Auto",
+    "RadioButtonField.HeaderHorizontalAlign": "Left",
+    "RadioButtonField.HorizontalAlign": "Auto",
+    "RadioButtonField.OnMainServerUnavalableBehavior": "Auto",
+    "RadioButtonField.SkipOnInput": "auto",
+    "RadioButtonField.TitleLocation": "Auto",
+    "RadioButtonField.ToolTipRepresentation": "Auto",
+    "RadioButtonField.VerticalAlign": "Auto",
+    "RadioButtonField.WarningOnEditRepresentation": "Auto",
+    "SpreadSheetDocumentField.DrawingSelectionShowMode": "Auto",
+    "SpreadSheetDocumentField.EditMode": "Enter",
+    "SpreadSheetDocumentField.FixingInTable": "None",
+    "SpreadSheetDocumentField.FooterHorizontalAlign": "Auto",
+    "SpreadSheetDocumentField.GroupHorizontalAlign": "Auto",
+    "SpreadSheetDocumentField.GroupVerticalAlign": "Auto",
+    "SpreadSheetDocumentField.HeaderHorizontalAlign": "Left",
+    "SpreadSheetDocumentField.HorizontalAlign": "Auto",
+    "SpreadSheetDocumentField.OnMainServerUnavalableBehavior": "Auto",
+    "SpreadSheetDocumentField.Output": "Auto",
+    "SpreadSheetDocumentField.PointerType": "Special",
+    "SpreadSheetDocumentField.SelectionShowMode": "Always",
+    "SpreadSheetDocumentField.SkipOnInput": "auto",
+    "SpreadSheetDocumentField.TitleLocation": "Auto",
+    "SpreadSheetDocumentField.ToolTipRepresentation": "Auto",
+    "SpreadSheetDocumentField.VerticalAlign": "Auto",
+    "SpreadSheetDocumentField.ViewScalingMode": "Auto",
+    "SpreadSheetDocumentField.WarningOnEditRepresentation": "Auto",
+    "Table.AutoAddIncomplete": "auto",
+    "Table.AutoMarkIncomplete": "auto",
+    "Table.BehaviorOnHorizontalCompression": "Auto",
+    "Table.CommandBarLocation": "Auto",
+    "Table.CurrentRowUse": "Auto",
+    "Table.FileDragMode": "AsFileRef",
+    "Table.GroupHorizontalAlign": "Auto",
+    "Table.GroupVerticalAlign": "Auto",
+    "Table.HeightControlVariant": "Auto",
+    "Table.HorizontalScrollBar": "AutoUse",
+    "Table.InitialListView": "Auto",
+    "Table.InitialTreeView": "NoExpand",
+    "Table.OnMainServerUnavalableBehavior": "Auto",
+    "Table.Output": "Auto",
+    "Table.RefreshRequest": "None",
+    "Table.Representation": "HierarchicalList",
+    "Table.RowInputMode": "EndOfList",
+    "Table.RowSelectionMode": "Cell",
+    "Table.SearchControlLocation": "Auto",
+    "Table.SearchOnInput": "Auto",
+    "Table.SearchStringLocation": "Auto",
+    "Table.SelectionMode": "MultiRow",
+    "Table.SkipOnInput": "auto",
+    "Table.TitleLocation": "None",
+    "Table.ToolTipRepresentation": "Auto",
+    "Table.VerticalScrollBar": "AutoUse",
+    "Table.ViewStatusLocation": "Auto",
+    "TextDocumentField.EditMode": "Enter",
+    "TextDocumentField.FixingInTable": "None",
+    "TextDocumentField.FooterHorizontalAlign": "Auto",
+    "TextDocumentField.GroupHorizontalAlign": "Auto",
+    "TextDocumentField.GroupVerticalAlign": "Auto",
+    "TextDocumentField.HeaderHorizontalAlign": "Left",
+    "TextDocumentField.HorizontalAlign": "Auto",
+    "TextDocumentField.OnMainServerUnavalableBehavior": "Auto",
+    "TextDocumentField.Output": "Auto",
+    "TextDocumentField.SkipOnInput": "auto",
+    "TextDocumentField.TitleLocation": "Auto",
+    "TextDocumentField.ToolTipRepresentation": "Auto",
+    "TextDocumentField.VerticalAlign": "Auto",
+    "TextDocumentField.WarningOnEditRepresentation": "Auto",
+    "TrackBarField.EditMode": "Enter",
+    "TrackBarField.FixingInTable": "None",
+    "TrackBarField.FooterHorizontalAlign": "Auto",
+    "TrackBarField.GroupHorizontalAlign": "Auto",
+    "TrackBarField.GroupVerticalAlign": "Auto",
+    "TrackBarField.HeaderHorizontalAlign": "Left",
+    "TrackBarField.HorizontalAlign": "Auto",
+    "TrackBarField.MarkingAppearance": "BottomRight",
+    "TrackBarField.OnMainServerUnavalableBehavior": "Auto",
+    "TrackBarField.Orientation": "Horizontal",
+    "TrackBarField.SkipOnInput": "auto",
+    "TrackBarField.TitleLocation": "Auto",
+    "TrackBarField.ToolTipRepresentation": "Auto",
+    "TrackBarField.VerticalAlign": "Auto",
+    "TrackBarField.WarningOnEditRepresentation": "Auto",
+    "UsualGroup.Behavior": "Auto",
+    "UsualGroup.ChildItemsWidth": "Auto",
+    "UsualGroup.ChildrenAlign": "Auto",
+    "UsualGroup.ControlRepresentation": "TitleHyperlink",
+    "UsualGroup.CurrentRowUse": "Auto",
+    "UsualGroup.Group": "HorizontalIfPossible",
+    "UsualGroup.GroupHorizontalAlign": "Auto",
+    "UsualGroup.GroupVerticalAlign": "Auto",
+    "UsualGroup.HorizontalAlign": "Auto",
+    "UsualGroup.HorizontalSpacing": "Auto",
+    "UsualGroup.HorizontalStretch": "auto",
+    "UsualGroup.Representation": "WeakSeparation",
+    "UsualGroup.ThroughAlign": "Auto",
+    "UsualGroup.ToolTipRepresentation": "Auto",
+    "UsualGroup.VerticalAlign": "Auto",
+    "UsualGroup.VerticalSpacing": "Auto",
+    "UsualGroup.VerticalStretch": "auto",
+}
+# --- /Перечисления свойств формы ---
+
+# Порядок дочерних тегов элемента (копия form-compile; держат check-enum-drift и check-inline-drift)
+CHILD_TAG_ORDER = {
+    "AutoCommandBar": "HorizontalAlign Autofill ChildItems",
+    "Button": "Type Visible TitleHeight UserVisible Representation DefaultButton SkipOnInput Enabled DefaultItem Width AutoMaxWidth MaxWidth Height AutoMaxHeight HorizontalStretch MaxHeight VerticalStretch GroupHorizontalAlign Check GroupVerticalAlign CommandName Parameter DataPath TextColor BackColor BorderColor Font Picture Title Shape ToolTipRepresentation RepresentationInContextMenu ShapeRepresentation PictureLocation LocationInCommandBar CommandUniqueness ExtendedTooltip",
+    "ButtonGroup": "EnableContentChange Visible Title GroupVerticalAlign ToolTip HorizontalStretch GroupHorizontalAlign ToolTipRepresentation CommandSource Representation VerticalStretch ExtendedTooltip ChildItems",
+    "CalendarField": "DataPath SkipOnInput Title TitleLocation ToolTip ToolTipRepresentation Width AutoMaxWidth Height HorizontalStretch SelectionMode ShowCurrentDate ShowMonthsPanel WidthInMonths HeightInMonths ContextMenu ExtendedTooltip Events",
+    "ChartField": "DataPath Enabled Title TitleFont Visible TitleLocation GroupHorizontalAlign Width AutoMaxWidth MaxHeight MaxWidth Height AutoMaxHeight HorizontalStretch VerticalStretch ContextMenu ExtendedTooltip Events",
+    "CheckBoxField": "DataPath Visible Enabled UserVisible DefaultItem ReadOnly SkipOnInput Title TitleTextColor TitleFont TitleLocation TitleHeight ToolTip FooterHorizontalAlign HorizontalAlign ToolTipRepresentation Shortcut GroupHorizontalAlign VerticalAlign GroupVerticalAlign WarningOnEditRepresentation WarningOnEdit EditMode AutoCellHeight CellHyperlink FixingInTable ShowInHeader FooterDataPath HeaderPicture HeaderHorizontalAlign ShowInFooter CheckBoxType EditFormat ItemHeight ItemTitleHeight ItemWidth EqualItemsWidth ThreeState ContextMenu ExtendedTooltip Events",
+    "ColumnGroup": "Visible Enabled ReadOnly UserVisible EnableContentChange Title GroupVerticalAlign TitleFont TitleTextColor ToolTip ToolTipRepresentation Width Height HorizontalStretch GroupHorizontalAlign VerticalStretch Group ShowTitle ShowInHeader HeaderDataPath HeaderHorizontalAlign HeaderFormat HeaderPicture FixingInTable ExtendedTooltip ChildItems",
+    "CommandBar": "Enabled Visible EnableContentChange Title ToolTip ToolTipRepresentation Width Height HorizontalStretch VerticalStretch GroupHorizontalAlign GroupVerticalAlign HorizontalLocation CommandSource ExtendedTooltip ChildItems",
+    "FormattedDocumentField": "DataPath DefaultItem Enabled ReadOnly SkipOnInput Title TitleLocation CommandSet Font ToolTip EditMode Width AutoMaxWidth Height AutoMaxHeight BorderColor HorizontalStretch MaxWidth ContextMenu ExtendedTooltip Events",
+    "GanttChartField": "DataPath DefaultItem TitleLocation Width Height HorizontalStretch VerticalStretch ContextMenu ExtendedTooltip Table Events",
+    "GraphicalSchemaField": "DataPath DefaultItem ReadOnly Title TitleLocation WarningOnEditRepresentation Width Height Edit ContextMenu ExtendedTooltip Events",
+    "HTMLDocumentField": "DataPath DefaultItem Enabled ReadOnly SkipOnInput Title TitleTextColor TitleFont TitleLocation ToolTipRepresentation Visible WarningOnEditRepresentation Width AutoMaxWidth MaxWidth Height AutoMaxHeight MaxHeight HorizontalStretch VerticalStretch Output BorderColor ContextMenu ExtendedTooltip Events",
+    "InputField": "DataPath Visible UserVisible DefaultItem Enabled ReadOnly SkipOnInput Title TitleBackColor TitleTextColor TitleFont TitleLocation TitleHeight ToolTip ToolTipRepresentation WarningOnEditRepresentation WarningOnEdit Shortcut HorizontalAlign VerticalAlign GroupHorizontalAlign GroupVerticalAlign EditMode CellHyperlink FixingInTable AutoCellHeight ShowInHeader HeaderHorizontalAlign HeaderPicture ShowInFooter FooterDataPath FooterText FooterTextColor FooterFont FooterHorizontalAlign FooterPicture Width AutoMaxWidth MaxWidth Height AutoMaxHeight MaxHeight HorizontalStretch AllowInputEmptyMultipleValues MultipleValuesFont MultipleValuesTextColor MultipleValuesBackColor VerticalStretch Wrap MarkNegatives PasswordMode MultiLine ExtendedEdit DropListButton ChoiceButton ChoiceButtonRepresentation ClearButton SpinButton OpenButton CreateButton Mask ListChoiceMode ExtendedEditMultipleValues AutoChoiceIncomplete Format MultipleValuePictureShape QuickChoice ChoiceFoldersAndItems EditFormat AutoMarkIncomplete ChooseType AutoShowOpenButtonMode IncompleteChoiceMode ShowCheckBoxesInDropList MultipleValueDataPath MultipleValuePictureDataPath MultipleValuePresentDataPath SpellCheckingOnTextInput TypeDomainEnabled TextEdit AvailableTypes ChoiceForm ChoiceParameterLinks ChoiceParameters EditTextUpdate MinValue ChoiceButtonPicture MaxValue ChoiceList AutoCorrectionOnTextInput AutoShowClearButtonMode ChoiceListButton ChoiceListHeight DropListWidth TextColor BackColor BorderColor Font HeightControlVariant SpecialTextInputMode InputHint ChoiceHistoryOnInput TypeLink ContextMenu ExtendedTooltip Events",
+    "LabelDecoration": "UserVisible Visible Enabled Width AutoMaxWidth MaxWidth Height AutoMaxHeight MaxHeight HorizontalStretch VerticalStretch SkipOnInput TextColor Font Shortcut Title ToolTip ToolTipRepresentation GroupHorizontalAlign GroupVerticalAlign Hyperlink HorizontalAlign VerticalAlign BackColor BorderColor Border TitleHeight ContextMenu ExtendedTooltip Events",
+    "LabelField": "DataPath Visible Enabled UserVisible DefaultItem ReadOnly SkipOnInput Title TitleTextColor TitleFont TitleLocation TitleHeight ToolTip ToolTipRepresentation HorizontalAlign VerticalAlign GroupHorizontalAlign GroupVerticalAlign WarningOnEditRepresentation WarningOnEdit EditMode FixingInTable CellHyperlink AutoCellHeight FooterText ShowInHeader HeaderHorizontalAlign FooterDataPath HeaderPicture ShowInFooter FooterHorizontalAlign Width AutoMaxWidth MaxWidth Height AutoMaxHeight MaxHeight HorizontalStretch MarkNegatives VerticalStretch Format Border BorderColor Hiperlink PasswordMode TextColor BackColor Font ContextMenu ExtendedTooltip Events",
+    "Page": "Visible Enabled ReadOnly EnableContentChange UserVisible Title GroupVerticalAlign Shortcut TitleTextColor TitleFont ToolTip ToolTipRepresentation Width Height HorizontalStretch VerticalStretch ChildrenAlign Picture Format Group ChildItemsWidth HorizontalSpacing VerticalSpacing HorizontalAlign VerticalAlign ShowTitle BackColor TitleDataPath ScrollOnCompress ExtendedTooltip ChildItems",
+    "Pages": "Enabled ReadOnly EnableContentChange UserVisible Visible Title TitleFont ToolTip ToolTipRepresentation Width Height HorizontalStretch VerticalStretch GroupHorizontalAlign GroupVerticalAlign PagesRepresentation CurrentRowUse ExtendedTooltip Events ChildItems",
+    "PeriodField": "DataPath TitleLocation ContextMenu ExtendedTooltip",
+    "PictureDecoration": "Enabled Visible Width AutoMaxWidth MaxWidth Height AutoMaxHeight MaxHeight HorizontalStretch VerticalStretch SkipOnInput TextColor Font Title ToolTip ToolTipRepresentation GroupHorizontalAlign GroupVerticalAlign Hyperlink PictureSize Zoomable ImageScale NonselectedPictureText EnableStartDrag EnableDrag Picture BorderColor Border FileDragMode ContextMenu ExtendedTooltip Events",
+    "PictureField": "DataPath TitleBackColor UserVisible Visible Enabled ReadOnly SkipOnInput Title TitleTextColor TitleLocation TitleHeight ToolTip GroupHorizontalAlign GroupVerticalAlign Shortcut ToolTipRepresentation HorizontalAlign WarningOnEditRepresentation EditMode AutoCellHeight FixingInTable CellHyperlink ShowInHeader FooterDataPath HeaderPicture FooterText HeaderHorizontalAlign ShowInFooter FooterHorizontalAlign Width AutoMaxWidth MaxWidth Height AutoMaxHeight MaxHeight HorizontalStretch VerticalStretch PictureSize Zoomable Hyperlink NonselectedPictureText EnableDrag TextColor ValuesPicture BorderColor Border Font FileDragMode ContextMenu ExtendedTooltip Events",
+    "PlannerField": "DataPath TitleLocation ContextMenu ExtendedTooltip Events",
+    "Popup": "UserVisible Visible EnableContentChange Title Shape TitleTextColor TitleFont ToolTip ToolTipRepresentation VerticalStretch Width HorizontalStretch Picture CommandSource Representation BackColor ShapeRepresentation BorderColor ExtendedTooltip ChildItems",
+    "ProgressBarField": "DataPath Title Visible ReadOnly TitleLocation ToolTip ToolTipRepresentation Width AutoMaxHeight AutoMaxWidth HorizontalStretch MaxValue ShowPercent ContextMenu ExtendedTooltip",
+    "RadioButtonField": "DataPath DefaultItem Enabled SkipOnInput UserVisible Visible ReadOnly Title TitleTextColor TitleFont TitleLocation FooterHorizontalAlign TitleHeight ToolTip ToolTipRepresentation EditMode GroupHorizontalAlign Shortcut VerticalAlign GroupVerticalAlign WarningOnEditRepresentation WarningOnEdit RadioButtonType ItemHeight ItemTitleHeight ItemWidth ColumnsCount EqualColumnsWidth ChoiceList Font TextColor ContextMenu ExtendedTooltip Events",
+    "SpreadSheetDocumentField": "DataPath Enabled ReadOnly SkipOnInput UserVisible Visible DefaultItem Title TitleLocation DrawingSelectionShowMode FooterHorizontalAlign GroupHorizontalAlign ToolTip ToolTipRepresentation CommandSet Width AutoMaxWidth MaxWidth Height AutoMaxHeight MaxHeight HorizontalStretch VerticalStretch ShowGrid ShowHeaders VerticalScrollBar HorizontalScrollBar Protection SelectionShowMode Edit Output PointerType ShowGroups EnableStartDrag EnableDrag BorderColor ShowCellNames ShowRowAndColumnNames ViewScalingMode ContextMenu ExtendedTooltip Events",
+    "Table": "Representation Visible UserVisible TitleLocation CommandBarLocation Autofill Enabled TitleHeight ReadOnly SkipOnInput DefaultItem ChangeRowSet ChangeRowOrder Width AutoMaxWidth MaxWidth Height AutoMaxHeight MaxHeight HeightInTableRows HeightControlVariant AutoMaxRowsCount MaxRowsCount ChoiceMode MultipleChoice RowInputMode SelectionMode RowSelectionMode Header FooterHeight HeaderHeight Footer HorizontalScrollBar VerticalScrollBar HorizontalLines VerticalLines UseAlternationRowColor AutoInsertNewRow AutoAddIncomplete AutoMarkIncomplete SearchOnInput InitialListView InitialTreeView HorizontalStretch Output VerticalStretch EnableStartDrag EnableDrag FileDragMode DataPath Font RowPictureDataPath RowsPicture BackColor BorderColor TextColor Title BehaviorOnHorizontalCompression GroupVerticalAlign Shortcut TitleTextColor TitleFont CommandSet ToolTip ToolTipRepresentation SearchStringLocation ViewStatusLocation SearchControlLocation GroupHorizontalAlign CurrentRowUse RefreshRequest AutoRefresh AutoRefreshPeriod Period ChoiceFoldersAndItems RestoreCurrentRow RowFilter TopLevelParent ShowRoot AllowRootChoice UpdateOnDataChange UserSettingsGroup AllowGettingCurrentRowURL ViewMode SettingsNamedItemDetailedRepresentation ContextMenu AutoCommandBar ExtendedTooltip SearchStringAddition ViewStatusAddition SearchControlAddition Events ChildItems",
+    "TextDocumentField": "DataPath DefaultItem ReadOnly Title TitleFont TitleLocation EditMode ToolTip Width AutoMaxWidth Font MaxWidth Height AutoMaxHeight ContextMenu ExtendedTooltip Events",
+    "TrackBarField": "DataPath Title TitleLocation HorizontalAlign ToolTip ToolTipRepresentation Width AutoMaxWidth HorizontalStretch MaxWidth Height AutoMaxHeight MinValue MarkingAppearance MaxValue LargeStep Step MarkingStep ContextMenu ExtendedTooltip Events",
+    "UsualGroup": "UserVisible Visible Enabled ReadOnly EnableContentChange Title TitleTextColor TitleFont ToolTip ToolTipRepresentation Shortcut Width Height HorizontalStretch VerticalStretch GroupHorizontalAlign GroupVerticalAlign Group ChildrenAlign HorizontalSpacing VerticalSpacing HorizontalAlign VerticalAlign Behavior CollapsedRepresentationTitle Collapsed ControlRepresentation Representation CurrentRowUse Format ShowLeftMargin United ChildItemsWidth ShowTitle BackColor ThroughAlign TitleDataPath ExtendedTooltip ChildItems",
+}
+CHILD_RANK = {t: {c: i for i, c in enumerate(v.split(" "))} for t, v in CHILD_TAG_ORDER.items()}
+
+
+def get_child_rank(parent_tag, child_tag):
+    return CHILD_RANK.get(parent_tag, {}).get(child_tag, -1)
 
 
 def main():
@@ -187,32 +883,12 @@ def main():
     root = tree.getroot()
 
     # Detect context: config vs EPF/ERF
-    is_config_context = False
-    config_xml_path = ''
-    version_anchor = ''
-    walk_dir = os.path.dirname(os.path.abspath(form_path))
-    for _ in range(15):
-        parent = os.path.dirname(walk_dir)
-        if parent == walk_dir:
-            break
-        # Порядок проверок тот же, что у detect_format_version: сначала корень автономной обработки,
-        # потом Configuration.xml — иначе форма внутри EPF, лежащей в дереве конфигурации, взяла бы
-        # версию конфигурации.
-        ext_root = walk_dir + '.xml'
-        if not version_anchor:
-            if _sg_is_external_root(ext_root):
-                # Ближайший якорь побеждает: автономная обработка остаётся автономной, даже если её
-                # исходники лежат внутри дерева с Configuration.xml (типовая раскладка проекта:
-                # src/cf рядом с src/epf). Иначе её собственные External*-типы считались бы ошибкой.
-                version_anchor = ext_root
-                break
-        if os.path.isfile(os.path.join(walk_dir, 'Configuration.xml')):
-            is_config_context = True
-            config_xml_path = os.path.join(walk_dir, 'Configuration.xml')
-            if not version_anchor:
-                version_anchor = config_xml_path
-            break
-        walk_dir = parent
+    # Ближайший якорь выгрузки вверх от формы. Configuration.xml → конфигурация; корень EPF/ERF → внешняя
+    # обработка/отчёт. Ближайший побеждает: автономная обработка остаётся автономной, даже если её
+    # исходники лежат внутри дерева с Configuration.xml (типовая раскладка проекта: src/cf рядом с
+    # src/epf). Иначе её собственные External*-типы считались бы ошибкой.
+    dump_anchor = find_dump_anchor(os.path.dirname(os.path.abspath(form_path)))
+    is_config_context = bool(dump_anchor) and os.path.basename(dump_anchor) == 'Configuration.xml'
 
     errors = 0
     warnings = 0
@@ -898,7 +1574,9 @@ def main():
             elif tv.startswith("cfg:"):
                 suffix = tv[4:]  # after "cfg:"
                 prefix = suffix.split(".")[0]
-                if prefix in VALID_CFG_PREFIXES or suffix == "DynamicList":
+                # Тип без имени объекта: динамический список, набор констант, любой отчёт — ровно те три,
+                # что встречаются в формах корпуса (УТ, ERP, БП, УНФ); иное без имени — вероятная опечатка
+                if ("." in suffix and prefix in VALID_CFG_PREFIXES) or suffix in ("DynamicList", "ConstantsSet", "ReportObject"):
                     # ExternalDataProcessorObject/ExternalReportObject valid only in EPF/ERF context
                     if is_config_context and prefix in ('ExternalDataProcessorObject', 'ExternalReportObject'):
                         report_error(f'12. Type "{tv}": External* type in configuration context (use DataProcessorObject/ReportObject instead)')
@@ -957,22 +1635,109 @@ def main():
         elif prefix_errors == 0:
             report_ok(f'13. Namespace prefixes: {prefix_checked} values, all declared')
 
-    # --- Check 14: версия формата формы совпадает с версией выгрузки ---
-    # Версию задаёт платформа, которой выгружали, и в пределах одной выгрузки она едина. Форма из
-    # другой версии — «Неизвестная версия формата N загружаемого файла»: платформа не читает файл,
-    # который новее её самой. Источник версии ищем общим helper-ом: он же покрывает автономную
-    # внешнюю обработку/отчёт, где Configuration.xml нет и версию несёт корень самой обработки.
-    if not stopped and version_anchor:
+    # --- Check 14: версия формата формы — как у её дескриптора; сверка с выгрузкой ---
+    # Тело формы и дескриптор Forms/<Имя>.xml (у общей формы — CommonForms/<Имя>.xml) платформа загружает
+    # только в одной версии: «Версия формата загружаемого файла … отличается от версии формата ранее
+    # загруженных файлов». С остальной выгрузкой форма может расходиться — платформа такое грузит, это
+    # лишь неоднородность выгрузки (типично после мержа веток, выгруженных разными платформами).
+    if not stopped:
         form_ver = root.get('version', '')
-        dump_ver = detect_format_version(os.path.dirname(os.path.abspath(form_path)))
+        owner_path = ext_body_owner(os.path.abspath(form_path))
+        owner_ver = root_version(owner_path) if owner_path else None
+        dump_ver = root_version(dump_anchor) if dump_anchor else None
+
+        # У заимствованной формы расширения второй штамп — <BaseForm version=…>; платформа сверяет с дескриптором и его.
+        base_form_ver = ''
+        for ch in root:
+            if isinstance(ch.tag, str) and etree.QName(ch.tag).localname == 'BaseForm':
+                base_form_ver = ch.get('version', '')
+                break
 
         if not form_ver:
             report_ok('14. Format version: not comparable')
-        elif form_ver != dump_ver:
-            report_error(f'14. Format version {form_ver} differs from the dump ({dump_ver}) '
-                         '— a dump carries one version, the platform refuses a file it cannot read')
-        else:
-            report_ok(f'14. Format version: {form_ver}, matches the dump')
+        elif owner_ver and form_ver != owner_ver:
+            report_error(f'14. Format version {form_ver} differs from the form descriptor '
+                         f'{os.path.basename(owner_path)} ({owner_ver}) '
+                         '— the platform refuses to load parts of one object in different formats')
+        elif owner_ver and base_form_ver and base_form_ver != owner_ver:
+            report_error(f'14. <BaseForm> format version {base_form_ver} differs from the form descriptor '
+                         f'{os.path.basename(owner_path)} ({owner_ver}) '
+                         '— the platform refuses to load parts of one object in different formats')
+        elif dump_ver and form_ver != dump_ver:
+            report_warn(f'14. Format version {form_ver} differs from the dump ({dump_ver}) — the platform loads it, '
+                        'but the dump is no longer uniform (typical after merging branches dumped by different platforms)')
+        elif owner_ver or dump_ver:
+            report_ok(f'14. Format version: {form_ver}, matches the descriptor and the dump')
+
+    # Элементы формы, которые сверяются: корень и элементы известных типов (вне <BaseForm> — его пишет платформа)
+    def enum_check_nodes():
+        out = [(root, 'Form')]
+        for n in root.iter():
+            if not isinstance(n.tag, str) or n.get('name') is None:
+                continue
+            q = etree.QName(n.tag)
+            if q.namespace != F_NS or q.localname not in CHILD_TAG_ORDER:
+                continue
+            if any(isinstance(a.tag, str) and etree.QName(a.tag).localname == 'BaseForm' for a in n.iterancestors()):
+                continue
+            out.append((n, q.localname))
+        return out
+
+    # --- Check 15: значения свойств-перечислений ---
+    # Платформа читает перечисление по точному имени: значение в другом регистре или вне списка — ошибка
+    # загрузки XDTO. Старое имя (синоним) платформа примет и переведёт в современное — предупреждение.
+    if not stopped:
+        enum_checked = 0
+        check15_ok = True
+        for node, typ in enum_check_nodes():
+            if stopped:
+                break
+            label = 'Form' if typ == 'Form' else f"{typ} '{node.get('name', '')}'"
+            for c in node:
+                if not isinstance(c.tag, str) or etree.QName(c.tag).namespace != F_NS:
+                    continue
+                if any(isinstance(x.tag, str) for x in c) or not (c.text or ''):
+                    continue
+                prop = etree.QName(c.tag).localname
+                allowed = valid_enum_values.get(f'{typ}.{prop}') or valid_enum_values.get(prop)
+                if not allowed:
+                    continue
+                val = c.text
+                enum_checked += 1
+                if val in enum_value_aliases and enum_value_aliases[val] in allowed and val in allowed:
+                    report_warn(f"15. {label}: {prop} '{val}' is an old name — the platform converts it to '{enum_value_aliases[val]}'")
+                elif val not in allowed:
+                    hint = [a for a in allowed if a.lower() == val.lower()]
+                    if hint:
+                        report_error(f"15. {label}: {prop} '{val}' — wrong case, the platform will not load it; use '{hint[0]}'")
+                    else:
+                        report_error(f"15. {label}: {prop} has invalid value '{val}' (allowed: {', '.join(allowed)})")
+                    check15_ok = False
+        if check15_ok:
+            report_ok(f'15. Enum values: {enum_checked} checked')
+
+    # --- Check 16: порядок свойств элемента ---
+    # Платформа пишет дочерние теги в своём порядке (таблица — по корпусу выгрузок). Чужой порядок она
+    # принимает и переставляет при выгрузке — предупреждение, а не ошибка.
+    if not stopped:
+        order_bad = 0
+        for node, typ in enum_check_nodes():
+            if typ == 'Form':
+                continue
+            prev, prev_rank = None, -1
+            for c in node:
+                if not isinstance(c.tag, str):
+                    continue
+                r = get_child_rank(typ, etree.QName(c.tag).localname)
+                if r < 0:
+                    continue
+                if r < prev_rank:
+                    report_warn(f"16. {typ} '{node.get('name', '')}': <{etree.QName(c.tag).localname}> stands after <{prev}>, the platform writes it before — it reorders them on dump")
+                    order_bad += 1
+                    break
+                prev, prev_rank = etree.QName(c.tag).localname, r
+        if order_bad == 0:
+            report_ok('16. Property order: matches the platform')
 
     # --- Finalize ---
     checks = ok_count + errors + warnings

@@ -1,4 +1,4 @@
-﻿# epf-build v1.17 — Build external data processor or report (EPF/ERF) from XML sources
+﻿# epf-build v1.21 — Build external data processor or report (EPF/ERF) from XML sources
 # Source: https://github.com/Nikolay-Shirokov/cc-1c-skills
 # NB: *nix-раскладку платформы (/opt/1cv8/<ver>/1cv8, без .exe) знает только .py-порт — PS на *nix не исполняется.
 <#
@@ -32,6 +32,9 @@
 
 .PARAMETER OutputFile
     Путь к выходному EPF/ERF-файлу
+
+.PARAMETER ConfigSrc
+    Каталог XML-выгрузки целевой конфигурации (общие модули для проверки исходников)
 
 .PARAMETER AdditionalV8Arguments
     Дополнительные аргументы запуска 1cv8.exe (например /UseHwLicenses+)
@@ -80,6 +83,10 @@ param(
     # Контексты синтаксической проверки. По умолчанию ThinClient,Server.
     [Parameter(Mandatory=$false)]
     [string]$Context,
+    # Выгрузка конфигурации, в которой будет работать обработка: её общие модули видны проверке.
+    # Без параметра берётся configSrc базы из .v8-project.json.
+    [Parameter(Mandatory=$false)]
+    [string]$ConfigSrc,
 
     [Parameter(Mandatory=$false)]
     [string[]]$AdditionalV8Arguments = @(),
@@ -87,6 +94,11 @@ param(
     [Parameter(Mandatory=$false)]
     [string[]]$AdditionalIbcmdArguments = @()
 )
+
+# Необработанная ошибка (напр. привязка параметра) внутри try/finally без catch завершала
+# скрипт с кодом 0 — ложный успех без запуска платформы. Любая такая ошибка — код 1.
+# py-порт: необработанное исключение и так даёт код 1.
+trap { Write-Host "Error: $($_.Exception.Message) ($($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber))" -ForegroundColor Red; exit 1 }
 
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -262,6 +274,7 @@ $V8Path = ConvertTo-CleanPath $V8Path '-V8Path'
 $InfoBasePath = ConvertTo-CleanPath $InfoBasePath '-InfoBasePath'
 $SourceFile = ConvertTo-CleanPath $SourceFile '-SourceFile'
 $OutputFile = ConvertTo-CleanPath $OutputFile '-OutputFile'
+$ConfigSrc = ConvertTo-CleanPath $ConfigSrc '-ConfigSrc'
 
 function Assert-InfoBaseExists {
     # These skills work on a ready infobase. Saying so up front beats the platform's
@@ -276,8 +289,52 @@ function Assert-InfoBaseExists {
 
 Assert-InfoBaseExists $InfoBasePath
 
+# --- Запись базы в .v8-project.json ---
+# Модель не передаёт ни путь к платформе конкретной базы, ни реквизиты хранилища: скрипт
+# сопоставляет параметры соединения с записью в databases[] и берёт их оттуда. Тот же приём,
+# что в cf-edit.ps1 (сопоставление по configSrc).
+function Find-V8Project([string]$startDir) {
+	$d = $startDir
+	for ($i = 0; $i -lt 20 -and $d; $i++) {
+		$pj = Join-Path $d ".v8-project.json"
+		if (Test-Path $pj) { return $pj }
+		$parent = [System.IO.Path]::GetDirectoryName($d)
+		if ($parent -eq $d) { break }
+		$d = $parent
+	}
+	return $null
+}
+function Test-SamePath {
+    param([string]$A, [string]$B)
+    if (-not $A -or -not $B) { return $false }
+    try {
+        $na = [System.IO.Path]::GetFullPath($A).TrimEnd('\', '/')
+        $nb = [System.IO.Path]::GetFullPath($B).TrimEnd('\', '/')
+        return $na.Equals($nb, [System.StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+function Find-ProjectDatabase {
+    # Запись базы в реестре, соответствующая переданному соединению. $null, если не найдена.
+    $pf = Find-V8Project (Get-Location).Path
+    if (-not $pf) { return $null }
+    try { $proj = Get-Content $pf -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
+    if (-not $proj.databases) { return $null }
+    foreach ($db in $proj.databases) {
+        if ($InfoBasePath -and $db.path -and (Test-SamePath $db.path $InfoBasePath)) { return $db }
+        if ($InfoBaseServer -and $InfoBaseRef -and $db.server -and $db.ref) {
+            if ($db.server.Equals($InfoBaseServer, [System.StringComparison]::OrdinalIgnoreCase) -and
+                $db.ref.Equals($InfoBaseRef, [System.StringComparison]::OrdinalIgnoreCase)) { return $db }
+        }
+    }
+    return $null
+}
+
 # --- Resolve V8Path ---
 function Find-ProjectV8Path {
+    # v8path записи базы сильнее корневого: в одном проекте базы живут на разных версиях
+    # платформы, а версию формата выгрузки задаёт та платформа, которая выгружает.
+    $dbRec = Find-ProjectDatabase
+    if ($dbRec -and $dbRec.v8path) { return [string]$dbRec.v8path }
     $dir = (Get-Location).Path
     while ($dir) {
         $pf = Join-Path $dir ".v8-project.json"
@@ -397,18 +454,6 @@ function Test-OutputNonEmpty {
     return (Test-Path $Path -PathType Leaf) -and ((Get-Item $Path -ErrorAction SilentlyContinue).Length -gt 0)
 }
 
-function Find-V8Project([string]$startDir) {
-	$d = $startDir
-	for ($i = 0; $i -lt 20 -and $d; $i++) {
-		$pj = Join-Path $d ".v8-project.json"
-		if (Test-Path $pj) { return $pj }
-		$parent = [System.IO.Path]::GetDirectoryName($d)
-		if ($parent -eq $d) { break }
-		$d = $parent
-	}
-	return $null
-}
-
 # --- Проверка исходников платформой ---
 # Сборка .epf/.erf ничего не проверяет: /LoadExternalDataProcessorOrReportFromFiles упаковывает XML
 # и модули не компилирует, поэтому сломанный модуль доезжает до пользователя и падает при открытии
@@ -449,6 +494,24 @@ function Resolve-SourcePath {
 	return $null
 }
 
+# «Переменная не определена (X)» при обращении X.… — чаще всего общий модуль конфигурации, которого
+# проверке не показали. Платформа печатает строку кода следующей строкой лога с меткой <<?>> перед X.
+# Подсказка одна на имя; сама ошибка остаётся ошибкой.
+function Get-UndefinedModuleHint {
+	param([string]$Line, [string]$CodeLine, $Hinted)
+	$m = [regex]::Match($Line, 'Переменная не определена \(([^)]+)\)')
+	if (-not $m.Success) { return $null }
+	$name = $m.Groups[1].Value
+	if (-not [regex]::IsMatch($CodeLine, '<<\?>>\s*' + [regex]::Escape($name) + '\s*\.')) { return $null }
+	if (-not $Hinted.Add($name)) { return $null }
+	if (-not $checkConfigSrc) { return "похоже на общий модуль конфигурации — выгрузка конфигурации проверке не передана" }
+	$cmDir = Join-Path $checkConfigSrc "CommonModules"
+	$inCfg = (Test-Path -LiteralPath $cmDir -PathType Container) -and
+		@(Get-ChildItem -LiteralPath $cmDir -Filter "*.xml" -File | Where-Object { $_.BaseName.Equals($name, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+	if ($inCfg) { return "общий модуль $name есть в configSrc, но недоступен в контексте проверки (см. «Проверка: …» в строке выше)" }
+	return "общего модуля $name нет в configSrc ($checkConfigSrc)"
+}
+
 # $true, если платформа нашла проблемы — вызывающий не собирает артефакт.
 function Invoke-SourceCheck {
 	param([string]$Exe, [string]$BasePath, [string[]]$Flags, [string]$SourceDir, [string[]]$ExtraArgs)
@@ -459,7 +522,7 @@ function Invoke-SourceCheck {
 		Write-Host "[note] source check skipped: 1cv8 not found at $v8" -ForegroundColor Yellow
 		return $false
 	}
-	$dir = Join-Path $env:TEMP "epf_check_$(Get-Random)"
+	$dir = Join-Path ([IO.Path]::GetTempPath()) "epf_check_$(Get-Random)"
 	New-Item -ItemType Directory -Path $dir -Force | Out-Null
 	try {
 		$outFile = Join-Path $dir "check_log.txt"
@@ -476,14 +539,23 @@ function Invoke-SourceCheck {
 		Write-Host "Error: платформа нашла проблемы в исходниках — сборка отменена" -ForegroundColor Red
 		# Пустой лог при ненулевом коде — отказ не по находкам (база занята, нет лицензии); молчать нельзя.
 		if ($lines.Count -eq 0) { Write-Host "  платформа вернула код $($res.ExitCode) без сообщений" -ForegroundColor Red }
-		foreach ($l in $lines) {
+		$hinted = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+		for ($i = 0; $i -lt $lines.Count; $i++) {
+			$l = $lines[$i]
 			Write-Host "  $($l.TrimEnd())" -ForegroundColor Red
 			$srcPath = Resolve-SourcePath $l $SourceDir
 			if ($srcPath) { Write-Host "    -> $srcPath" -ForegroundColor Red }
+			# Подсказка — под строкой кода, которую платформа печатает следом за ошибкой.
+			$hint = if ($i -gt 0) { Get-UndefinedModuleHint $lines[$i - 1] $l $hinted } else { $null }
+			if ($hint) { Write-Host "    [hint] $hint" -ForegroundColor Yellow }
+		}
+		if ($hinted.Count -gt 0 -and -not $checkConfigSrc) {
+			Write-Host "[hint] Общие модули конфигурации проверке не видны: $(@($hinted) -join ', ')." -ForegroundColor Yellow
+			Write-Host "       Укажите -ConfigSrc (каталог выгрузки конфигурации) или базу с configSrc в .v8-project.json; либо соберите без проверки: -Checks off" -ForegroundColor Yellow
 		}
 		return $true
 	} finally {
-		if (Test-Path $dir) { Remove-Item -Path $dir -Recurse -Force -ErrorAction SilentlyContinue }
+		if ($dir -and (Test-Path $dir)) { Remove-Item -Path $dir -Recurse -Force -ErrorAction SilentlyContinue }
 	}
 }
 
@@ -534,6 +606,31 @@ elseif ($checkList.Count -gt 0 -and $checkList -notcontains 'modules') {
 }
 $sourceDir = Split-Path $SourceFile -Parent
 
+# Выгрузка целевой конфигурации для проверки: явный -ConfigSrc, иначе configSrc базы из реестра.
+# Без неё обращения к общим модулям конфигурации проверка считает неопределёнными переменными.
+function Resolve-ConfigSrc {
+    if ($ConfigSrc) {
+        if (-not (Test-Path -LiteralPath $ConfigSrc -PathType Container)) {
+            Write-Host "Error: -ConfigSrc not found: $ConfigSrc" -ForegroundColor Red
+            exit 1
+        }
+        return (Resolve-Path -LiteralPath $ConfigSrc).Path
+    }
+    $db = Find-ProjectDatabase
+    if (-not $db -or -not $db.configSrc) { return $null }
+    $p = [string]$db.configSrc
+    if (-not [System.IO.Path]::IsPathRooted($p)) {
+        $pf = Find-V8Project (Get-Location).Path
+        $p = Join-Path (Split-Path $pf -Parent) $p
+    }
+    if (-not (Test-Path -LiteralPath $p -PathType Container)) {
+        Write-Host "WARNING: configSrc базы не найден: $p — общие модули конфигурации проверке недоступны" -ForegroundColor Yellow
+        return $null
+    }
+    return $p
+}
+$checkConfigSrc = if ($checkList.Count -gt 0) { Resolve-ConfigSrc } else { $null }
+
 function New-StubBase {
     # Стаб запускает свои процессы платформы (CREATEINFOBASE, LoadConfigFromFiles, UpdateDBCfg) —
     # им нужны те же дополнительные аргументы, что и сборке. Передаются только явные: файл проекта
@@ -544,6 +641,7 @@ function New-StubBase {
     $q = { param($s) "'" + ($s -replace "'", "''") + "'" }
     $stubCmd = "& $(& $q $stubScript) -SourceDir $(& $q $sourceDir) -V8Path $(& $q $V8Path) -TempBasePath $(& $q $BasePath)"
     if ($Embed) { $stubCmd += " -EmbedSourceFile $(& $q $SourceFile)" }
+    if ($Embed -and $checkConfigSrc) { $stubCmd += " -ConfigSrc $(& $q $checkConfigSrc)" }
     if ($AdditionalV8Arguments.Count -gt 0) {
         $stubCmd += " -AdditionalV8Arguments " + (($AdditionalV8Arguments | ForEach-Object { & $q $_ }) -join ',')
     }
@@ -559,7 +657,7 @@ $autoCreatedBase = $null
 $checkBase = $null
 $checkBasePath = $null
 if (-not $InfoBasePath -and (-not $InfoBaseServer -or -not $InfoBaseRef)) {
-    $autoBasePath = Join-Path $env:TEMP "epf_stub_db_$(Get-Random)"
+    $autoBasePath = Join-Path ([IO.Path]::GetTempPath()) "epf_stub_db_$(Get-Random)"
     Write-Host "No database specified. Creating temporary stub database..."
     if ((New-StubBase $autoBasePath -Embed:($checkList.Count -gt 0)) -ne 0) {
         # С внедрённой обработкой база падает прежде всего из-за самих исходников
@@ -578,7 +676,7 @@ if (-not $InfoBasePath -and (-not $InfoBaseServer -or -not $InfoBaseRef)) {
 } elseif ($checkList.Count -gt 0) {
     # Базу указали снаружи: класть проверяемую обработку в чужую конфигурацию нельзя, поэтому под
     # проверку поднимается своя временная база, а сборка идёт на указанной.
-    $checkBase = Join-Path $env:TEMP "epf_check_db_$(Get-Random)"
+    $checkBase = Join-Path ([IO.Path]::GetTempPath()) "epf_check_db_$(Get-Random)"
     Write-Host "Creating temporary database for the source check..."
     if ((New-StubBase $checkBase -Embed) -ne 0) {
         Write-Host "Error: платформа не приняла исходники при подготовке проверки — сборка отменена" -ForegroundColor Red
@@ -613,7 +711,7 @@ if ($outDir -and -not (Test-Path $outDir)) {
 }
 
 # --- Temp dir ---
-$tempDir = Join-Path $env:TEMP "epf_build_$(Get-Random)"
+$tempDir = Join-Path ([IO.Path]::GetTempPath()) "epf_build_$(Get-Random)"
 New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
 try {
@@ -693,7 +791,7 @@ try {
     exit $exitCode
 
 } finally {
-    if (Test-Path $tempDir) {
+    if ($tempDir -and (Test-Path $tempDir)) {
         Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     if ($autoCreatedBase -and (Test-Path $autoCreatedBase)) {
